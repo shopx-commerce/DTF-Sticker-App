@@ -64,6 +64,7 @@ const PreviewSection = forwardRef<HTMLCanvasElement, PreviewSectionProps>(
     const segmentOverlayCacheRef = useRef<{key: string; canvas: HTMLCanvasElement} | null>(null);
     const segmentMaskImagesRef = useRef<Map<string, HTMLImageElement>>(new Map());
     const croppedImageCacheRef = useRef<{src: string; canvas: HTMLCanvasElement | HTMLImageElement} | null>(null);
+    const previewImageCacheRef = useRef<{src: string; w: number; h: number; canvas: HTMLCanvasElement} | null>(null);
     const holographicCacheRef = useRef<{contourKey: string; canvas: HTMLCanvasElement} | null>(null);
     const contourTransformRef = useRef<{x: number; y: number; width: number; height: number; canvasW: number; canvasH: number} | null>(null);
     const lastCanvasDimsRef = useRef<{width: number; height: number}>({width: 0, height: 0});
@@ -335,6 +336,7 @@ const PreviewSection = forwardRef<HTMLCanvasElement, PreviewSectionProps>(
         spotOverlayCacheRef.current = null;
         segmentOverlayCacheRef.current = null;
         croppedImageCacheRef.current = null;
+        previewImageCacheRef.current = null;
         holographicCacheRef.current = null;
         return;
       }
@@ -349,6 +351,7 @@ const PreviewSection = forwardRef<HTMLCanvasElement, PreviewSectionProps>(
       spotOverlayCacheRef.current = null;
       segmentOverlayCacheRef.current = null;
       croppedImageCacheRef.current = null;
+      previewImageCacheRef.current = null;
       holographicCacheRef.current = null;
       
       // Skip zoom reset for enhancement (same file, different resolution)
@@ -447,12 +450,38 @@ const PreviewSection = forwardRef<HTMLCanvasElement, PreviewSectionProps>(
       if (croppedImageCacheRef.current?.src === src) {
         return croppedImageCacheRef.current.canvas;
       }
-      // Skip full-res crop for large images (already cropped during upload)
       const totalPx = imageInfo.image.width * imageInfo.image.height;
-      const cropped = totalPx <= 16_000_000 ? cropImageToContent(imageInfo.image) : null;
+      const cropped = totalPx <= 4_000_000 ? cropImageToContent(imageInfo.image) : null;
       const result = cropped || imageInfo.image;
       croppedImageCacheRef.current = { src, canvas: result };
       return result;
+    };
+
+    const getPreviewImage = (): HTMLCanvasElement | HTMLImageElement => {
+      if (!imageInfo) return document.createElement('canvas');
+      const img = imageInfo.image;
+      const w = img.naturalWidth || img.width;
+      const h = img.naturalHeight || img.height;
+      const targetDim = Math.max(800, Math.round(Math.max(previewDims.width, previewDims.height) * zoom));
+      if (w <= targetDim && h <= targetDim) return img;
+      const src = img.src;
+      const scale = Math.min(targetDim / w, targetDim / h);
+      const pw = Math.round(w * scale);
+      const ph = Math.round(h * scale);
+      if (previewImageCacheRef.current?.src === src && previewImageCacheRef.current.w === pw && previewImageCacheRef.current.h === ph) {
+        return previewImageCacheRef.current.canvas;
+      }
+      const c = document.createElement('canvas');
+      c.width = pw;
+      c.height = ph;
+      const cx = c.getContext('2d');
+      if (cx) {
+        cx.imageSmoothingEnabled = true;
+        cx.imageSmoothingQuality = 'high';
+        cx.drawImage(img, 0, 0, pw, ph);
+      }
+      previewImageCacheRef.current = { src, w: pw, h: ph, canvas: c };
+      return c;
     };
 
     // Version bump forces cache invalidation when worker code changes
@@ -1261,7 +1290,7 @@ const PreviewSection = forwardRef<HTMLCanvasElement, PreviewSectionProps>(
       
       const cornerRadiusPixels = (shapeSettings.cornerRadius || 0.25) * shapePixelsPerInch;
       
-      const sourceImage = getCachedCroppedImage();
+      const sourceImage = getPreviewImage();
       
       // Image dimensions within the shape
       let imageWidth = resizeSettings.widthInches * shapePixelsPerInch;
@@ -1619,7 +1648,8 @@ const PreviewSection = forwardRef<HTMLCanvasElement, PreviewSectionProps>(
         const displayX = (canvasWidth - displayWidth) / 2;
         const displayY = (canvasHeight - displayHeight) / 2;
         
-        ctx.drawImage(imageInfo.image, displayX, displayY, displayWidth, displayHeight);
+        const previewImg = getPreviewImage();
+        ctx.drawImage(previewImg, displayX, displayY, displayWidth, displayHeight);
         lastImageRenderRef.current = { x: displayX, y: displayY, width: displayWidth, height: displayHeight };
 
         if (segmentationData?.mode === 'items') {
