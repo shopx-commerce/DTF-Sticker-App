@@ -734,12 +734,12 @@ export default function ControlsSection({
                 </button>
               </div>
 
-              {extractedColors.length > 0 && (
+              {extractedColors.some(c => c.percentage >= 1) && (
                 <div className="flex items-center gap-1.5 mb-2">
                   <button
                     onClick={() => {
                       setSpotPreviewEnabled(true);
-                      setExtractedColors(prev => prev.map(c => ({ ...c, spotWhite: true })));
+                      setExtractedColors(prev => prev.map(c => c.percentage >= 1 ? { ...c, spotWhite: true } : c));
                     }}
                     className="flex-1 px-2 py-1 rounded text-[10px] font-medium transition-colors bg-orange-50 text-orange-700 border border-orange-200 hover:bg-orange-100"
                   >
@@ -748,7 +748,7 @@ export default function ControlsSection({
                   <button
                     onClick={() => {
                       setSpotPreviewEnabled(true);
-                      setExtractedColors(prev => prev.map(c => ({ ...c, spotGloss: true })));
+                      setExtractedColors(prev => prev.map(c => c.percentage >= 1 ? { ...c, spotGloss: true } : c));
                     }}
                     className="flex-1 px-2 py-1 rounded text-[10px] font-medium transition-colors bg-teal-50 text-teal-700 border border-teal-200 hover:bg-teal-100"
                   >
@@ -756,7 +756,7 @@ export default function ControlsSection({
                   </button>
                   <button
                     onClick={() => {
-                      setExtractedColors(prev => prev.map(c => ({ ...c, spotWhite: false, spotGloss: false })));
+                      setExtractedColors(prev => prev.map(c => c.percentage >= 1 ? { ...c, spotWhite: false, spotGloss: false } : c));
                     }}
                     className="flex-1 px-2 py-1 rounded text-[10px] font-medium transition-colors bg-gray-50 text-gray-500 border border-gray-200 hover:bg-gray-100"
                   >
@@ -765,11 +765,11 @@ export default function ControlsSection({
                 </div>
               )}
               
-              {extractedColors.length === 0 ? (
+              {!extractedColors.some(c => c.percentage >= 1) ? (
                 <div className="text-xs text-gray-500 italic">No colors detected</div>
               ) : (
                 <div ref={colorListRef} className="space-y-2 max-h-[400px] overflow-y-auto">
-                  {extractedColors.map((color, index) => {
+                  {extractedColors.map((color, index) => ({ color, index })).filter(({ color }) => color.percentage >= 1).map(({ color, index }) => {
                     const hasRegions = color.regions && color.regions.length > 1;
                     const isExpanded = expandedColorIndex === index;
                     const isHighlighted = highlightedColorIndex === index;
