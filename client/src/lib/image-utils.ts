@@ -13,16 +13,8 @@ function hexToRgb(hex: string): { r: number; g: number; b: number } {
 }
 
 export function calculateImageDimensions(width: number, height: number, dpi: number) {
-  let widthInches = parseFloat((width / dpi).toFixed(1));
-  let heightInches = parseFloat((height / dpi).toFixed(1));
-  
-  // Auto-resize: if either dimension exceeds 6", scale down to max 3"
-  if (widthInches > 6 || heightInches > 6) {
-    const maxDimension = Math.max(widthInches, heightInches);
-    const scale = 3 / maxDimension;
-    widthInches = parseFloat((widthInches * scale).toFixed(1));
-    heightInches = parseFloat((heightInches * scale).toFixed(1));
-  }
+  const widthInches = parseFloat((width / dpi).toFixed(1));
+  const heightInches = parseFloat((height / dpi).toFixed(1));
   
   return { widthInches, heightInches };
 }
