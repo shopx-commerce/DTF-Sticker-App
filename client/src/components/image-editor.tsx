@@ -1418,8 +1418,33 @@ export default function ImageEditor({ onDesignUploaded }: { onDesignUploaded?: (
         </div>
       )}
 
+      {enhancingMode && (
+        <div className="fixed inset-0 bg-black/70 backdrop-blur-sm flex items-center justify-center z-50">
+          <div className="bg-slate-900 border border-slate-700/50 rounded-2xl p-8 max-w-sm mx-4 text-center shadow-2xl">
+            <div className="relative w-16 h-16 mx-auto mb-5">
+              <div className="absolute inset-0 rounded-full border-4 border-slate-700"></div>
+              <div className={`absolute inset-0 rounded-full border-4 border-t-transparent animate-spin ${enhancingMode === 'faces' ? 'border-violet-500' : 'border-amber-500'}`}></div>
+              <div className="absolute inset-0 flex items-center justify-center">
+                {enhancingMode === 'faces' ? (
+                  <svg className="w-6 h-6 text-violet-400" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><circle cx="12" cy="8" r="5" /><path d="M20 21a8 8 0 0 0-16 0" /></svg>
+                ) : (
+                  <svg className="w-6 h-6 text-amber-400" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M12 3l1.912 5.813a2 2 0 0 0 1.275 1.275L21 12l-5.813 1.912a2 2 0 0 0-1.275 1.275L12 21l-1.912-5.813a2 2 0 0 0-1.275-1.275L3 12l5.813-1.912a2 2 0 0 0 1.275-1.275L12 3z" /></svg>
+                )}
+              </div>
+            </div>
+            <div className="text-white text-lg font-semibold mb-2">
+              {enhancingMode === 'faces' ? 'Enhancing Faces' : 'Enhancing Design'}
+            </div>
+            <div className={`text-sm mb-4 ${enhancingMode === 'faces' ? 'text-violet-300' : 'text-amber-300'}`}>
+              {enhanceStage || 'Starting up...'}
+            </div>
+            <p className="text-xs text-slate-400">This may take up to a minute. Please wait.</p>
+          </div>
+        </div>
+      )}
+
       {/* Processing Modal */}
-      {isProcessing && (
+      {isProcessing && !enhancingMode && (
         <div className="fixed inset-0 bg-black/70 flex items-center justify-center z-50">
           <div className="bg-slate-900 border border-slate-700/50 rounded-lg p-6 max-w-sm mx-4">
             <div className="flex items-center space-x-3">
