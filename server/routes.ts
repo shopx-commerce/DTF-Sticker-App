@@ -639,8 +639,7 @@ ${pdfData ? '<p><strong>PDF design with CutContour is attached.</strong></p>' : 
       const imgHeight = metadata.height || 1;
 
       const model = (req.body?.model as string) || 'anime';
-      const requestedScale = parseInt(req.body?.scale || '4', 10);
-      const scale = requestedScale === 2 ? 2 : 4;
+      const scale = 2;
       const faceEnhance = model === 'general_face';
 
       // Cap output at ~8000px to avoid Replicate OOM

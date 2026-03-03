@@ -47,8 +47,7 @@ ctx.onmessage = async (e: MessageEvent<EnhanceRequest>) => {
     postProgress('Encoding PNG…', 15);
     const blob = await offscreen.convertToBlob({ type: 'image/png' });
 
-    const longestSide = Math.max(width, height);
-    const scale = longestSide >= 2000 ? 2 : 4;
+    const scale = 2;
 
     const formData = new FormData();
     formData.append('image', blob, 'image.png');
