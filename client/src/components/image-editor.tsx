@@ -85,6 +85,7 @@ export default function ImageEditor({ onDesignUploaded }: { onDesignUploaded?: (
     resizeSettings: ResizeSettings;
     shapeSettings: ShapeSettings;
     spotColors: SpotPreviewData;
+    imageInfo: ImageInfo | null;
   }
   const historyRef = useRef<EditorSnapshot[]>([]);
   const historyIndexRef = useRef(-1);
@@ -100,6 +101,7 @@ export default function ImageEditor({ onDesignUploaded }: { onDesignUploaded?: (
       resizeSettings: { ...resizeSettings },
       shapeSettings: { ...shapeSettings },
       spotColors: { ...spotPreviewData, colors: spotPreviewData.colors.map(c => ({ ...c, regions: c.regions?.map(r => ({ ...r })) })) },
+      imageInfo: imageInfo ? { ...imageInfo } : null,
     };
     const idx = historyIndexRef.current;
     historyRef.current = historyRef.current.slice(0, idx + 1);
@@ -108,7 +110,7 @@ export default function ImageEditor({ onDesignUploaded }: { onDesignUploaded?: (
     historyIndexRef.current = historyRef.current.length - 1;
     setCanUndo(historyIndexRef.current > 0);
     setCanRedo(false);
-  }, [strokeSettings, resizeSettings, shapeSettings, spotPreviewData]);
+  }, [strokeSettings, resizeSettings, shapeSettings, spotPreviewData, imageInfo]);
 
   // Debounced snapshot: batch rapid changes into one history entry
   useEffect(() => {
@@ -118,7 +120,7 @@ export default function ImageEditor({ onDesignUploaded }: { onDesignUploaded?: (
       pushSnapshot();
     }, 600);
     return () => { if (snapshotTimerRef.current) clearTimeout(snapshotTimerRef.current); };
-  }, [strokeSettings, resizeSettings, shapeSettings, spotPreviewData, pushSnapshot]);
+  }, [strokeSettings, resizeSettings, shapeSettings, spotPreviewData, imageInfo, pushSnapshot]);
 
   const handleUndo = useCallback(() => {
     if (historyIndexRef.current <= 0) return;
@@ -129,6 +131,12 @@ export default function ImageEditor({ onDesignUploaded }: { onDesignUploaded?: (
     setResizeSettings(snap.resizeSettings);
     setShapeSettings(snap.shapeSettings);
     setSpotPreviewData(snap.spotColors);
+    if (snap.imageInfo !== undefined) {
+      setImageInfo(snap.imageInfo);
+      const workerManager = getContourWorkerManager();
+      workerManager.clearCache();
+      setCadCutBounds(null);
+    }
     setCanUndo(historyIndexRef.current > 0);
     setCanRedo(true);
     requestAnimationFrame(() => { isRestoringRef.current = false; });
@@ -143,6 +151,12 @@ export default function ImageEditor({ onDesignUploaded }: { onDesignUploaded?: (
     setResizeSettings(snap.resizeSettings);
     setShapeSettings(snap.shapeSettings);
     setSpotPreviewData(snap.spotColors);
+    if (snap.imageInfo !== undefined) {
+      setImageInfo(snap.imageInfo);
+      const workerManager = getContourWorkerManager();
+      workerManager.clearCache();
+      setCadCutBounds(null);
+    }
     setCanUndo(true);
     setCanRedo(historyIndexRef.current < historyRef.current.length - 1);
     requestAnimationFrame(() => { isRestoringRef.current = false; });
@@ -787,7 +801,7 @@ export default function ImageEditor({ onDesignUploaded }: { onDesignUploaded?: (
       const enhancedUrl = URL.createObjectURL(result.blob);
       const enhancedImage = await new Promise<HTMLImageElement>((resolve, reject) => {
         const img = new Image();
-        img.onload = () => resolve(img);
+        img.onload = () => { URL.revokeObjectURL(enhancedUrl); resolve(img); };
         img.onerror = () => { URL.revokeObjectURL(enhancedUrl); reject(new Error('Failed to load enhanced image')); };
         img.src = enhancedUrl;
       });
