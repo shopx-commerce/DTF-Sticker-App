@@ -549,15 +549,21 @@ export function extractColorsFromImage(image: HTMLImageElement, maxColors: numbe
   if (!image.complete || image.width === 0 || image.height === 0)
     return { colors: [], pixelMap: new Int16Array(0), width: 0, height: 0 };
   
-  const w = image.width;
-  const h = image.height;
+  const maxDim = 1000;
+  const origW = image.width;
+  const origH = image.height;
+  const scale = Math.max(origW, origH) > maxDim ? maxDim / Math.max(origW, origH) : 1;
+  const w = Math.round(origW * scale);
+  const h = Math.round(origH * scale);
   const tempCanvas = document.createElement('canvas');
   tempCanvas.width = w;
   tempCanvas.height = h;
   const tempCtx = tempCanvas.getContext('2d');
   if (!tempCtx) return { colors: [], pixelMap: new Int16Array(0), width: 0, height: 0 };
   
-  tempCtx.drawImage(image, 0, 0);
+  tempCtx.imageSmoothingEnabled = true;
+  tempCtx.imageSmoothingQuality = 'medium';
+  tempCtx.drawImage(image, 0, 0, w, h);
   const imageData = tempCtx.getImageData(0, 0, w, h);
   
   const colors = extractDominantColors(imageData, maxColors);

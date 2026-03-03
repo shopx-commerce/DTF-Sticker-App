@@ -116,24 +116,25 @@ export default function ControlsSection({
 
   useEffect(() => {
     if (imageInfo?.image) {
-      const result = extractColorsFromImage(imageInfo.image, 999);
-      extractionRef.current = result;
+      const rafId = requestAnimationFrame(() => {
+        const result = extractColorsFromImage(imageInfo.image, 999);
+        extractionRef.current = result;
 
-      const canvas = document.createElement('canvas');
-      canvas.width = result.width;
-      canvas.height = result.height;
-      const ctx = canvas.getContext('2d');
-      let imgData: ImageData | undefined;
-      if (ctx) {
-        ctx.drawImage(imageInfo.image, 0, 0);
-        imgData = ctx.getImageData(0, 0, result.width, result.height);
-      }
+        const canvas = document.createElement('canvas');
+        canvas.width = result.width;
+        canvas.height = result.height;
+        const ctx = canvas.getContext('2d');
+        let imgData: ImageData | undefined;
+        if (ctx) {
+          ctx.drawImage(imageInfo.image, 0, 0, result.width, result.height);
+          imgData = ctx.getImageData(0, 0, result.width, result.height);
+        }
 
-      // Run region detection in Web Worker to keep UI responsive
-      detectColorRegionsAsync(result.pixelMap, result.width, result.height, result.colors, imgData)
-        .then(() => setExtractedColors([...result.colors]));
-      // Set colors immediately (regions will update when worker finishes)
-      setExtractedColors(result.colors);
+        detectColorRegionsAsync(result.pixelMap, result.width, result.height, result.colors, imgData)
+          .then(() => setExtractedColors([...result.colors]));
+        setExtractedColors(result.colors);
+      });
+      return () => cancelAnimationFrame(rafId);
     } else {
       extractionRef.current = null;
       setExtractedColors([]);

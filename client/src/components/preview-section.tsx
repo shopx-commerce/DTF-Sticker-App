@@ -225,16 +225,16 @@ const PreviewSection = forwardRef<HTMLCanvasElement, PreviewSectionProps>(
       const imgRect = lastImageRenderRef.current;
       if (!imgRect) return;
 
-      // Convert canvas coords to image pixel coords
-      const imgX = Math.floor((canvasX - imgRect.x) / imgRect.width * imageInfo.image.width);
-      const imgY = Math.floor((canvasY - imgRect.y) / imgRect.height * imageInfo.image.height);
-
-      if (imgX < 0 || imgX >= imageInfo.image.width || imgY < 0 || imgY >= imageInfo.image.height) return;
-
-      const pixelIndex = imgY * imageInfo.image.width + imgX;
       const pixelMap = spotPreviewData.pixelMap;
       const mapW = spotPreviewData.mapWidth ?? imageInfo.image.width;
+      const mapH = spotPreviewData.mapHeight ?? imageInfo.image.height;
 
+      const mapX = Math.floor((canvasX - imgRect.x) / imgRect.width * mapW);
+      const mapY = Math.floor((canvasY - imgRect.y) / imgRect.height * mapH);
+
+      if (mapX < 0 || mapX >= mapW || mapY < 0 || mapY >= mapH) return;
+
+      const pixelIndex = mapY * mapW + mapX;
       if (pixelIndex < 0 || pixelIndex >= pixelMap.length) return;
 
       const colorIndex = pixelMap[pixelIndex];
@@ -245,9 +245,7 @@ const PreviewSection = forwardRef<HTMLCanvasElement, PreviewSectionProps>(
 
       let regionId: number | null = null;
       if (color.regionMap) {
-        // Remap pixel index if dimensions differ
-        const rIdx = imgY * mapW + imgX;
-        const rid = color.regionMap[rIdx];
+        const rid = color.regionMap[pixelIndex];
         if (rid >= 0) regionId = rid;
       }
 
