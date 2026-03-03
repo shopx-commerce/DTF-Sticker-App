@@ -812,26 +812,27 @@ export default function ImageEditor({ onDesignUploaded }: { onDesignUploaded?: (
 
       const newW = result.enhancedWidth;
       const newH = result.enhancedHeight;
-      const dpi = imageInfo.dpi || 300;
-      const { widthInches, heightInches } = calculateImageDimensions(newW, newH, dpi);
+      const origW = imageInfo.originalWidth;
+      const origH = imageInfo.originalHeight;
+      const scaleUsed = Math.max(1, Math.round(newW / origW));
+
+      const newDpi = Math.round((imageInfo.dpi || 300) * scaleUsed);
 
       const newImageInfo: ImageInfo = {
         ...imageInfo,
         image: enhancedImage,
         originalWidth: newW,
         originalHeight: newH,
+        dpi: newDpi,
       };
 
       setImageInfo(newImageInfo);
-      setResizeSettings(prev => ({ ...prev, widthInches, heightInches }));
 
       const workerManager = getContourWorkerManager();
       workerManager.clearCache();
       setCadCutBounds(null);
+      setLockedContour(null);
 
-      const origW = imageInfo.originalWidth;
-      const origH = imageInfo.originalHeight;
-      const scaleUsed = Math.round(newW / origW);
       const modeLabel = mode === 'faces' ? 'Faces' : 'Design';
 
       toast({
