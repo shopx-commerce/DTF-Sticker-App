@@ -6,7 +6,7 @@ import { calculateImageDimensions, downloadCanvas } from "@/lib/image-utils";
 import { cropImageToContent } from "@/lib/image-crop";
 import { createVectorStroke, downloadVectorStroke, createVectorPaths, type VectorFormat } from "@/lib/vector-stroke";
 import { checkCadCutBounds, type CadCutBounds } from "@/lib/cadcut-bounds";
-import { downloadContourPDF, type CachedContourData, type SpotColorInput } from "@/lib/contour-outline";
+import { downloadContourPDF, downloadDesignOnlyPDF, type CachedContourData, type SpotColorInput } from "@/lib/contour-outline";
 import { getContourWorkerManager, type DetectedAlgorithm, type DetectedShapeInfo } from "@/lib/contour-worker-manager";
 import { downloadShapePDF, calculateShapeDimensions, generateShapePathPointsInches } from "@/lib/shape-outline";
 import { useDebouncedValue } from "@/hooks/use-debounce";
@@ -75,6 +75,10 @@ export default function ImageEditor({ onDesignUploaded }: { onDesignUploaded?: (
   });
   const [isSegmenting, setIsSegmenting] = useState(false);
   const [enhancingMode, setEnhancingMode] = useState<'design' | 'faces' | null>(null);
+  const [noCutlinesDialog, setNoCutlinesDialog] = useState<{
+    pending: boolean;
+    args: { downloadType: string; format: VectorFormat; spotColors?: SpotColorInput[]; singleArtboard: boolean } | null;
+  }>({ pending: false, args: null });
   const applyAddRef = useRef<HTMLDivElement>(null);
   
   const canvasRef = useRef<HTMLCanvasElement>(null);
@@ -1117,18 +1121,12 @@ export default function ImageEditor({ onDesignUploaded }: { onDesignUploaded?: (
             lockedContour ? { label: lockedContour.label, pathPoints: lockedContour.pathPoints, widthInches: lockedContour.widthInches, heightInches: lockedContour.heightInches, imageOffsetX: lockedContour.imageOffsetX, imageOffsetY: lockedContour.imageOffsetY } : null
           );
         } else {
-          // No mode selected - just download the image
-          const dpi = 300;
-          const filename = `${nameWithoutExt}.png`;
-          await downloadCanvas(
-            imageInfo.image,
-            strokeSettings,
-            resizeSettings.widthInches,
-            resizeSettings.heightInches,
-            dpi,
-            filename,
-            undefined
-          );
+          setIsProcessing(false);
+          setNoCutlinesDialog({
+            pending: true,
+            args: { downloadType: downloadType || 'standard', format, spotColors, singleArtboard }
+          });
+          return;
         }
       }
     } catch (error) {
@@ -1365,6 +1363,61 @@ export default function ImageEditor({ onDesignUploaded }: { onDesignUploaded?: (
         </div>
       </div>
       
+      {noCutlinesDialog.pending && (
+        <div className="fixed inset-0 bg-black/60 flex items-center justify-center z-50">
+          <div className="bg-white rounded-xl shadow-2xl p-6 max-w-xs mx-4 text-center">
+            <div className="text-lg font-semibold text-gray-800 mb-2">No cutlines?</div>
+            <p className="text-sm text-gray-500 mb-5">Your download won't include cut lines. Continue anyway?</p>
+            <div className="flex gap-3">
+              <button
+                onClick={() => setNoCutlinesDialog({ pending: false, args: null })}
+                className="flex-1 px-4 py-2.5 rounded-lg border border-gray-300 text-gray-700 font-medium hover:bg-gray-50 transition-colors"
+              >
+                No
+              </button>
+              <button
+                onClick={async () => {
+                  const args = noCutlinesDialog.args;
+                  setNoCutlinesDialog({ pending: false, args: null });
+                  if (!imageInfo) return;
+                  setIsProcessing(true);
+                  try {
+                    const nameWithoutExt = imageInfo.file.name.replace(/\.[^/.]+$/, '');
+                    if (args?.format === 'pdf') {
+                      await downloadDesignOnlyPDF(
+                        imageInfo.image,
+                        resizeSettings,
+                        `${nameWithoutExt}.pdf`,
+                        args.spotColors,
+                        args.singleArtboard
+                      );
+                    } else {
+                      const dpi = 300;
+                      await downloadCanvas(
+                        imageInfo.image,
+                        strokeSettings,
+                        resizeSettings.widthInches,
+                        resizeSettings.heightInches,
+                        dpi,
+                        `${nameWithoutExt}.png`,
+                        undefined
+                      );
+                    }
+                  } catch (error) {
+                    console.error("Download failed:", error);
+                  } finally {
+                    setIsProcessing(false);
+                  }
+                }}
+                className="flex-1 px-4 py-2.5 rounded-lg bg-indigo-600 text-white font-medium hover:bg-indigo-700 transition-colors"
+              >
+                Yes
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
       {/* Processing Modal */}
       {isProcessing && (
         <div className="fixed inset-0 bg-black/70 flex items-center justify-center z-50">

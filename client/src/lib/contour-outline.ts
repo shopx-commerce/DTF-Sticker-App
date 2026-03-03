@@ -2083,6 +2083,78 @@ export async function downloadContourPDF(
   }
 }
 
+export async function downloadDesignOnlyPDF(
+  image: HTMLImageElement,
+  resizeSettings: ResizeSettings,
+  filename: string,
+  spotColors?: SpotColorInput[],
+  singleArtboard: boolean = false
+): Promise<void> {
+  try {
+    console.log('[downloadDesignOnlyPDF] Starting design-only PDF (no cut lines)');
+    await new Promise(resolve => setTimeout(resolve, 50));
+
+    const widthInches = resizeSettings.widthInches;
+    const heightInches = resizeSettings.heightInches;
+    const widthPts = widthInches * 72;
+    const heightPts = heightInches * 72;
+
+    const pdfDoc = await PDFDocument.create();
+    const page = pdfDoc.addPage([widthPts, heightPts]);
+
+    const designBlob: Blob = await new Promise((resolve, reject) => {
+      const tempCanvas = document.createElement('canvas');
+      const tempCtx = tempCanvas.getContext('2d');
+      if (!tempCtx) { reject(new Error('Failed to get canvas context')); return; }
+      tempCanvas.width = image.width;
+      tempCanvas.height = image.height;
+      tempCtx.drawImage(image, 0, 0);
+      tempCanvas.toBlob((b) => {
+        if (b) resolve(b);
+        else reject(new Error('Failed to create blob'));
+      }, 'image/png');
+    });
+
+    const pngBytes = new Uint8Array(await designBlob.arrayBuffer());
+    const pngImage = await pdfDoc.embedPng(pngBytes);
+
+    page.drawImage(pngImage, {
+      x: 0,
+      y: 0,
+      width: widthPts,
+      height: heightPts,
+    });
+
+    if (spotColors && spotColors.length > 0) {
+      const spotLabels = await addSpotColorVectorsToPDF(
+        pdfDoc, page, image, spotColors,
+        widthInches, heightInches,
+        heightInches, 0, 0,
+        singleArtboard, widthPts, heightPts
+      );
+      console.log('[downloadDesignOnlyPDF] Added spot color vector layers:', spotLabels);
+    }
+
+    pdfDoc.setTitle('Design with Spot Colors');
+    pdfDoc.setSubject('Design PDF without cut lines');
+
+    const pdfBytes = await pdfDoc.save();
+    const pdfBlob = new Blob([pdfBytes], { type: 'application/pdf' });
+    const url = URL.createObjectURL(pdfBlob);
+
+    const link = document.createElement('a');
+    link.href = url;
+    link.download = filename;
+    document.body.appendChild(link);
+    link.click();
+    document.body.removeChild(link);
+    URL.revokeObjectURL(url);
+  } catch (error) {
+    console.error('[downloadDesignOnlyPDF] Error:', error);
+    throw error;
+  }
+}
+
 export async function generateContourPDFBase64(
   image: HTMLImageElement,
   strokeSettings: StrokeSettings,
