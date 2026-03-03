@@ -1358,8 +1358,6 @@ export default function ImageEditor({ onDesignUploaded }: { onDesignUploaded?: (
             onRedo={handleRedo}
             canUndo={canUndo}
             canRedo={canRedo}
-            highlightedColorIndex={highlightedColor?.colorIndex ?? null}
-            highlightedRegionId={highlightedColor?.regionId ?? null}
             onSpotColorClick={(colorIndex, regionId) => {
               setHighlightWithTimer({ colorIndex, regionId });
             }}

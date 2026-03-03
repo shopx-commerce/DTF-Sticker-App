@@ -33,12 +33,10 @@ interface PreviewSectionProps {
   onRedo?: () => void;
   canUndo?: boolean;
   canRedo?: boolean;
-  highlightedColorIndex?: number | null;
-  highlightedRegionId?: number | null;
 }
 
 const PreviewSection = forwardRef<HTMLCanvasElement, PreviewSectionProps>(
-  ({ imageInfo, strokeSettings, resizeSettings, shapeSettings, cadCutBounds, spotPreviewData, showCutLineInfo, onDetectedAlgorithm, detectedShapeType, detectedShapeInfo, detectedAlgorithm, onStrokeChange, lockedContour, segmentationData, onSpotColorClick, fileName, onResizeChange, onUndo, onRedo, canUndo, canRedo, highlightedColorIndex, highlightedRegionId }, ref) => {
+  ({ imageInfo, strokeSettings, resizeSettings, shapeSettings, cadCutBounds, spotPreviewData, showCutLineInfo, onDetectedAlgorithm, detectedShapeType, detectedShapeInfo, detectedAlgorithm, onStrokeChange, lockedContour, segmentationData, onSpotColorClick, fileName, onResizeChange, onUndo, onRedo, canUndo, canRedo }, ref) => {
     const canvasRef = useRef<HTMLCanvasElement>(null);
     const containerRef = useRef<HTMLDivElement>(null);
     const [zoom, setZoom] = useState(1);
@@ -959,7 +957,7 @@ const PreviewSection = forwardRef<HTMLCanvasElement, PreviewSectionProps>(
       return () => {
         if (renderRafRef.current) { cancelAnimationFrame(renderRafRef.current); renderRafRef.current = null; }
       };
-    }, [imageInfo, strokeSettings, resizeSettings, shapeSettings, cadCutBounds, backgroundColor, isProcessing, spotPreviewData, previewDims.height, previewDims.width, lockedContour, segmentationData, highlightedColorIndex, highlightedRegionId]);
+    }, [imageInfo, strokeSettings, resizeSettings, shapeSettings, cadCutBounds, backgroundColor, isProcessing, spotPreviewData, previewDims.height, previewDims.width, lockedContour, segmentationData]);
 
     useEffect(() => {
       if (!spotPreviewData?.enabled) {
@@ -1101,78 +1099,6 @@ const PreviewSection = forwardRef<HTMLCanvasElement, PreviewSectionProps>(
       
       overlayCtx.putImageData(overlayData, 0, 0);
       spotOverlayCacheRef.current = { key: cacheKey, canvas: overlayCanvas };
-      return overlayCanvas;
-    };
-
-    const createHighlightOverlay = (): HTMLCanvasElement | null => {
-      if (highlightedColorIndex == null || highlightedColorIndex < 0) return null;
-      if (!imageInfo || !spotPreviewData?.pixelMap) return null;
-
-      const pixelMap = spotPreviewData.pixelMap;
-      const mapW = spotPreviewData.mapWidth ?? imageInfo.image.width;
-      const mapH = spotPreviewData.mapHeight ?? imageInfo.image.height;
-      const w = mapW || imageInfo.image.width;
-      const h = mapH || imageInfo.image.height;
-
-      const color = spotPreviewData.colors[highlightedColorIndex];
-      if (!color) return null;
-
-      const totalPixels = w * h;
-      if (pixelMap.length < totalPixels) return null;
-
-      const mask = new Uint8Array(totalPixels);
-      for (let i = 0; i < totalPixels; i++) {
-        if (pixelMap[i] !== highlightedColorIndex) continue;
-        if (highlightedRegionId != null && color.regionMap) {
-          if (color.regionMap[i] !== highlightedRegionId) continue;
-        }
-        mask[i] = 1;
-      }
-
-      const overlayCanvas = document.createElement('canvas');
-      overlayCanvas.width = w;
-      overlayCanvas.height = h;
-      const ctx2 = overlayCanvas.getContext('2d');
-      if (!ctx2) return null;
-
-      const imgData = ctx2.createImageData(w, h);
-      const out = imgData.data;
-
-      // Semi-transparent blue fill for the region
-      for (let i = 0; i < w * h; i++) {
-        if (mask[i]) {
-          const off = i * 4;
-          out[off] = 59;
-          out[off + 1] = 130;
-          out[off + 2] = 246;
-          out[off + 3] = 60;
-        }
-      }
-
-      // Blue border: any mask pixel adjacent to a non-mask pixel
-      const borderThickness = Math.max(1, Math.round(Math.max(w, h) / 400));
-      for (let y = 0; y < h; y++) {
-        for (let x = 0; x < w; x++) {
-          const idx = y * w + x;
-          if (!mask[idx]) continue;
-          let isBorder = false;
-          for (let d = 1; d <= borderThickness && !isBorder; d++) {
-            if (x - d < 0 || !mask[idx - d]) isBorder = true;
-            else if (x + d >= w || !mask[idx + d]) isBorder = true;
-            else if (y - d < 0 || !mask[(y - d) * w + x]) isBorder = true;
-            else if (y + d >= h || !mask[(y + d) * w + x]) isBorder = true;
-          }
-          if (isBorder) {
-            const off = idx * 4;
-            out[off] = 59;
-            out[off + 1] = 130;
-            out[off + 2] = 246;
-            out[off + 3] = 220;
-          }
-        }
-      }
-
-      ctx2.putImageData(imgData, 0, 0);
       return overlayCanvas;
     };
 
@@ -1476,12 +1402,6 @@ const PreviewSection = forwardRef<HTMLCanvasElement, PreviewSectionProps>(
         }
       }
 
-      const hlOverlay = createHighlightOverlay();
-      if (hlOverlay) {
-        ctx.save();
-        ctx.drawImage(hlOverlay, imageX, imageY, imageWidth, imageHeight);
-        ctx.restore();
-      }
       
       ctx.restore();
     };
@@ -1619,21 +1539,6 @@ const PreviewSection = forwardRef<HTMLCanvasElement, PreviewSectionProps>(
             ctx.restore();
           }
         }
-        {
-          const hlOverlay = createHighlightOverlay();
-          if (hlOverlay) {
-            const dsScale = contourCacheRef.current?.downsampleScale ?? 1;
-            const dsWidth = Math.round(imageInfo.image.width * dsScale);
-            const dsHeight = Math.round(imageInfo.image.height * dsScale);
-            const imgX2 = contourCacheRef.current?.imageCanvasX ?? 0;
-            const imgY2 = contourCacheRef.current?.imageCanvasY ?? 0;
-            const scaleX2 = contourWidth / contourCanvas.width;
-            const scaleY2 = contourHeight / contourCanvas.height;
-            ctx.save();
-            ctx.drawImage(hlOverlay, contourX + (imgX2 * scaleX2), contourY + (imgY2 * scaleY2), dsWidth * scaleX2, dsHeight * scaleY2);
-            ctx.restore();
-          }
-        }
       } else {
         const aspectRatio = imageInfo.image.width / imageInfo.image.height;
         let displayWidth, displayHeight;
@@ -1666,14 +1571,6 @@ const PreviewSection = forwardRef<HTMLCanvasElement, PreviewSectionProps>(
             ctx.save();
             ctx.globalAlpha = spotPulseRef.current;
             ctx.drawImage(spotOverlay, displayX, displayY, displayWidth, displayHeight);
-            ctx.restore();
-          }
-        }
-        {
-          const hlOverlay = createHighlightOverlay();
-          if (hlOverlay) {
-            ctx.save();
-            ctx.drawImage(hlOverlay, displayX, displayY, displayWidth, displayHeight);
             ctx.restore();
           }
         }
