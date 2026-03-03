@@ -1,55 +1,53 @@
 @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap');
-@import url('https://fonts.googleapis.com/css2?family=Fredoka+One&display=swap');
-@import url('https://db.onlinewebfonts.com/c/598a2bdeaef4affee05367e9e3dd54c6?family=Nabana+Shadow');
 
 @tailwind base;
 @tailwind components;
 @tailwind utilities;
 
 :root {
-  --background: hsl(0, 0%, 100%);
-  --foreground: hsl(0, 0%, 0%);
-  --muted: hsl(0, 0%, 95%);
-  --muted-foreground: hsl(0, 0%, 30%);
+  --background: hsl(220, 20%, 97%);
+  --foreground: hsl(220, 25%, 10%);
+  --muted: hsl(220, 14%, 94%);
+  --muted-foreground: hsl(220, 10%, 42%);
   --popover: hsl(0, 0%, 100%);
-  --popover-foreground: hsl(0, 0%, 0%);
+  --popover-foreground: hsl(220, 25%, 10%);
   --card: hsl(0, 0%, 100%);
-  --card-foreground: hsl(0, 0%, 0%);
-  --border: hsl(0, 0%, 80%);
-  --input: hsl(0, 0%, 90%);
-  --primary: hsl(180, 100%, 40%);
-  --primary-foreground: hsl(0, 0%, 0%);
-  --secondary: hsl(0, 0%, 95%);
-  --secondary-foreground: hsl(0, 0%, 0%);
-  --accent: hsl(180, 100%, 40%);
-  --accent-foreground: hsl(0, 0%, 0%);
-  --destructive: hsl(0, 100%, 50%);
+  --card-foreground: hsl(220, 25%, 10%);
+  --border: hsl(220, 14%, 89%);
+  --input: hsl(220, 14%, 91%);
+  --primary: hsl(234, 89%, 60%);
+  --primary-foreground: hsl(0, 0%, 100%);
+  --secondary: hsl(220, 14%, 94%);
+  --secondary-foreground: hsl(220, 25%, 10%);
+  --accent: hsl(234, 89%, 96%);
+  --accent-foreground: hsl(234, 89%, 50%);
+  --destructive: hsl(0, 84%, 60%);
   --destructive-foreground: hsl(0, 0%, 100%);
-  --ring: hsl(180, 100%, 40%);
-  --radius: 0.5rem;
+  --ring: hsl(234, 89%, 60%);
+  --radius: 0.625rem;
 }
 
 .dark {
-  --background: hsl(0, 0%, 0%);
-  --foreground: hsl(0, 0%, 100%);
-  --muted: hsl(0, 0%, 10%);
-  --muted-foreground: hsl(0, 0%, 70%);
-  --popover: hsl(0, 0%, 0%);
-  --popover-foreground: hsl(0, 0%, 100%);
-  --card: hsl(0, 0%, 0%);
-  --card-foreground: hsl(0, 0%, 100%);
-  --border: hsl(0, 0%, 20%);
-  --input: hsl(0, 0%, 15%);
-  --primary: hsl(180, 100%, 50%);
-  --primary-foreground: hsl(0, 0%, 0%);
-  --secondary: hsl(0, 0%, 15%);
-  --secondary-foreground: hsl(0, 0%, 100%);
-  --accent: hsl(180, 100%, 50%);
-  --accent-foreground: hsl(0, 0%, 0%);
-  --destructive: hsl(0, 100%, 50%);
+  --background: hsl(224, 30%, 8%);
+  --foreground: hsl(220, 14%, 96%);
+  --muted: hsl(224, 20%, 14%);
+  --muted-foreground: hsl(220, 10%, 58%);
+  --popover: hsl(224, 30%, 10%);
+  --popover-foreground: hsl(220, 14%, 96%);
+  --card: hsl(224, 25%, 11%);
+  --card-foreground: hsl(220, 14%, 96%);
+  --border: hsl(224, 18%, 18%);
+  --input: hsl(224, 18%, 16%);
+  --primary: hsl(234, 89%, 65%);
+  --primary-foreground: hsl(0, 0%, 100%);
+  --secondary: hsl(224, 20%, 16%);
+  --secondary-foreground: hsl(220, 14%, 96%);
+  --accent: hsl(234, 60%, 18%);
+  --accent-foreground: hsl(234, 89%, 75%);
+  --destructive: hsl(0, 84%, 60%);
   --destructive-foreground: hsl(0, 0%, 100%);
-  --ring: hsl(180, 100%, 50%);
-  --radius: 0.5rem;
+  --ring: hsl(234, 89%, 65%);
+  --radius: 0.625rem;
 }
 
 @layer base {
@@ -64,6 +62,6 @@
 }
 
 .checkerboard {
-  background-image: url('data:image/svg+xml,<svg width="20" height="20" viewBox="0 0 20 20" xmlns="http://www.w3.org/2000/svg"><rect x="0" y="0" width="10" height="10" fill="%23f3f4f6"/><rect x="10" y="10" width="10" height="10" fill="%23f3f4f6"/></svg>');
+  background-image: url('data:image/svg+xml,<svg width="20" height="20" viewBox="0 0 20 20" xmlns="http://www.w3.org/2000/svg"><rect width="20" height="20" fill="%23ffffff"/><rect x="0" y="0" width="10" height="10" fill="%23eef0f4"/><rect x="10" y="10" width="10" height="10" fill="%23eef0f4"/></svg>');
   background-size: 20px 20px;
 }

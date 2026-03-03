@@ -1,15 +1,11 @@
-import { useState, useRef, useCallback, useEffect, useMemo } from "react";
+import { useState, useRef, useCallback, useEffect } from "react";
 import UploadSection from "./upload-section";
 import PreviewSection from "./preview-section";
 import ControlsSection, { SpotPreviewData } from "./controls-section";
-import ResizeModal from "./resize-modal";
 import { calculateImageDimensions, downloadCanvas } from "@/lib/image-utils";
 import { cropImageToContent } from "@/lib/image-crop";
 import { createVectorStroke, downloadVectorStroke, createVectorPaths, type VectorFormat } from "@/lib/vector-stroke";
-import { createTrueContour } from "@/lib/true-contour";
-import { createCTContour } from "@/lib/ctcontour";
 import { checkCadCutBounds, type CadCutBounds } from "@/lib/cadcut-bounds";
-import { downloadZipPackage } from "@/lib/zip-download";
 import { downloadContourPDF, type CachedContourData, type SpotColorInput } from "@/lib/contour-outline";
 import { getContourWorkerManager, type DetectedAlgorithm, type DetectedShapeInfo } from "@/lib/contour-worker-manager";
 import { downloadShapePDF, calculateShapeDimensions, generateShapePathPointsInches } from "@/lib/shape-outline";
@@ -18,9 +14,10 @@ import { removeBackgroundFromImage } from "@/lib/background-removal";
 import type { ParsedPDFData } from "@/lib/pdf-parser";
 import { detectShape, mapDetectedShapeToType } from "@/lib/shape-detection";
 import { useToast } from "@/hooks/use-toast";
+import EnhanceWorker from "@/lib/enhance-worker?worker";
 
-export type { ImageInfo, StrokeSettings, StrokeMode, ResizeSettings, ShapeSettings, StickerSize, LockedContour } from "@/lib/types";
-import type { ImageInfo, StrokeSettings, StrokeMode, ResizeSettings, ShapeSettings, StickerSize, LockedContour } from "@/lib/types";
+export type { ImageInfo, StrokeSettings, StrokeMode, ResizeSettings, ShapeSettings, StickerSize, LockedContour, SegmentLayer, SegmentationData } from "@/lib/types";
+import type { ImageInfo, StrokeSettings, StrokeMode, ResizeSettings, ShapeSettings, StickerSize, LockedContour, SegmentLayer, SegmentationData } from "@/lib/types";
 
 export default function ImageEditor({ onDesignUploaded }: { onDesignUploaded?: () => void } = {}) {
   const { toast } = useToast();
@@ -60,10 +57,9 @@ export default function ImageEditor({ onDesignUploaded }: { onDesignUploaded?: (
   const [stickerSize, setStickerSize] = useState<StickerSize>(4); // Default 4 inch max dimension
   const [isProcessing, setIsProcessing] = useState(false);
   const [isRemovingBackground, setIsRemovingBackground] = useState(false);
-  const [showResizeModal, setShowResizeModal] = useState(false);
-  const [detectedDimensions, setDetectedDimensions] = useState<{ width: number; height: number } | null>(null);
-  const [pendingImageInfo, setPendingImageInfo] = useState<ImageInfo | null>(null);
   const [spotPreviewData, setSpotPreviewData] = useState<SpotPreviewData>({ enabled: false, colors: [] });
+  const [highlightedColor, setHighlightedColor] = useState<{ colorIndex: number; regionId: number | null } | null>(null);
+  const highlightTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const [detectedAlgorithm, setDetectedAlgorithm] = useState<DetectedAlgorithm | undefined>(undefined);
   const [detectedShapeType, setDetectedShapeType] = useState<'circle' | 'oval' | 'square' | 'rectangle' | null>(null);
   const [detectedShapeInfo, setDetectedShapeInfo] = useState<DetectedShapeInfo | null>(null);
@@ -72,10 +68,97 @@ export default function ImageEditor({ onDesignUploaded }: { onDesignUploaded?: (
   const cutLabelRef = useRef<HTMLDivElement>(null);
   const [lockedContour, setLockedContour] = useState<LockedContour | null>(null);
   const [showApplyAddDropdown, setShowApplyAddDropdown] = useState(false);
+  const [segmentationData, setSegmentationData] = useState<SegmentationData>({
+    enabled: false,
+    layers: [],
+    mode: 'colors',
+  });
+  const [isSegmenting, setIsSegmenting] = useState(false);
+  const [enhancingMode, setEnhancingMode] = useState<'design' | 'faces' | null>(null);
   const applyAddRef = useRef<HTMLDivElement>(null);
   
   const canvasRef = useRef<HTMLCanvasElement>(null);
-  
+
+  // Undo/Redo history
+  interface EditorSnapshot {
+    strokeSettings: StrokeSettings;
+    resizeSettings: ResizeSettings;
+    shapeSettings: ShapeSettings;
+    spotColors: SpotPreviewData;
+  }
+  const historyRef = useRef<EditorSnapshot[]>([]);
+  const historyIndexRef = useRef(-1);
+  const isRestoringRef = useRef(false);
+  const snapshotTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const [canUndo, setCanUndo] = useState(false);
+  const [canRedo, setCanRedo] = useState(false);
+
+  const pushSnapshot = useCallback(() => {
+    if (isRestoringRef.current) return;
+    const snap: EditorSnapshot = {
+      strokeSettings: { ...strokeSettings },
+      resizeSettings: { ...resizeSettings },
+      shapeSettings: { ...shapeSettings },
+      spotColors: { ...spotPreviewData, colors: spotPreviewData.colors.map(c => ({ ...c, regions: c.regions?.map(r => ({ ...r })) })) },
+    };
+    const idx = historyIndexRef.current;
+    historyRef.current = historyRef.current.slice(0, idx + 1);
+    historyRef.current.push(snap);
+    if (historyRef.current.length > 50) historyRef.current.shift();
+    historyIndexRef.current = historyRef.current.length - 1;
+    setCanUndo(historyIndexRef.current > 0);
+    setCanRedo(false);
+  }, [strokeSettings, resizeSettings, shapeSettings, spotPreviewData]);
+
+  // Debounced snapshot: batch rapid changes into one history entry
+  useEffect(() => {
+    if (isRestoringRef.current) return;
+    if (snapshotTimerRef.current) clearTimeout(snapshotTimerRef.current);
+    snapshotTimerRef.current = setTimeout(() => {
+      pushSnapshot();
+    }, 600);
+    return () => { if (snapshotTimerRef.current) clearTimeout(snapshotTimerRef.current); };
+  }, [strokeSettings, resizeSettings, shapeSettings, spotPreviewData, pushSnapshot]);
+
+  const handleUndo = useCallback(() => {
+    if (historyIndexRef.current <= 0) return;
+    isRestoringRef.current = true;
+    historyIndexRef.current--;
+    const snap = historyRef.current[historyIndexRef.current];
+    setStrokeSettings(snap.strokeSettings);
+    setResizeSettings(snap.resizeSettings);
+    setShapeSettings(snap.shapeSettings);
+    setSpotPreviewData(snap.spotColors);
+    setCanUndo(historyIndexRef.current > 0);
+    setCanRedo(true);
+    requestAnimationFrame(() => { isRestoringRef.current = false; });
+  }, []);
+
+  const handleRedo = useCallback(() => {
+    if (historyIndexRef.current >= historyRef.current.length - 1) return;
+    isRestoringRef.current = true;
+    historyIndexRef.current++;
+    const snap = historyRef.current[historyIndexRef.current];
+    setStrokeSettings(snap.strokeSettings);
+    setResizeSettings(snap.resizeSettings);
+    setShapeSettings(snap.shapeSettings);
+    setSpotPreviewData(snap.spotColors);
+    setCanUndo(true);
+    setCanRedo(historyIndexRef.current < historyRef.current.length - 1);
+    requestAnimationFrame(() => { isRestoringRef.current = false; });
+  }, []);
+
+  const setHighlightWithTimer = useCallback((color: { colorIndex: number; regionId: number | null } | null) => {
+    if (highlightTimerRef.current) clearTimeout(highlightTimerRef.current);
+    setHighlightedColor(color);
+    if (color) {
+      highlightTimerRef.current = setTimeout(() => {
+        setHighlightedColor(null);
+        highlightTimerRef.current = null;
+      }, 3000);
+    }
+  }, []);
+
   // Debounced settings for heavy processing
   const debouncedStrokeSettings = useDebouncedValue(strokeSettings, 100);
   const debouncedResizeSettings = useDebouncedValue(resizeSettings, 250); // Higher debounce for size changes
@@ -199,126 +282,29 @@ export default function ImageEditor({ onDesignUploaded }: { onDesignUploaded?: (
     setShowApplyAddDropdown(false);
   }, [cutContourLabel, toast, imageInfo, shapeSettings, resizeSettings]);
 
-  const handleImageUpload = useCallback((file: File, image: HTMLImageElement) => {
-    try {
-      // Validate image size - allow very large images since we auto-downsample
-      // 1 billion pixels = ~1000MP, enough for 10ft+ prints at 300 DPI
-      if (image.width * image.height > 1000000000) { // 1000MP limit
-        alert('Image is too large. Please upload an image smaller than 1000 megapixels.');
-        return;
-      }
-      
-      // Validate image dimensions
-      if (image.width <= 0 || image.height <= 0) {
-        alert('Invalid image dimensions.');
-        return;
-      }
-      
-      // Automatically crop the image to remove ALL empty space
-      const croppedCanvas = cropImageToContent(image);
-      if (!croppedCanvas) {
-        console.error('Failed to crop image, using original');
-        handleFallbackImage(file, image);
-        return;
-      }
-      
-      const croppedImage = new Image();
-      
-      croppedImage.onload = () => {
-        // Close any open dropdowns by blurring active element
-        if (document.activeElement instanceof HTMLElement) {
-          document.activeElement.blur();
-        }
-        
-        const dpi = 300; // Default DPI for high-quality printing
-        
-        // Downsample very large images to prevent performance issues
-        // 4000px max dimension provides enough quality for contour generation
-        const MAX_STORED_DIMENSION = 4000;
-        let finalImage = croppedImage;
-        let finalWidth = croppedImage.width;
-        let finalHeight = croppedImage.height;
-        
-        const maxDim = Math.max(croppedImage.width, croppedImage.height);
-        if (maxDim > MAX_STORED_DIMENSION) {
-          const scale = MAX_STORED_DIMENSION / maxDim;
-          finalWidth = Math.round(croppedImage.width * scale);
-          finalHeight = Math.round(croppedImage.height * scale);
-          
-          console.log(`[Upload] Downsampling from ${croppedImage.width}x${croppedImage.height} to ${finalWidth}x${finalHeight}`);
-          
-          const downsampleCanvas = document.createElement('canvas');
-          downsampleCanvas.width = finalWidth;
-          downsampleCanvas.height = finalHeight;
-          const dsCtx = downsampleCanvas.getContext('2d')!;
-          dsCtx.imageSmoothingEnabled = true;
-          dsCtx.imageSmoothingQuality = 'high';
-          dsCtx.drawImage(croppedImage, 0, 0, finalWidth, finalHeight);
-          
-          // Create new image from downsampled canvas
-          finalImage = new Image();
-          finalImage.src = downsampleCanvas.toDataURL('image/png');
-        }
-        
-        // Wait for final image to be ready (only needed if we downsampled)
-        const processImage = () => {
-          // Create final cropped image info with zero padding
-          const newImageInfo: ImageInfo = {
-            file,
-            image: finalImage,
-            originalWidth: finalWidth,
-            originalHeight: finalHeight,
-            dpi,
-          };
-          
-          // Calculate detected dimensions based on ORIGINAL image size, not downsampled
-          // This preserves the correct aspect ratio for resize calculations
-          const originalMaxDim = Math.max(croppedImage.width, croppedImage.height);
-          const { widthInches, heightInches } = calculateImageDimensions(croppedImage.width, croppedImage.height, dpi);
-          
-          // Store pending info and show resize modal
-          setPendingImageInfo(newImageInfo);
-          setDetectedDimensions({ width: widthInches, height: heightInches });
-          setShowResizeModal(true);
-        };
-        
-        if (finalImage === croppedImage) {
-          processImage();
-        } else {
-          finalImage.onload = processImage;
-        }
-      };
-      
-      croppedImage.onerror = () => {
-        console.error('Error loading cropped image, using original');
-        handleFallbackImage(file, image);
-      };
-      
-      croppedImage.src = croppedCanvas.toDataURL('image/png');
-    } catch (error) {
-      console.error('Error processing uploaded image:', error);
-      handleFallbackImage(file, image);
-    }
-  }, [shapeSettings, stickerSize, updateCadCutBounds]);
+  const canvasToImage = useCallback((canvas: HTMLCanvasElement): Promise<HTMLImageElement> => {
+    return new Promise((resolve, reject) => {
+      canvas.toBlob((blob) => {
+        if (!blob) { reject(new Error('toBlob failed')); return; }
+        const url = URL.createObjectURL(blob);
+        const img = new Image();
+        img.onload = () => resolve(img);
+        img.onerror = () => { URL.revokeObjectURL(url); reject(new Error('Image load failed')); };
+        img.src = url;
+      }, 'image/png');
+    });
+  }, []);
 
-  const handleResizeConfirm = useCallback((widthInches: number, heightInches: number) => {
-    if (!pendingImageInfo) return;
-    
-    // Apply the pending image info
-    setImageInfo(pendingImageInfo);
-    
-    // Detect shape from image (threshold must match detectShape's internal confidenceThreshold of 0.88)
-    const SHAPE_CONFIDENCE_THRESHOLD = 0.88;
-    const detectionResult = detectShape(pendingImageInfo.image);
-    const detectedShapeType = mapDetectedShapeToType(detectionResult.shape);
-    const shouldAutoApplyShape = detectedShapeType !== null && detectionResult.confidence >= SHAPE_CONFIDENCE_THRESHOLD;
-    
-    // Reset all settings to defaults when new image is uploaded
-    // If shape detected, enable shape mode; otherwise default to contour mode
+  const applyNewImage = useCallback((newImageInfo: ImageInfo, widthInches: number, heightInches: number) => {
+    setImageInfo(newImageInfo);
+
+    const detectionResult = detectShape(newImageInfo.image);
+    const detectedType = mapDetectedShapeToType(detectionResult.shape);
+
     setStrokeSettings({
       width: 0.14,
       color: "#ffffff",
-      enabled: !shouldAutoApplyShape,
+      enabled: false,
       alphaThreshold: 128,
       backgroundColor: "#ffffff",
       useCustomBackground: true,
@@ -328,11 +314,11 @@ export default function ImageEditor({ onDesignUploaded }: { onDesignUploaded?: (
       contourMode: undefined,
     });
     setDetectedAlgorithm(undefined);
-    
-    const autoType = detectedShapeType || 'square';
+
+    const autoType = detectedType || 'square';
     const isCircularType = autoType === 'circle' || autoType === 'oval';
     const newShapeSettings: ShapeSettings = {
-      enabled: shouldAutoApplyShape,
+      enabled: false,
       type: autoType,
       offset: isCircularType ? 0.05 : 0.25,
       fillColor: '#FFFFFF',
@@ -340,35 +326,32 @@ export default function ImageEditor({ onDesignUploaded }: { onDesignUploaded?: (
       strokeWidth: 2,
       strokeColor: '#000000',
       cornerRadius: 0.25,
+      bleedEnabled: false,
+      bleedColor: '#FFFFFF',
     };
     setShapeSettings(newShapeSettings);
-    
-    setDetectedShapeType(detectedShapeType);
-    setDetectedShapeInfo(detectedShapeType ? {
-      type: detectedShapeType,
+
+    setDetectedShapeType(detectedType);
+    setDetectedShapeInfo(detectedType ? {
+      type: detectedType,
       boundingBox: detectionResult.boundingBox
     } : null);
-    
-    if (shouldAutoApplyShape) {
-      setStrokeMode('shape');
-    } else {
-      setStrokeMode('contour');
-    }
+
+    setStrokeMode('contour');
     setCadCutBounds(null);
     setLockedContour(null);
-    
+
     setResizeSettings(prev => ({
       ...prev,
       widthInches,
       heightInches,
     }));
-    
+
     const maxDim = Math.max(widthInches, heightInches);
     const validSizes: StickerSize[] = [2, 2.5, 3, 3.5, 4, 4.5, 5, 5.5];
     const fittingSize = validSizes.find(size => size >= maxDim) || 5.5;
     setStickerSize(fittingSize as StickerSize);
-    
-    // Initial bounds check with the actual shape settings being applied
+
     const shapeDims = calculateShapeDimensions(
       widthInches,
       heightInches,
@@ -376,23 +359,81 @@ export default function ImageEditor({ onDesignUploaded }: { onDesignUploaded?: (
       newShapeSettings.offset
     );
     updateCadCutBounds(shapeDims.widthInches, shapeDims.heightInches, newShapeSettings);
-    
-    // Close modal and clear pending state
-    setShowResizeModal(false);
-    setPendingImageInfo(null);
-    setDetectedDimensions(null);
-  }, [pendingImageInfo, updateCadCutBounds]);
+  }, [updateCadCutBounds]);
 
-  const handleResizeModalClose = useCallback(() => {
-    setShowResizeModal(false);
-    setPendingImageInfo(null);
-    setDetectedDimensions(null);
-  }, []);
+  const handleImageUpload = useCallback(async (file: File, image: HTMLImageElement) => {
+    try {
+      if (image.width <= 0 || image.height <= 0) {
+        alert('Invalid image dimensions.');
+        return;
+      }
+
+      if (document.activeElement instanceof HTMLElement) {
+        document.activeElement.blur();
+      }
+
+      const dpi = 300;
+
+      // Crop whitespace. For very large images, skip the full-res crop and use directly
+      const totalPixels = image.width * image.height;
+      let croppedCanvas: HTMLCanvasElement | null = null;
+      if (totalPixels <= 16_000_000) {
+        croppedCanvas = cropImageToContent(image);
+      }
+
+      const sourceCanvas = croppedCanvas || (() => {
+        const c = document.createElement('canvas');
+        c.width = image.width; c.height = image.height;
+        c.getContext('2d')!.drawImage(image, 0, 0);
+        return c;
+      })();
+
+      const origW = sourceCanvas.width;
+      const origH = sourceCanvas.height;
+
+      // Downsample for the in-memory working image (keeps preview fast)
+      const MAX_STORED_DIMENSION = 4000;
+      const maxDim = Math.max(origW, origH);
+      let finalCanvas = sourceCanvas;
+      let finalW = origW;
+      let finalH = origH;
+
+      if (maxDim > MAX_STORED_DIMENSION) {
+        const scale = MAX_STORED_DIMENSION / maxDim;
+        finalW = Math.round(origW * scale);
+        finalH = Math.round(origH * scale);
+        console.log(`[Upload] Downsampling from ${origW}x${origH} to ${finalW}x${finalH}`);
+        finalCanvas = document.createElement('canvas');
+        finalCanvas.width = finalW;
+        finalCanvas.height = finalH;
+        const dsCtx = finalCanvas.getContext('2d')!;
+        dsCtx.imageSmoothingEnabled = true;
+        dsCtx.imageSmoothingQuality = 'high';
+        dsCtx.drawImage(sourceCanvas, 0, 0, finalW, finalH);
+      }
+
+      const finalImage = await canvasToImage(finalCanvas);
+
+      const newImageInfo: ImageInfo = {
+        file,
+        image: finalImage,
+        originalWidth: finalW,
+        originalHeight: finalH,
+        dpi,
+      };
+
+      const { widthInches, heightInches } = calculateImageDimensions(origW, origH, dpi);
+
+      applyNewImage(newImageInfo, widthInches, heightInches);
+    } catch (error) {
+      console.error('Error processing uploaded image:', error);
+      handleFallbackImage(file, image);
+    }
+  }, [shapeSettings, stickerSize, updateCadCutBounds, canvasToImage, applyNewImage]);
 
   const handleFallbackImage = useCallback((file: File, image: HTMLImageElement) => {
     const dpi = 300;
     
-    // Always try to crop even fallback images to remove empty space
     const croppedCanvas = cropImageToContent(image);
     const finalImage = croppedCanvas ? (() => {
       const img = new Image();
@@ -401,20 +442,11 @@ export default function ImageEditor({ onDesignUploaded }: { onDesignUploaded?: (
     })() : image;
 
     const processImage = () => {
-      // Close any open dropdowns by blurring active element
       if (document.activeElement instanceof HTMLElement) {
         document.activeElement.blur();
       }
       
-      let { widthInches, heightInches } = calculateImageDimensions(finalImage.width, finalImage.height, dpi);
-      
-      // Always resize to fit within the selected sticker size
-      const maxDimension = Math.max(widthInches, heightInches);
-      if (maxDimension > stickerSize) {
-        const scale = stickerSize / maxDimension;
-        widthInches = parseFloat((widthInches * scale).toFixed(2));
-        heightInches = parseFloat((heightInches * scale).toFixed(2));
-      }
+      const { widthInches, heightInches } = calculateImageDimensions(finalImage.width, finalImage.height, dpi);
 
       const newImageInfo: ImageInfo = {
         file,
@@ -424,71 +456,7 @@ export default function ImageEditor({ onDesignUploaded }: { onDesignUploaded?: (
         dpi,
       };
 
-      setImageInfo(newImageInfo);
-
-      // Detect shape from image (same logic as handleResizeConfirm)
-      const SHAPE_CONFIDENCE_THRESHOLD = 0.88;
-      const detectionResult = detectShape(finalImage);
-      const detectedShapeType = mapDetectedShapeToType(detectionResult.shape);
-      const shouldAutoApplyShape = detectedShapeType !== null && detectionResult.confidence >= SHAPE_CONFIDENCE_THRESHOLD;
-
-      setStrokeSettings({
-        width: 0.14,
-        color: "#ffffff",
-        enabled: !shouldAutoApplyShape,
-        alphaThreshold: 128,
-        backgroundColor: "#ffffff",
-        useCustomBackground: true,
-        cornerMode: 'rounded',
-        autoBridging: true,
-        autoBridgingThreshold: 0.02,
-        contourMode: undefined,
-      });
-      setDetectedAlgorithm(undefined);
-      setDetectedShapeType(detectedShapeType);
-      setDetectedShapeInfo(detectedShapeType ? {
-        type: detectedShapeType,
-        boundingBox: detectionResult.boundingBox
-      } : null);
-      
-      const autoType2 = detectedShapeType || 'square';
-      const isCircularType2 = autoType2 === 'circle' || autoType2 === 'oval';
-      const newShapeSettings: ShapeSettings = {
-        enabled: shouldAutoApplyShape,
-        type: autoType2,
-        offset: isCircularType2 ? 0.05 : 0.25,
-        fillColor: '#FFFFFF',
-        strokeEnabled: false,
-        strokeWidth: 2,
-        strokeColor: '#000000',
-        cornerRadius: 0.25,
-      };
-      setShapeSettings(newShapeSettings);
-      
-      // Auto-apply shape mode if detected, otherwise default to contour
-      if (shouldAutoApplyShape) {
-        setStrokeMode('shape');
-      } else {
-        setStrokeMode('contour');
-      }
-      
-      setCadCutBounds(null);
-      setStickerSize(4);
-
-      setResizeSettings(prev => ({
-        ...prev,
-        widthInches,
-        heightInches,
-      }));
-      
-      // Initial bounds check with actual shape settings
-      const shapeDims = calculateShapeDimensions(
-        widthInches,
-        heightInches,
-        newShapeSettings.type,
-        newShapeSettings.offset
-      );
-      updateCadCutBounds(shapeDims.widthInches, shapeDims.heightInches, newShapeSettings);
+      applyNewImage(newImageInfo, widthInches, heightInches);
     };
 
     if (croppedCanvas) {
@@ -496,7 +464,7 @@ export default function ImageEditor({ onDesignUploaded }: { onDesignUploaded?: (
     } else {
       processImage();
     }
-  }, [stickerSize, updateCadCutBounds]);
+  }, [applyNewImage]);
 
   const handlePDFUpload = useCallback((file: File, pdfData: ParsedPDFData) => {
     // Close any open dropdowns
@@ -542,6 +510,8 @@ export default function ImageEditor({ onDesignUploaded }: { onDesignUploaded?: (
       strokeWidth: 2,
       strokeColor: '#000000',
       cornerRadius: 0.25,
+      bleedEnabled: false,
+      bleedColor: '#FFFFFF',
     });
     
     // If PDF has CutContour, set mode to 'contour' but disable generation
@@ -554,14 +524,7 @@ export default function ImageEditor({ onDesignUploaded }: { onDesignUploaded?: (
     setCadCutBounds(null);
     setStickerSize(4);
     
-    // Calculate dimensions
-    let { widthInches, heightInches } = calculateImageDimensions(image.width, image.height, dpi);
-    const maxDimension = Math.max(widthInches, heightInches);
-    if (maxDimension > 4) {
-      const scale = 4 / maxDimension;
-      widthInches = parseFloat((widthInches * scale).toFixed(2));
-      heightInches = parseFloat((heightInches * scale).toFixed(2));
-    }
+    const { widthInches, heightInches } = calculateImageDimensions(image.width, image.height, dpi);
     
     setResizeSettings(prev => ({
       ...prev,
@@ -672,15 +635,7 @@ export default function ImageEditor({ onDesignUploaded }: { onDesignUploaded?: (
       
       // Recalculate resize settings based on cropped image dimensions
       const dpi = imageInfo.dpi || 300;
-      let { widthInches, heightInches } = calculateImageDimensions(newWidth, newHeight, dpi);
-      
-      // Scale to fit within the selected sticker size if needed
-      const maxDimension = Math.max(widthInches, heightInches);
-      if (maxDimension > stickerSize) {
-        const scale = stickerSize / maxDimension;
-        widthInches = parseFloat((widthInches * scale).toFixed(2));
-        heightInches = parseFloat((heightInches * scale).toFixed(2));
-      }
+      const { widthInches, heightInches } = calculateImageDimensions(newWidth, newHeight, dpi);
       
       setResizeSettings(prev => ({
         ...prev,
@@ -727,6 +682,191 @@ export default function ImageEditor({ onDesignUploaded }: { onDesignUploaded?: (
     
     setStrokeSettings(updated);
   }, [strokeSettings]);
+
+  const handleSegmentImage = useCallback(async () => {
+    if (!imageInfo || isSegmenting) return;
+
+    setIsSegmenting(true);
+    try {
+      const canvas = document.createElement('canvas');
+      canvas.width = imageInfo.image.width;
+      canvas.height = imageInfo.image.height;
+      const ctx = canvas.getContext('2d')!;
+      ctx.drawImage(imageInfo.image, 0, 0);
+
+      const blob = await new Promise<Blob>((resolve, reject) => {
+        canvas.toBlob((b) => b ? resolve(b) : reject(new Error('Failed to create blob')), 'image/png');
+      });
+
+      const formData = new FormData();
+      formData.append('image', blob, 'image.png');
+
+      const response = await fetch('/api/segment-image', {
+        method: 'POST',
+        body: formData,
+      });
+
+      if (!response.ok) {
+        const errData = await response.json().catch(() => ({}));
+        throw new Error(errData.error || `Server error ${response.status}`);
+      }
+
+      const data = await response.json();
+      const layers: SegmentLayer[] = (data.layers || []).map((l: any) => ({
+        ...l,
+        spotWhite: l.spotWhite ?? false,
+        spotGloss: l.spotGloss ?? false,
+      }));
+
+      setSegmentationData({
+        enabled: true,
+        layers,
+        mode: 'items',
+      });
+
+      toast({
+        title: "Segmentation Complete",
+        description: `Detected ${layers.length} item${layers.length !== 1 ? 's' : ''} in the image.`,
+      });
+    } catch (error) {
+      console.error('Segmentation failed:', error);
+      toast({
+        title: "Segmentation Failed",
+        description: error instanceof Error ? error.message : "Unknown error",
+        variant: "destructive",
+      });
+    } finally {
+      setIsSegmenting(false);
+    }
+  }, [imageInfo, isSegmenting, toast]);
+
+  const [enhanceStage, setEnhanceStage] = useState('');
+  const enhanceWorkerRef = useRef<Worker | null>(null);
+
+  const handleEnhanceImage = useCallback(async (mode: 'design' | 'faces') => {
+    if (!imageInfo || enhancingMode) return;
+
+    setEnhancingMode(mode);
+    setEnhanceStage('Preparing…');
+
+    try {
+      const bmpCanvas = document.createElement('canvas');
+      bmpCanvas.width = imageInfo.image.width;
+      bmpCanvas.height = imageInfo.image.height;
+      const bmpCtx = bmpCanvas.getContext('2d')!;
+      bmpCtx.drawImage(imageInfo.image, 0, 0);
+      const bitmap = await createImageBitmap(bmpCanvas);
+      bmpCanvas.width = 1;
+      bmpCanvas.height = 1;
+
+      const worker = new EnhanceWorker();
+      enhanceWorkerRef.current = worker;
+
+      const result = await new Promise<{ blob: Blob; enhancedWidth: number; enhancedHeight: number }>((resolve, reject) => {
+        worker.onmessage = (e: MessageEvent) => {
+          const msg = e.data;
+          if (msg.type === 'progress') {
+            setEnhanceStage(msg.stage);
+          } else if (msg.type === 'result') {
+            resolve({ blob: msg.blob, enhancedWidth: msg.enhancedWidth, enhancedHeight: msg.enhancedHeight });
+          } else if (msg.type === 'error') {
+            reject(new Error(msg.error));
+          }
+        };
+        worker.onerror = (err) => reject(new Error(err.message || 'Worker crashed'));
+        worker.postMessage(
+          { type: 'enhance', imageBitmap: bitmap, mode, width: imageInfo.image.width, height: imageInfo.image.height },
+          [bitmap],
+        );
+      });
+
+      worker.terminate();
+      enhanceWorkerRef.current = null;
+
+      setEnhanceStage('Loading result…');
+      const enhancedUrl = URL.createObjectURL(result.blob);
+      const enhancedImage = await new Promise<HTMLImageElement>((resolve, reject) => {
+        const img = new Image();
+        img.onload = () => resolve(img);
+        img.onerror = () => { URL.revokeObjectURL(enhancedUrl); reject(new Error('Failed to load enhanced image')); };
+        img.src = enhancedUrl;
+      });
+
+      const newW = result.enhancedWidth;
+      const newH = result.enhancedHeight;
+      const dpi = imageInfo.dpi || 300;
+      const { widthInches, heightInches } = calculateImageDimensions(newW, newH, dpi);
+
+      const newImageInfo: ImageInfo = {
+        ...imageInfo,
+        image: enhancedImage,
+        originalWidth: newW,
+        originalHeight: newH,
+      };
+
+      setImageInfo(newImageInfo);
+      setResizeSettings(prev => ({ ...prev, widthInches, heightInches }));
+
+      const workerManager = getContourWorkerManager();
+      workerManager.clearCache();
+      setCadCutBounds(null);
+
+      const origW = imageInfo.originalWidth;
+      const origH = imageInfo.originalHeight;
+      const scaleUsed = Math.round(newW / origW);
+      const modeLabel = mode === 'faces' ? 'Faces' : 'Design';
+
+      toast({
+        title: `${modeLabel} Enhanced`,
+        description: `${origW}×${origH} → ${newW}×${newH} (${scaleUsed}x upscale)`,
+      });
+    } catch (error) {
+      console.error('[Enhance] Error:', error);
+      if (enhanceWorkerRef.current) {
+        enhanceWorkerRef.current.terminate();
+        enhanceWorkerRef.current = null;
+      }
+      toast({
+        title: "Enhancement Failed",
+        description: error instanceof Error ? error.message : "Unknown error. Please try again.",
+        variant: "destructive",
+      });
+    } finally {
+      setEnhancingMode(null);
+      setEnhanceStage('');
+    }
+  }, [imageInfo, enhancingMode, toast]);
+
+  const handleSegmentationChange = useCallback((data: Partial<SegmentationData>) => {
+    setSegmentationData(prev => ({ ...prev, ...data }));
+  }, []);
+
+  const handleSegmentLayerToggle = useCallback((layerId: string) => {
+    setSegmentationData(prev => ({
+      ...prev,
+      layers: prev.layers.map(l =>
+        l.id === layerId ? { ...l, visible: !l.visible } : l
+      ),
+    }));
+  }, []);
+
+  const handleSegmentLayerSpotChange = useCallback((layerId: string, field: 'spotWhite' | 'spotGloss', value: boolean) => {
+    setSegmentationData(prev => ({
+      ...prev,
+      layers: prev.layers.map(l =>
+        l.id === layerId ? { ...l, [field]: value } : l
+      ),
+    }));
+  }, []);
+
+  const handleSegmentLayerLabelChange = useCallback((layerId: string, label: string) => {
+    setSegmentationData(prev => ({
+      ...prev,
+      layers: prev.layers.map(l =>
+        l.id === layerId ? { ...l, label } : l
+      ),
+    }));
+  }, []);
 
   const handleShapeChange = useCallback((newSettings: Partial<ShapeSettings>) => {
     let updated = { ...shapeSettings, ...newSettings };
@@ -990,47 +1130,20 @@ export default function ImageEditor({ onDesignUploaded }: { onDesignUploaded?: (
     } finally {
       setIsProcessing(false);
     }
-  }, [imageInfo, strokeSettings, resizeSettings, shapeSettings, cutContourLabel]);
+  }, [imageInfo, strokeSettings, resizeSettings, shapeSettings, cutContourLabel, lockedContour]);
 
   // Empty state - no image uploaded
   if (!imageInfo) {
     return (
       <div className="min-h-[70vh] flex items-center justify-center">
         <div className="w-full max-w-xl mx-auto transition-all duration-300">
-          {showResizeModal && detectedDimensions ? (
-            <ResizeModal
-              open={showResizeModal}
-              onClose={handleResizeModalClose}
-              onConfirm={handleResizeConfirm}
-              detectedWidth={detectedDimensions.width}
-              detectedHeight={detectedDimensions.height}
-            />
-          ) : (
-            <UploadSection 
-              onImageUpload={handleImageUpload}
-              onPDFUpload={handlePDFUpload}
-              showCutLineInfo={false}
-              imageInfo={null}
-              resizeSettings={resizeSettings}
-              stickerSize={stickerSize}
-            />
-          )}
-        </div>
-      </div>
-    );
-  }
-
-  // Show inline resize panel when re-uploading from loaded state
-  if (showResizeModal && detectedDimensions) {
-    return (
-      <div className="min-h-[70vh] flex items-center justify-center">
-        <div className="w-full max-w-xl mx-auto transition-all duration-300">
-          <ResizeModal
-            open={showResizeModal}
-            onClose={handleResizeModalClose}
-            onConfirm={handleResizeConfirm}
-            detectedWidth={detectedDimensions.width}
-            detectedHeight={detectedDimensions.height}
+          <UploadSection 
+            onImageUpload={handleImageUpload}
+            onPDFUpload={handlePDFUpload}
+            showCutLineInfo={false}
+            imageInfo={null}
+            resizeSettings={resizeSettings}
+            stickerSize={stickerSize}
           />
         </div>
       </div>
@@ -1040,6 +1153,17 @@ export default function ImageEditor({ onDesignUploaded }: { onDesignUploaded?: (
   // Loaded state - image uploaded
   return (
     <div className="grid grid-cols-1 lg:grid-cols-12 gap-4">
+      {/* Hidden file input for Change Design */}
+      <div className="hidden">
+        <UploadSection
+          onImageUpload={handleImageUpload}
+          onPDFUpload={handlePDFUpload}
+          showCutLineInfo={false}
+          imageInfo={imageInfo}
+          resizeSettings={resizeSettings}
+          stickerSize={stickerSize}
+        />
+      </div>
       {/* Left sidebar - Settings */}
       <div className="lg:col-span-4 xl:col-span-3 space-y-3">
         <ControlsSection
@@ -1058,53 +1182,87 @@ export default function ImageEditor({ onDesignUploaded }: { onDesignUploaded?: (
           onStepChange={() => {}}
           onRemoveBackground={handleRemoveBackground}
           isRemovingBackground={isRemovingBackground}
+          onChangeDesign={() => document.getElementById('imageInput')?.click()}
           onSpotPreviewChange={setSpotPreviewData}
           detectedAlgorithm={detectedAlgorithm}
+          segmentationData={segmentationData}
+          isSegmenting={isSegmenting}
+          onSegmentImage={handleSegmentImage}
+          onSegmentationChange={handleSegmentationChange}
+          onSegmentLayerToggle={handleSegmentLayerToggle}
+          onSegmentLayerLabelChange={handleSegmentLayerLabelChange}
+          onSegmentLayerSpotChange={handleSegmentLayerSpotChange}
+          highlightedColorIndex={highlightedColor?.colorIndex ?? null}
+          highlightedRegionId={highlightedColor?.regionId ?? null}
+          onHighlightRegion={(colorIndex, regionId) => {
+            setHighlightWithTimer({ colorIndex, regionId });
+          }}
         />
       </div>
       
       {/* Right area - Upload, Info, and Preview */}
       <div className="lg:col-span-8 xl:col-span-9">
         <div className="sticky top-4 space-y-3">
-          {/* Top row: Change Image and Image Info - compact bar */}
+          {/* Top row: Actions bar */}
           <div className="flex items-center gap-2 bg-white rounded-lg border border-gray-100 shadow-sm px-3 py-2">
-            {/* Change Image - glowing button */}
-            <UploadSection 
-              onImageUpload={handleImageUpload}
-              onPDFUpload={handlePDFUpload}
-              showCutLineInfo={false}
-              imageInfo={imageInfo}
-              resizeSettings={resizeSettings}
-              stickerSize={stickerSize}
-            />
+            {/* Remove White Background */}
+            {imageInfo && (
+              <button
+                onClick={() => handleRemoveBackground(85)}
+                disabled={isRemovingBackground}
+                className="flex items-center gap-1 px-2.5 py-1.5 rounded-lg text-[11px] font-medium transition-all whitespace-nowrap bg-gradient-to-r from-indigo-500 to-violet-500 text-white hover:from-indigo-400 hover:to-violet-400 shadow-sm hover:shadow-md disabled:opacity-50"
+              >
+                {isRemovingBackground ? 'Removing...' : 'Remove White Background'}
+              </button>
+            )}
             
-            <div className="w-px h-6 bg-gray-200"></div>
+            <div className="flex-1"></div>
             
-            {/* Image Info - inline */}
-            <div className="flex items-center gap-3 flex-1">
-              {imageInfo?.file?.name && (
-                <p className="text-xs text-gray-500 truncate max-w-[140px]" title={imageInfo.file.name}>
-                  {imageInfo.file.name}
-                </p>
+            <div className="flex items-center gap-1">
+              {enhancingMode === 'design' ? (
+                <div className="flex items-center gap-1 px-2.5 py-1.5 rounded-lg text-[11px] font-medium bg-amber-100 text-amber-700 cursor-wait whitespace-nowrap">
+                  <svg className="w-3 h-3 animate-spin" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><path d="M12 2v4M12 18v4M4.93 4.93l2.83 2.83M16.24 16.24l2.83 2.83M2 12h4M18 12h4M4.93 19.07l2.83-2.83M16.24 7.76l2.83-2.83" /></svg>
+                  {enhanceStage || 'Enhancing Design…'}
+                </div>
+              ) : enhancingMode === 'faces' ? (
+                <div className="flex items-center gap-1 px-2.5 py-1.5 rounded-lg text-[11px] font-medium bg-violet-100 text-violet-700 cursor-wait whitespace-nowrap">
+                  <svg className="w-3 h-3 animate-spin" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><path d="M12 2v4M12 18v4M4.93 4.93l2.83 2.83M16.24 16.24l2.83 2.83M2 12h4M18 12h4M4.93 19.07l2.83-2.83M16.24 7.76l2.83-2.83" /></svg>
+                  {enhanceStage || 'Enhancing Faces…'}
+                </div>
+              ) : (
+                <>
+                  <button
+                    onClick={() => handleEnhanceImage('design')}
+                    disabled={!imageInfo}
+                    className="flex items-center gap-1 px-2.5 py-1.5 rounded-lg text-[11px] font-medium transition-all whitespace-nowrap bg-gradient-to-r from-amber-500 to-orange-500 text-white hover:from-amber-600 hover:to-orange-600 shadow-sm hover:shadow-md disabled:opacity-50"
+                    title="Enhance design quality (best for illustrations, logos, stickers)"
+                  >
+                    <svg className="w-3 h-3" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M12 3l1.912 5.813a2 2 0 0 0 1.275 1.275L21 12l-5.813 1.912a2 2 0 0 0-1.275 1.275L12 21l-1.912-5.813a2 2 0 0 0-1.275-1.275L3 12l5.813-1.912a2 2 0 0 0 1.275-1.275L12 3z" /></svg>
+                    Enhance Design
+                  </button>
+                  <button
+                    onClick={() => handleEnhanceImage('faces')}
+                    disabled={!imageInfo}
+                    className="flex items-center gap-1 px-2.5 py-1.5 rounded-lg text-[11px] font-medium transition-all whitespace-nowrap bg-gradient-to-r from-violet-500 to-purple-500 text-white hover:from-violet-600 hover:to-purple-600 shadow-sm hover:shadow-md disabled:opacity-50"
+                    title="Enhance faces (best for photo stickers with people)"
+                  >
+                    <svg className="w-3 h-3" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><circle cx="12" cy="8" r="5" /><path d="M20 21a8 8 0 0 0-16 0" /></svg>
+                    Enhance Faces
+                  </button>
+                </>
               )}
-              <div className="flex items-center gap-1.5">
-                <span className="text-sm font-semibold text-gray-700">{resizeSettings.widthInches.toFixed(1)}"</span>
-                <span className="text-gray-300">×</span>
-                <span className="text-sm font-semibold text-gray-700">{resizeSettings.heightInches.toFixed(1)}"</span>
-              </div>
-              <span className="text-[10px] text-gray-400 bg-gray-100 px-1.5 py-0.5 rounded">{resizeSettings.outputDPI} DPI</span>
             </div>
             
             {(strokeSettings.enabled || shapeSettings.enabled || (imageInfo?.isPDF && imageInfo?.pdfCutContourInfo?.hasCutContour)) && (
               <div className="flex flex-col items-end gap-1">
                 {lockedContour && (
-                  <div className="flex items-center gap-1.5 px-2 py-1 bg-blue-50 rounded border border-blue-200">
-                    <div className="w-2 h-2 rounded-full bg-blue-500"></div>
-                    <span className="text-[10px] text-blue-600 font-medium">{lockedContour.label}</span>
-                    <svg className="w-2.5 h-2.5 text-blue-400" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><rect x="3" y="11" width="18" height="11" rx="2" ry="2"/><path d="M7 11V7a5 5 0 0 1 10 0v4"/></svg>
+                  <div className="flex items-center gap-1.5 px-2 py-1 bg-indigo-50 rounded border border-indigo-200">
+                    <div className="w-2 h-2 rounded-full bg-indigo-500"></div>
+                    <span className="text-[10px] text-indigo-600 font-medium">{lockedContour.label}</span>
+                    <svg className="w-2.5 h-2.5 text-indigo-400" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><rect x="3" y="11" width="18" height="11" rx="2" ry="2"/><path d="M7 11V7a5 5 0 0 1 10 0v4"/></svg>
                     <button
                       onClick={() => setLockedContour(null)}
-                      className="ml-0.5 text-blue-400 hover:text-blue-600 transition-colors"
+                      className="ml-0.5 text-indigo-400 hover:text-indigo-600 transition-colors"
                       title="Remove locked contour"
                     >
                       <svg className="w-2.5 h-2.5" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>
@@ -1139,11 +1297,11 @@ export default function ImageEditor({ onDesignUploaded }: { onDesignUploaded?: (
                 <div className="relative" ref={applyAddRef}>
                   <button
                     onClick={() => setShowApplyAddDropdown(prev => !prev)}
-                    className="flex items-center gap-1.5 px-2 py-1 bg-cyan-50 rounded border border-cyan-100 hover:bg-cyan-100 transition-colors cursor-pointer"
+                    className="flex items-center gap-1.5 px-2 py-1 bg-indigo-50 rounded border border-indigo-100 hover:bg-indigo-100 transition-colors cursor-pointer"
                   >
-                    <div className="w-2 h-2 rounded-full bg-cyan-500"></div>
-                    <span className="text-[10px] text-cyan-600 font-medium">Add Contour</span>
-                    <svg className="w-2.5 h-2.5 text-cyan-400" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M11 4H4a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2v-7"/><path d="M18.5 2.5a2.121 2.121 0 0 1 3 3L12 15l-4 1 1-4 9.5-9.5z"/></svg>
+                    <div className="w-2 h-2 rounded-full bg-indigo-500"></div>
+                    <span className="text-[10px] text-indigo-600 font-medium">Add Contour</span>
+                    <svg className="w-2.5 h-2.5 text-indigo-400" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M11 4H4a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2v-7"/><path d="M18.5 2.5a2.121 2.121 0 0 1 3 3L12 15l-4 1 1-4 9.5-9.5z"/></svg>
                   </button>
                   {showApplyAddDropdown && (
                     <div className="absolute right-0 top-full mt-1 bg-white rounded-lg shadow-lg border border-gray-200 py-1 z-50 min-w-[140px]">
@@ -1151,7 +1309,7 @@ export default function ImageEditor({ onDesignUploaded }: { onDesignUploaded?: (
                         <button
                           key={label}
                           onClick={() => handleApplyAndAdd(label)}
-                          className={`w-full text-left px-3 py-1.5 text-[11px] hover:bg-cyan-50 transition-colors text-gray-600`}
+                          className={`w-full text-left px-3 py-1.5 text-[11px] hover:bg-indigo-50 transition-colors text-gray-600`}
                         >
                           {label}
                         </button>
@@ -1179,6 +1337,18 @@ export default function ImageEditor({ onDesignUploaded }: { onDesignUploaded?: (
             detectedAlgorithm={detectedAlgorithm}
             onStrokeChange={handleStrokeChange}
             lockedContour={lockedContour}
+            segmentationData={segmentationData}
+            fileName={imageInfo?.file?.name}
+            onResizeChange={handleResizeChange}
+            onUndo={handleUndo}
+            onRedo={handleRedo}
+            canUndo={canUndo}
+            canRedo={canRedo}
+            highlightedColorIndex={highlightedColor?.colorIndex ?? null}
+            highlightedRegionId={highlightedColor?.regionId ?? null}
+            onSpotColorClick={(colorIndex, regionId) => {
+              setHighlightWithTimer({ colorIndex, regionId });
+            }}
           />
         </div>
       </div>
@@ -1186,9 +1356,9 @@ export default function ImageEditor({ onDesignUploaded }: { onDesignUploaded?: (
       {/* Processing Modal */}
       {isProcessing && (
         <div className="fixed inset-0 bg-black/70 flex items-center justify-center z-50">
-          <div className="bg-slate-800 border border-slate-700 rounded-lg p-6 max-w-sm mx-4">
+          <div className="bg-slate-900 border border-slate-700/50 rounded-lg p-6 max-w-sm mx-4">
             <div className="flex items-center space-x-3">
-              <div className="animate-spin rounded-full h-5 w-5 border-2 border-cyan-500 border-t-transparent"></div>
+              <div className="animate-spin rounded-full h-5 w-5 border-2 border-indigo-500 border-t-transparent"></div>
               <span className="text-white">Processing...</span>
             </div>
           </div>

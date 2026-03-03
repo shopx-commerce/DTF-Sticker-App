@@ -1,10 +1,9 @@
-import { useEffect, useRef, forwardRef, useImperativeHandle, useState, useCallback } from "react";
-import { ZoomIn, ZoomOut, RotateCcw, ImageIcon, Palette, Loader2, Maximize2 } from "lucide-react";
+import { useEffect, useLayoutEffect, useRef, forwardRef, useImperativeHandle, useState, useCallback } from "react";
+import { ZoomIn, ZoomOut, RotateCcw, ImageIcon, Loader2, Scan, Link2, Unlink2, Undo2, Redo2 } from "lucide-react";
 import { Card, CardContent } from "@/components/ui/card";
 import { Button } from "@/components/ui/button";
-import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
-import { Slider } from "@/components/ui/slider";
-import { ImageInfo, StrokeSettings, ResizeSettings, ShapeSettings, type LockedContour } from "./image-editor";
+
+import { ImageInfo, StrokeSettings, ResizeSettings, ShapeSettings, type LockedContour, type SegmentationData } from "./image-editor";
 import { SpotPreviewData } from "./controls-section";
 import { CadCutBounds } from "@/lib/cadcut-bounds";
 import { processContourInWorker, type DetectedAlgorithm, type DetectedShapeInfo } from "@/lib/contour-worker-manager";
@@ -26,10 +25,20 @@ interface PreviewSectionProps {
   detectedAlgorithm?: DetectedAlgorithm;
   onStrokeChange?: (settings: Partial<StrokeSettings>) => void;
   lockedContour?: LockedContour | null;
+  segmentationData?: SegmentationData;
+  onSpotColorClick?: (colorIndex: number, regionId: number | null) => void;
+  fileName?: string;
+  onResizeChange?: (settings: Partial<ResizeSettings>) => void;
+  onUndo?: () => void;
+  onRedo?: () => void;
+  canUndo?: boolean;
+  canRedo?: boolean;
+  highlightedColorIndex?: number | null;
+  highlightedRegionId?: number | null;
 }
 
 const PreviewSection = forwardRef<HTMLCanvasElement, PreviewSectionProps>(
-  ({ imageInfo, strokeSettings, resizeSettings, shapeSettings, cadCutBounds, spotPreviewData, showCutLineInfo, onDetectedAlgorithm, detectedShapeType, detectedShapeInfo, detectedAlgorithm, onStrokeChange, lockedContour }, ref) => {
+  ({ imageInfo, strokeSettings, resizeSettings, shapeSettings, cadCutBounds, spotPreviewData, showCutLineInfo, onDetectedAlgorithm, detectedShapeType, detectedShapeInfo, detectedAlgorithm, onStrokeChange, lockedContour, segmentationData, onSpotColorClick, fileName, onResizeChange, onUndo, onRedo, canUndo, canRedo, highlightedColorIndex, highlightedRegionId }, ref) => {
     const canvasRef = useRef<HTMLCanvasElement>(null);
     const containerRef = useRef<HTMLDivElement>(null);
     const [zoom, setZoom] = useState(1);
@@ -50,16 +59,31 @@ const PreviewSection = forwardRef<HTMLCanvasElement, PreviewSectionProps>(
     const spotAnimFrameRef = useRef<number | null>(null);
     const renderRef = useRef<(() => void) | null>(null);
     
+    const renderRafRef = useRef<number | null>(null);
     const spotOverlayCacheRef = useRef<{key: string; canvas: HTMLCanvasElement} | null>(null);
-    const checkerboardPatternRef = useRef<{width: number; height: number; pattern: CanvasPattern} | null>(null);
+    const segmentOverlayCacheRef = useRef<{key: string; canvas: HTMLCanvasElement} | null>(null);
+    const segmentMaskImagesRef = useRef<Map<string, HTMLImageElement>>(new Map());
     const croppedImageCacheRef = useRef<{src: string; canvas: HTMLCanvasElement | HTMLImageElement} | null>(null);
     const holographicCacheRef = useRef<{contourKey: string; canvas: HTMLCanvasElement} | null>(null);
     const contourTransformRef = useRef<{x: number; y: number; width: number; height: number; canvasW: number; canvasH: number} | null>(null);
     const lastCanvasDimsRef = useRef<{width: number; height: number}>({width: 0, height: 0});
     
+    // Resize animation state
+    const prevResizeDimsRef = useRef<{w: number; h: number} | null>(null);
+    const resizeAnimRafRef = useRef<number | null>(null);
+    const resizeAnimTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+    const [resizeAnimState, setResizeAnimState] = useState<{scale: number; opacity: number; transitioning: boolean} | null>(null);
+    
     // Drag-to-pan state
     const [isDragging, setIsDragging] = useState(false);
     const dragStartRef = useRef<{x: number; y: number; panX: number; panY: number} | null>(null);
+    const mouseDownPosRef = useRef<{x: number; y: number} | null>(null);
+    
+    // Select-to-zoom state
+    const [selectZoomMode, setSelectZoomMode] = useState(false);
+    const [selectionRect, setSelectionRect] = useState<{x: number; y: number; w: number; h: number} | null>(null);
+    const selectionStartRef = useRef<{x: number; y: number} | null>(null);
+    const isSelectingRef = useRef(false);
     
     const maxPanXY = useCallback(() => {
       const limit = 25 + Math.max(0, (zoom - 1) * 50);
@@ -82,26 +106,161 @@ const PreviewSection = forwardRef<HTMLCanvasElement, PreviewSectionProps>(
       return { dx: (dxPx / w) * 100, dy: (dyPx / h) * 100 };
     }, []);
     
+    const applySelectionZoom = useCallback((selX: number, selY: number, selW: number, selH: number) => {
+      const container = containerRef.current;
+      if (!container || selW < 20 || selH < 20) return;
+      
+      const containerRect = container.getBoundingClientRect();
+      const elemW = containerRect.width;
+      const elemH = containerRect.height;
+      if (elemW === 0 || elemH === 0) return;
+
+      // Selection center relative to container, as percentage offset from center
+      const scxPct = ((selX + selW / 2) / elemW - 0.5) * 100;
+      const scyPct = ((selY + selH / 2) / elemH - 0.5) * 100;
+
+      // Content coordinates of selection center (undo current transform)
+      // CSS: transform-origin center, translate(panX%, panY%) scale(zoom)
+      // screenPct = zoom * contentPct + panPct
+      // contentPct = (screenPct - panPct) / zoom
+      const contentCxPct = (scxPct - panX) / zoom;
+      const contentCyPct = (scyPct - panY) / zoom;
+
+      // Content size of selection
+      const contentWPct = (selW / elemW * 100) / zoom;
+      const contentHPct = (selH / elemH * 100) / zoom;
+
+      // New zoom: fit content rect into container
+      const newZoom = Math.min(100 / contentWPct, 100 / contentHPct);
+      const clampedZoom = Math.min(Math.max(newZoom, 1), 5);
+
+      // New pan: put content center at screen center
+      // screenCenterPct = 0 = clampedZoom * contentCxPct + newPanX
+      const newPanX = -clampedZoom * contentCxPct;
+      const newPanY = -clampedZoom * contentCyPct;
+      
+      const clamped = clampPan(newPanX, newPanY);
+      setZoom(clampedZoom);
+      setPanX(clamped.x);
+      setPanY(clamped.y);
+    }, [zoom, panX, panY, clampPan]);
+
     const handleMouseDown = useCallback((e: React.MouseEvent) => {
       e.preventDefault();
+      
+      if (selectZoomMode && containerRef.current) {
+        const rect = containerRef.current.getBoundingClientRect();
+        const x = e.clientX - rect.left;
+        const y = e.clientY - rect.top;
+        selectionStartRef.current = { x, y };
+        isSelectingRef.current = true;
+        setSelectionRect({ x, y, w: 0, h: 0 });
+        return;
+      }
+      
       setIsDragging(true);
       dragStartRef.current = { x: e.clientX, y: e.clientY, panX, panY };
-    }, [panX, panY]);
+      mouseDownPosRef.current = { x: e.clientX, y: e.clientY };
+    }, [panX, panY, selectZoomMode]);
     
     const handleMouseMove = useCallback((e: React.MouseEvent) => {
-      if (!isDragging || !dragStartRef.current) return;
+      if (isSelectingRef.current && selectionStartRef.current && containerRef.current) {
+        const rect = containerRef.current.getBoundingClientRect();
+        const curX = Math.max(0, Math.min(e.clientX - rect.left, rect.width));
+        const curY = Math.max(0, Math.min(e.clientY - rect.top, rect.height));
+        const sx = selectionStartRef.current.x;
+        const sy = selectionStartRef.current.y;
+        setSelectionRect({
+          x: Math.min(sx, curX),
+          y: Math.min(sy, curY),
+          w: Math.abs(curX - sx),
+          h: Math.abs(curY - sy),
+        });
+        return;
+      }
+      
+      if (!isDragging || !dragStartRef.current || zoom <= 1) return;
       const d = pxToPanXY(e.clientX - dragStartRef.current.x, e.clientY - dragStartRef.current.y);
       const clamped = clampPan(dragStartRef.current.panX + d.dx, dragStartRef.current.panY + d.dy);
       setPanX(clamped.x);
       setPanY(clamped.y);
-    }, [isDragging, pxToPanXY, clampPan]);
+    }, [isDragging, pxToPanXY, clampPan, zoom]);
     
-    const handleMouseUp = useCallback(() => {
+    const handleMouseUp = useCallback((e: React.MouseEvent) => {
+      if (isSelectingRef.current && selectionRect) {
+        isSelectingRef.current = false;
+        selectionStartRef.current = null;
+        if (selectionRect.w >= 20 && selectionRect.h >= 20) {
+          applySelectionZoom(selectionRect.x, selectionRect.y, selectionRect.w, selectionRect.h);
+          setSelectZoomMode(false);
+        }
+        setSelectionRect(null);
+        return;
+      }
+      
+      const downPos = mouseDownPosRef.current;
       setIsDragging(false);
       dragStartRef.current = null;
-    }, []);
+      mouseDownPosRef.current = null;
+
+      if (downPos && onSpotColorClick && spotPreviewData?.pixelMap && imageInfo) {
+        const dx = e.clientX - downPos.x;
+        const dy = e.clientY - downPos.y;
+        if (Math.abs(dx) < 4 && Math.abs(dy) < 4) {
+          handleCanvasClick(e);
+        }
+      }
+    }, [onSpotColorClick, spotPreviewData, imageInfo, selectionRect, applySelectionZoom]);
     
+    const handleCanvasClick = useCallback((e: React.MouseEvent) => {
+      if (!imageInfo || !spotPreviewData?.pixelMap || !onSpotColorClick || !canvasRef.current) return;
+
+      const canvas = canvasRef.current;
+      const rect = canvas.getBoundingClientRect();
+      
+      // Convert client coordinates to canvas coordinates
+      const canvasX = (e.clientX - rect.left) * (canvas.width / rect.width);
+      const canvasY = (e.clientY - rect.top) * (canvas.height / rect.height);
+
+      // Determine where the image is drawn on the canvas using lastImageRenderRef
+      const imgRect = lastImageRenderRef.current;
+      if (!imgRect) return;
+
+      // Convert canvas coords to image pixel coords
+      const imgX = Math.floor((canvasX - imgRect.x) / imgRect.width * imageInfo.image.width);
+      const imgY = Math.floor((canvasY - imgRect.y) / imgRect.height * imageInfo.image.height);
+
+      if (imgX < 0 || imgX >= imageInfo.image.width || imgY < 0 || imgY >= imageInfo.image.height) return;
+
+      const pixelIndex = imgY * imageInfo.image.width + imgX;
+      const pixelMap = spotPreviewData.pixelMap;
+      const mapW = spotPreviewData.mapWidth ?? imageInfo.image.width;
+
+      if (pixelIndex < 0 || pixelIndex >= pixelMap.length) return;
+
+      const colorIndex = pixelMap[pixelIndex];
+      if (colorIndex < 0) return;
+
+      const color = spotPreviewData.colors[colorIndex];
+      if (!color) return;
+
+      let regionId: number | null = null;
+      if (color.regionMap) {
+        // Remap pixel index if dimensions differ
+        const rIdx = imgY * mapW + imgX;
+        const rid = color.regionMap[rIdx];
+        if (rid >= 0) regionId = rid;
+      }
+
+      onSpotColorClick(colorIndex, regionId);
+    }, [imageInfo, spotPreviewData, onSpotColorClick]);
+
     const handleMouseLeave = useCallback(() => {
+      if (isSelectingRef.current) {
+        isSelectingRef.current = false;
+        selectionStartRef.current = null;
+        setSelectionRect(null);
+      }
       if (isDragging) {
         setIsDragging(false);
         dragStartRef.current = null;
@@ -117,46 +276,56 @@ const PreviewSection = forwardRef<HTMLCanvasElement, PreviewSectionProps>(
     }, [panX, panY]);
     
     const handleTouchMove = useCallback((e: React.TouchEvent) => {
-      if (!isDragging || !dragStartRef.current || e.touches.length !== 1) return;
+      if (!isDragging || !dragStartRef.current || e.touches.length !== 1 || zoom <= 1) return;
       e.preventDefault();
       const t = e.touches[0];
       const d = pxToPanXY(t.clientX - dragStartRef.current.x, t.clientY - dragStartRef.current.y);
       const clamped = clampPan(dragStartRef.current.panX + d.dx, dragStartRef.current.panY + d.dy);
       setPanX(clamped.x);
       setPanY(clamped.y);
-    }, [isDragging, pxToPanXY, clampPan]);
+    }, [isDragging, pxToPanXY, clampPan, zoom]);
     
     const handleTouchEnd = useCallback(() => {
       setIsDragging(false);
       dragStartRef.current = null;
     }, []);
     
-    // Fit to View: calculate zoom to fit canvas within container and reset pan
-    const fitToView = useCallback(() => {
-      if (!containerRef.current) return;
-      const viewPadding = Math.max(4, Math.round(Math.min(previewDims.width, previewDims.height) * 0.03));
-      const containerWidth = containerRef.current.clientWidth - viewPadding * 2;
-      const containerHeight = containerRef.current.clientHeight - viewPadding * 2;
-      const scaleX = containerWidth / previewDims.width;
-      const scaleY = containerHeight / previewDims.height;
-      const fitZoom = Math.min(scaleX, scaleY, 1); // max at 100%
-      setZoom(Math.max(0.2, Math.round(fitZoom * 20) / 20)); // round to 5% steps
-      setPanX(0);
-      setPanY(0);
-    }, [previewDims.height, previewDims.width]);
-    
-    // Reset view to default zoom and pan
     const resetView = useCallback(() => {
       setZoom(1);
       setPanX(0);
       setPanY(0);
+      setSelectZoomMode(false);
+      setSelectionRect(null);
+      isSelectingRef.current = false;
+      selectionStartRef.current = null;
     }, []);
     
-    // Mouse wheel zoom handler
+    useEffect(() => {
+      if (!selectZoomMode) return;
+      const handleKeyDown = (e: KeyboardEvent) => {
+        if (e.key === 'Escape') {
+          setSelectZoomMode(false);
+          setSelectionRect(null);
+          isSelectingRef.current = false;
+          selectionStartRef.current = null;
+        }
+      };
+      window.addEventListener('keydown', handleKeyDown);
+      return () => window.removeEventListener('keydown', handleKeyDown);
+    }, [selectZoomMode]);
+    
+    // Mouse wheel: scroll up = zoom in, scroll down = zoom back toward 100%
     const handleWheel = useCallback((e: React.WheelEvent) => {
       e.preventDefault();
-      const delta = e.deltaY > 0 ? -0.1 : 0.1;
-      setZoom(prev => Math.max(0.2, Math.min(3, prev + delta)));
+      if (e.deltaY < 0) {
+        setZoom(prev => Math.min(prev + 0.15, 5));
+      } else {
+        setZoom(prev => {
+          const next = Math.max(prev - 0.15, 1);
+          if (next <= 1) { setPanX(0); setPanY(0); }
+          return next;
+        });
+      }
     }, []);
     
     // Auto-set zoom to 75% for images with no empty space around them
@@ -164,6 +333,7 @@ const PreviewSection = forwardRef<HTMLCanvasElement, PreviewSectionProps>(
       if (!imageInfo) {
         lastImageRef.current = null;
         spotOverlayCacheRef.current = null;
+        segmentOverlayCacheRef.current = null;
         croppedImageCacheRef.current = null;
         holographicCacheRef.current = null;
         return;
@@ -171,12 +341,28 @@ const PreviewSection = forwardRef<HTMLCanvasElement, PreviewSectionProps>(
       
       const imageKey = `${imageInfo.image.src}-${imageInfo.image.width}-${imageInfo.image.height}`;
       if (lastImageRef.current === imageKey) return;
+      
+      // Detect if this is an enhanced version of the same image (same aspect ratio)
+      // by checking if the previous image key exists and the file is the same
+      const prevKey = lastImageRef.current;
       lastImageRef.current = imageKey;
       spotOverlayCacheRef.current = null;
+      segmentOverlayCacheRef.current = null;
       croppedImageCacheRef.current = null;
       holographicCacheRef.current = null;
       
-      // Check if image has minimal empty space around the edges
+      // Skip zoom reset for enhancement (same file, different resolution)
+      if (prevKey) {
+        const prevParts = prevKey.split('-');
+        const prevW = parseInt(prevParts[prevParts.length - 2]);
+        const prevH = parseInt(prevParts[prevParts.length - 1]);
+        if (!isNaN(prevW) && !isNaN(prevH) && prevW > 0 && prevH > 0) {
+          const prevRatio = prevW / prevH;
+          const newRatio = imageInfo.image.width / imageInfo.image.height;
+          if (Math.abs(prevRatio - newRatio) < 0.01) return;
+        }
+      }
+      
       const hasMinimalEmptySpace = checkImageHasMinimalEmptySpace(imageInfo.image);
       if (hasMinimalEmptySpace) {
         setZoom(0.75);
@@ -190,8 +376,9 @@ const PreviewSection = forwardRef<HTMLCanvasElement, PreviewSectionProps>(
       const updateSize = () => {
         const width = containerRef.current?.clientWidth || 0;
         const height = containerRef.current?.clientHeight || 0;
-        const safeWidth = Math.max(220, Math.min(720, width));
-        const safeHeight = Math.max(220, Math.min(720, height));
+        const dpr = Math.min(window.devicePixelRatio || 1, 2);
+        const safeWidth = Math.max(220, Math.round(width * dpr));
+        const safeHeight = Math.max(220, Math.round(height * dpr));
         setPreviewDims({
           width: safeWidth || 360,
           height: safeHeight || 360
@@ -203,97 +390,40 @@ const PreviewSection = forwardRef<HTMLCanvasElement, PreviewSectionProps>(
       return () => observer.disconnect();
     }, []);
     
-    // Check if image content extends close to the edges (minimal empty space)
+    // Check edges using a tiny downsampled version (max 200px) to avoid OOM on large images
     const checkImageHasMinimalEmptySpace = (image: HTMLImageElement): boolean => {
       try {
+        const MAX_CHECK_DIM = 200;
+        const scale = Math.min(1, MAX_CHECK_DIM / Math.max(image.width, image.height));
+        const w = Math.max(1, Math.round(image.width * scale));
+        const h = Math.max(1, Math.round(image.height * scale));
+
         const canvas = document.createElement('canvas');
+        canvas.width = w;
+        canvas.height = h;
         const ctx = canvas.getContext('2d');
         if (!ctx) return false;
-        
-        canvas.width = image.width;
-        canvas.height = image.height;
-        ctx.drawImage(image, 0, 0);
-        
-        const imageData = ctx.getImageData(0, 0, canvas.width, canvas.height);
-        const data = imageData.data;
-        
-        // Check edges for content - if content is within 5% of any edge, it's "no empty space"
-        const margin = Math.max(5, Math.floor(Math.min(canvas.width, canvas.height) * 0.05));
-        
-        let hasContentNearTop = false;
-        let hasContentNearBottom = false;
-        let hasContentNearLeft = false;
-        let hasContentNearRight = false;
-        
-        // Sample pixels near edges (every 10th pixel for performance)
-        const step = 10;
-        
-        // Check top edge
-        for (let y = 0; y < margin && !hasContentNearTop; y++) {
-          for (let x = 0; x < canvas.width; x += step) {
-            const idx = (y * canvas.width + x) * 4;
-            if (data[idx + 3] > 128) { // Alpha > 128
-              hasContentNearTop = true;
-              break;
-            }
-          }
-        }
-        
-        // Check bottom edge
-        for (let y = canvas.height - margin; y < canvas.height && !hasContentNearBottom; y++) {
-          for (let x = 0; x < canvas.width; x += step) {
-            const idx = (y * canvas.width + x) * 4;
-            if (data[idx + 3] > 128) {
-              hasContentNearBottom = true;
-              break;
-            }
-          }
-        }
-        
-        // Check left edge
-        for (let x = 0; x < margin && !hasContentNearLeft; x++) {
-          for (let y = 0; y < canvas.height; y += step) {
-            const idx = (y * canvas.width + x) * 4;
-            if (data[idx + 3] > 128) {
-              hasContentNearLeft = true;
-              break;
-            }
-          }
-        }
-        
-        // Check right edge
-        for (let x = canvas.width - margin; x < canvas.width && !hasContentNearRight; x++) {
-          for (let y = 0; y < canvas.height; y += step) {
-            const idx = (y * canvas.width + x) * 4;
-            if (data[idx + 3] > 128) {
-              hasContentNearRight = true;
-              break;
-            }
-          }
-        }
-        
-        // If content is near 3+ edges, consider it "no empty space"
-        const edgesWithContent = [hasContentNearTop, hasContentNearBottom, hasContentNearLeft, hasContentNearRight].filter(Boolean).length;
-        return edgesWithContent >= 3;
+        ctx.drawImage(image, 0, 0, w, h);
+        const data = ctx.getImageData(0, 0, w, h).data;
+
+        const margin = Math.max(2, Math.floor(Math.min(w, h) * 0.05));
+        let edges = 0;
+
+        // Top
+        outer: for (let y = 0; y < margin; y++) for (let x = 0; x < w; x += 2) { if (data[((y * w + x) * 4) + 3] > 128) { edges++; break outer; } }
+        // Bottom
+        outer2: for (let y = h - margin; y < h; y++) for (let x = 0; x < w; x += 2) { if (data[((y * w + x) * 4) + 3] > 128) { edges++; break outer2; } }
+        // Left
+        outer3: for (let x = 0; x < margin; x++) for (let y = 0; y < h; y += 2) { if (data[((y * w + x) * 4) + 3] > 128) { edges++; break outer3; } }
+        // Right
+        outer4: for (let x = w - margin; x < w; x++) for (let y = 0; y < h; y += 2) { if (data[((y * w + x) * 4) + 3] > 128) { edges++; break outer4; } }
+
+        return edges >= 3;
       } catch {
         return false;
       }
     };
     
-    const getColorName = (color: string) => {
-      const colorMap: Record<string, string> = {
-        "transparent": "Transparent",
-        "#ffffff": "White",
-        "#000000": "Black",
-        "#f3f4f6": "Light Gray",
-        "#1f2937": "Dark Gray",
-        "#3b82f6": "Blue",
-        "#ef4444": "Red",
-        "#10b981": "Green",
-      };
-      return colorMap[color] || color;
-    };
-
     useImperativeHandle(ref, () => {
       const canvas = canvasRef.current!;
       (canvas as any).getContourCanvasInfo = () => {
@@ -311,35 +441,15 @@ const PreviewSection = forwardRef<HTMLCanvasElement, PreviewSectionProps>(
       return canvas;
     }, []);
 
-    const getCheckerboardPattern = (ctx: CanvasRenderingContext2D, w: number, h: number): CanvasPattern | null => {
-      if (checkerboardPatternRef.current?.width === w && checkerboardPatternRef.current?.height === h) {
-        return checkerboardPatternRef.current.pattern;
-      }
-      const gridSize = 10;
-      const patternCanvas = document.createElement('canvas');
-      patternCanvas.width = gridSize * 2;
-      patternCanvas.height = gridSize * 2;
-      const pCtx = patternCanvas.getContext('2d');
-      if (!pCtx) return null;
-      pCtx.fillStyle = '#e8e8e8';
-      pCtx.fillRect(0, 0, gridSize * 2, gridSize * 2);
-      pCtx.fillStyle = '#d0d0d0';
-      pCtx.fillRect(gridSize, 0, gridSize, gridSize);
-      pCtx.fillRect(0, gridSize, gridSize, gridSize);
-      const pattern = ctx.createPattern(patternCanvas, 'repeat');
-      if (pattern) {
-        checkerboardPatternRef.current = { width: w, height: h, pattern };
-      }
-      return pattern;
-    };
-
     const getCachedCroppedImage = (): HTMLCanvasElement | HTMLImageElement => {
       if (!imageInfo) return document.createElement('canvas');
       const src = imageInfo.image.src;
       if (croppedImageCacheRef.current?.src === src) {
         return croppedImageCacheRef.current.canvas;
       }
-      const cropped = cropImageToContent(imageInfo.image);
+      // Skip full-res crop for large images (already cropped during upload)
+      const totalPx = imageInfo.image.width * imageInfo.image.height;
+      const cropped = totalPx <= 16_000_000 ? cropImageToContent(imageInfo.image) : null;
       const result = cropped || imageInfo.image;
       croppedImageCacheRef.current = { src, canvas: result };
       return result;
@@ -417,6 +527,56 @@ const PreviewSection = forwardRef<HTMLCanvasElement, PreviewSectionProps>(
       };
     }, [imageInfo, strokeSettings, resizeSettings, shapeSettings.enabled, generateContourCacheKey, detectedShapeType, detectedShapeInfo]);
 
+    // Smooth resize animation: detects dimension changes and animates the canvas
+    useLayoutEffect(() => {
+      if (!imageInfo) {
+        prevResizeDimsRef.current = null;
+        return;
+      }
+
+      const cur = { w: resizeSettings.widthInches, h: resizeSettings.heightInches };
+      const prev = prevResizeDimsRef.current;
+      prevResizeDimsRef.current = cur;
+
+      if (!prev) return;
+      if (prev.w === cur.w && prev.h === cur.h) return;
+
+      // Scale ratio based on longest dimension change for natural visual scaling
+      const oldMax = Math.max(prev.w, prev.h);
+      const newMax = Math.max(cur.w, cur.h);
+      const scaleRatio = oldMax / newMax;
+      const startScale = Math.max(0.82, Math.min(1.18, scaleRatio));
+
+      // Immediately set the "from" state (no CSS transition yet)
+      setResizeAnimState({ scale: startScale, opacity: 0.55, transitioning: false });
+
+      // After the browser paints the "from" state, enable the CSS transition to animate to the final state
+      if (resizeAnimRafRef.current) cancelAnimationFrame(resizeAnimRafRef.current);
+      resizeAnimRafRef.current = requestAnimationFrame(() => {
+        resizeAnimRafRef.current = requestAnimationFrame(() => {
+          setResizeAnimState({ scale: 1, opacity: 1, transitioning: true });
+          resizeAnimRafRef.current = null;
+        });
+      });
+
+      // Clear animation state after transition completes
+      if (resizeAnimTimeoutRef.current) clearTimeout(resizeAnimTimeoutRef.current);
+      resizeAnimTimeoutRef.current = setTimeout(() => {
+        setResizeAnimState(null);
+      }, 420);
+
+      return () => {
+        if (resizeAnimRafRef.current) {
+          cancelAnimationFrame(resizeAnimRafRef.current);
+          resizeAnimRafRef.current = null;
+        }
+        if (resizeAnimTimeoutRef.current) {
+          clearTimeout(resizeAnimTimeoutRef.current);
+          resizeAnimTimeoutRef.current = null;
+        }
+      };
+    }, [resizeSettings.widthInches, resizeSettings.heightInches, imageInfo]);
+
     useEffect(() => {
       if (!canvasRef.current || !imageInfo) return;
 
@@ -448,9 +608,9 @@ const PreviewSection = forwardRef<HTMLCanvasElement, PreviewSectionProps>(
       if (hasPdfCutContour && imageInfo.pdfCutContourInfo) {
         const cutContourInfo = imageInfo.pdfCutContourInfo;
         const hasExtractedPaths = cutContourInfo.cutContourPoints && cutContourInfo.cutContourPoints.length > 0;
-        const viewPadding = Math.max(4, Math.round(Math.min(canvasWidth, canvasHeight) * 0.03));
-        const availableWidth = canvas.width - (viewPadding * 2);
-        const availableHeight = canvas.height - (viewPadding * 2);
+        const viewPadding = 0;
+        const availableWidth = canvas.width;
+        const availableHeight = canvas.height;
         
         // Get actual content bounds of the rendered PDF (removes empty space and white background)
         const contentBounds = getImageBounds(imageInfo.image);
@@ -477,13 +637,6 @@ const PreviewSection = forwardRef<HTMLCanvasElement, PreviewSectionProps>(
           (imageInfo.image.naturalWidth / (imageInfo.pdfCutContourInfo.pageWidth / 72 * 72)) : 300;
         const bleedPixelsAtRender = bleedInches * renderDPI;
         const bleedPixels = bleedPixelsAtRender * scale;
-        
-        // Draw checkerboard background using cached pattern
-        const checkerPattern = getCheckerboardPattern(ctx, canvas.width, canvas.height);
-        if (checkerPattern) {
-          ctx.fillStyle = checkerPattern;
-          ctx.fillRect(0, 0, canvas.width, canvas.height);
-        }
         
         // Create clipping path - use extracted paths if available, otherwise use image bounds
         ctx.save();
@@ -652,11 +805,6 @@ const PreviewSection = forwardRef<HTMLCanvasElement, PreviewSectionProps>(
           ctx.fillRect(0, 0, canvas.width, canvas.height);
           drawShapePreview(ctx, canvas.width, canvas.height);
         } else if (effectiveBackgroundColor === "transparent") {
-          const checkerPattern = getCheckerboardPattern(ctx, canvas.width, canvas.height);
-          if (checkerPattern) {
-            ctx.fillStyle = checkerPattern;
-            ctx.fillRect(0, 0, canvas.width, canvas.height);
-          }
           drawImageWithResizePreview(ctx, canvas.width, canvas.height);
         } else {
           if (effectiveBackgroundColor === "holographic") {
@@ -733,9 +881,9 @@ const PreviewSection = forwardRef<HTMLCanvasElement, PreviewSectionProps>(
             });
           }
         } else {
-          const viewPadding = Math.max(4, Math.round(Math.min(canvas.width, canvas.height) * 0.03));
-          const availW = canvas.width - (viewPadding * 2);
-          const availH = canvas.height - (viewPadding * 2);
+          const viewPadding = 0;
+          const availW = canvas.width;
+          const availH = canvas.height;
           const lcAspect = lockedContour.contourCanvasWidth / lockedContour.contourCanvasHeight;
           let lcW: number, lcH: number;
           if (lcAspect > (availW / availH)) {
@@ -773,9 +921,16 @@ const PreviewSection = forwardRef<HTMLCanvasElement, PreviewSectionProps>(
         }
       }
       };
-      doRender();
       renderRef.current = doRender;
-    }, [imageInfo, strokeSettings, resizeSettings, shapeSettings, cadCutBounds, backgroundColor, isProcessing, spotPreviewData, previewDims.height, previewDims.width, lockedContour]);
+      if (renderRafRef.current) cancelAnimationFrame(renderRafRef.current);
+      renderRafRef.current = requestAnimationFrame(() => {
+        renderRafRef.current = null;
+        doRender();
+      });
+      return () => {
+        if (renderRafRef.current) { cancelAnimationFrame(renderRafRef.current); renderRafRef.current = null; }
+      };
+    }, [imageInfo, strokeSettings, resizeSettings, shapeSettings, cadCutBounds, backgroundColor, isProcessing, spotPreviewData, previewDims.height, previewDims.width, lockedContour, segmentationData, highlightedColorIndex, highlightedRegionId]);
 
     useEffect(() => {
       if (!spotPreviewData?.enabled) {
@@ -787,141 +942,277 @@ const PreviewSection = forwardRef<HTMLCanvasElement, PreviewSectionProps>(
         return;
       }
       
-      const whiteColors = spotPreviewData.colors.filter(c => c.spotWhite);
-      const glossColors = spotPreviewData.colors.filter(c => c.spotGloss);
-      const fluorYColors = spotPreviewData.colors.filter(c => c.spotFluorY);
-      const fluorMColors = spotPreviewData.colors.filter(c => c.spotFluorM);
-      const fluorGColors = spotPreviewData.colors.filter(c => c.spotFluorG);
-      const fluorOrangeColors = spotPreviewData.colors.filter(c => c.spotFluorOrange);
-      
-      if (whiteColors.length === 0 && glossColors.length === 0 && fluorYColors.length === 0 && fluorMColors.length === 0 && fluorGColors.length === 0 && fluorOrangeColors.length === 0) {
-        spotPulseRef.current = 1;
-        if (spotAnimFrameRef.current !== null) {
-          cancelAnimationFrame(spotAnimFrameRef.current);
-          spotAnimFrameRef.current = null;
-        }
-        return;
+      spotPulseRef.current = 1;
+      if (spotAnimFrameRef.current !== null) {
+        cancelAnimationFrame(spotAnimFrameRef.current);
+        spotAnimFrameRef.current = null;
       }
-      
-      let startTime: number | null = null;
-      let lastFrameTime = 0;
-      const FRAME_INTERVAL = 1000 / 30;
-      
-      const animate = (timestamp: number) => {
-        if (startTime === null) startTime = timestamp;
-        
-        if (timestamp - lastFrameTime >= FRAME_INTERVAL) {
-          lastFrameTime = timestamp;
-          const elapsed = (timestamp - startTime) / 1000;
-          spotPulseRef.current = 0.35 + 0.65 * (0.5 + 0.5 * Math.sin(elapsed * Math.PI * 1.5));
-          
-          if (renderRef.current) {
-            renderRef.current();
+      if (renderRef.current) renderRef.current();
+    }, [spotPreviewData]);
+
+    useEffect(() => {
+      segmentOverlayCacheRef.current = null;
+      if (segmentationData?.enabled && segmentationData.layers.length > 0) {
+        for (const layer of segmentationData.layers) {
+          if (!segmentMaskImagesRef.current.has(layer.id)) {
+            const img = new Image();
+            img.src = layer.maskDataUrl;
+            img.onload = () => {
+              if (renderRef.current) renderRef.current();
+            };
+            segmentMaskImagesRef.current.set(layer.id, img);
           }
         }
-        
-        spotAnimFrameRef.current = requestAnimationFrame(animate);
-      };
-      
-      spotAnimFrameRef.current = requestAnimationFrame(animate);
-      
-      return () => {
-        if (spotAnimFrameRef.current !== null) {
-          cancelAnimationFrame(spotAnimFrameRef.current);
-          spotAnimFrameRef.current = null;
-        }
-        spotPulseRef.current = 1;
-      };
-    }, [spotPreviewData]);
+      }
+      if (renderRef.current) renderRef.current();
+    }, [segmentationData]);
 
     const createSpotOverlayCanvas = (source?: HTMLImageElement | HTMLCanvasElement): HTMLCanvasElement | null => {
       if (!imageInfo || !spotPreviewData?.enabled) return null;
       
-      const whiteColors = spotPreviewData.colors.filter(c => c.spotWhite);
-      const glossColors = spotPreviewData.colors.filter(c => c.spotGloss);
-      const fluorYColors = spotPreviewData.colors.filter(c => c.spotFluorY);
-      const fluorMColors = spotPreviewData.colors.filter(c => c.spotFluorM);
-      const fluorGColors = spotPreviewData.colors.filter(c => c.spotFluorG);
-      const fluorOrangeColors = spotPreviewData.colors.filter(c => c.spotFluorOrange);
-      
-      const hasAny = whiteColors.length > 0 || glossColors.length > 0 || fluorYColors.length > 0 || fluorMColors.length > 0 || fluorGColors.length > 0 || fluorOrangeColors.length > 0;
+      const colors = spotPreviewData.colors;
+      const hasAny = colors.some(c => c.spotWhite || c.spotGloss);
       if (!hasAny) return null;
       
-      const img = source || imageInfo.image;
-      const imgIdentity = (img as HTMLImageElement).src || `${img.width}x${img.height}`;
-      const cacheKey = `${imgIdentity}-${img.width}x${img.height}-w:${whiteColors.map(c => c.hex).join(',')}-g:${glossColors.map(c => c.hex).join(',')}-fy:${fluorYColors.map(c => c.hex).join(',')}-fm:${fluorMColors.map(c => c.hex).join(',')}-fg:${fluorGColors.map(c => c.hex).join(',')}-fo:${fluorOrangeColors.map(c => c.hex).join(',')}`;
+      const regionKey = (c: typeof colors[0]) =>
+        c.hex + (c.regions ? ':' + c.regions.map(r => r.selected ? '1' : '0').join('') : '');
+      const cacheKey = `pm-${colors.map(c => `${regionKey(c)}:${c.spotWhite}:${c.spotGloss}`).join(',')}`;
       
       if (spotOverlayCacheRef.current?.key === cacheKey) {
         return spotOverlayCacheRef.current.canvas;
       }
-      
-      const srcCanvas = document.createElement('canvas');
-      const srcCtx = srcCanvas.getContext('2d');
-      if (!srcCtx) return null;
-      
-      srcCanvas.width = img.width;
-      srcCanvas.height = img.height;
-      srcCtx.drawImage(img, 0, 0);
-      const srcData = srcCtx.getImageData(0, 0, srcCanvas.width, srcCanvas.height);
+
+      const pixelMap = spotPreviewData.pixelMap;
+      const mapW = spotPreviewData.mapWidth ?? 0;
+      const mapH = spotPreviewData.mapHeight ?? 0;
+
+      const w = mapW || imageInfo.image.width;
+      const h = mapH || imageInfo.image.height;
       
       const overlayCanvas = document.createElement('canvas');
-      overlayCanvas.width = srcCanvas.width;
-      overlayCanvas.height = srcCanvas.height;
+      overlayCanvas.width = w;
+      overlayCanvas.height = h;
       const overlayCtx = overlayCanvas.getContext('2d');
       if (!overlayCtx) return null;
       
-      const overlayData = overlayCtx.createImageData(srcCanvas.width, srcCanvas.height);
-      
-      const parseColors = (colors: typeof whiteColors) => colors.map(c => ({
-        r: parseInt(c.hex.slice(1, 3), 16),
-        g: parseInt(c.hex.slice(3, 5), 16),
-        b: parseInt(c.hex.slice(5, 7), 16),
-      }));
-      
-      const parsedWhite = parseColors(whiteColors);
-      const parsedGloss = parseColors(glossColors);
-      const parsedFluorY = parseColors(fluorYColors);
-      const parsedFluorM = parseColors(fluorMColors);
-      const parsedFluorG = parseColors(fluorGColors);
-      const parsedFluorOrange = parseColors(fluorOrangeColors);
-      
-      const colorGroups: { parsed: typeof parsedWhite; overlayR: number; overlayG: number; overlayB: number }[] = [
-        ...parsedWhite.length > 0 ? [{ parsed: parsedWhite, overlayR: 255, overlayG: 255, overlayB: 255 }] : [],
-        ...parsedGloss.length > 0 ? [{ parsed: parsedGloss, overlayR: 180, overlayG: 180, overlayB: 190 }] : [],
-        ...parsedFluorY.length > 0 ? [{ parsed: parsedFluorY, overlayR: 223, overlayG: 255, overlayB: 0 }] : [],
-        ...parsedFluorM.length > 0 ? [{ parsed: parsedFluorM, overlayR: 255, overlayG: 0, overlayB: 255 }] : [],
-        ...parsedFluorG.length > 0 ? [{ parsed: parsedFluorG, overlayR: 57, overlayG: 255, overlayB: 20 }] : [],
-        ...parsedFluorOrange.length > 0 ? [{ parsed: parsedFluorOrange, overlayR: 255, overlayG: 102, overlayB: 0 }] : [],
-      ];
-      
-      const tolerance = 30;
-      const pixels = srcData.data;
+      const overlayData = overlayCtx.createImageData(w, h);
       const out = overlayData.data;
-      const len = pixels.length;
-      
-      for (let idx = 0; idx < len; idx += 4) {
-        const a = pixels[idx + 3];
-        if (a < 128) continue;
-        
-        const r = pixels[idx];
-        const g = pixels[idx + 1];
-        const b = pixels[idx + 2];
-        
-        for (const group of colorGroups) {
-          let matched = false;
-          for (const t of group.parsed) {
-            if (Math.abs(r - t.r) <= tolerance && Math.abs(g - t.g) <= tolerance && Math.abs(b - t.b) <= tolerance) {
-              out[idx] = group.overlayR; out[idx + 1] = group.overlayG; out[idx + 2] = group.overlayB; out[idx + 3] = 255;
-              matched = true;
+
+      // Build per-color overlay info: which overlay color, and region selection
+      // When both White and Gloss are on, blend to a distinguishable split color
+      const colorOverlay: Array<{ overlayR: number; overlayG: number; overlayB: number; regionMap?: Int32Array; regionSelected?: boolean[] } | null> = colors.map(c => {
+        if (!c.spotWhite && !c.spotGloss) return null;
+        let oR: number, oG: number, oB: number;
+        if (c.spotWhite && c.spotGloss) {
+          oR = 255; oG = 165; oB = 0; // orange = both
+        } else if (c.spotWhite) {
+          oR = 255; oG = 0; oB = 255; // magenta
+        } else {
+          oR = 57; oG = 255; oB = 20; // green
+        }
+        let regionSelected: boolean[] | undefined;
+        if (c.regions && c.regions.length > 1) {
+          const maxId = Math.max(...c.regions.map(rg => rg.id));
+          regionSelected = new Array(maxId + 1).fill(true);
+          for (const rg of c.regions) regionSelected[rg.id] = rg.selected;
+        }
+        return { overlayR: oR, overlayG: oG, overlayB: oB, regionMap: c.regionMap, regionSelected };
+      });
+
+      if (pixelMap && pixelMap.length === w * h) {
+        // Fast path: use pre-built pixelMap for O(1) lookups
+        const totalPixels = w * h;
+        for (let i = 0; i < totalPixels; i++) {
+          const ci = pixelMap[i];
+          if (ci < 0) continue;
+          const info = colorOverlay[ci];
+          if (!info) continue;
+          if (info.regionMap && info.regionSelected) {
+            const regionId = info.regionMap[i];
+            if (regionId < 0 || !info.regionSelected[regionId]) continue;
+          }
+          const off = i * 4;
+          out[off] = info.overlayR;
+          out[off + 1] = info.overlayG;
+          out[off + 2] = info.overlayB;
+          out[off + 3] = 255;
+        }
+      } else {
+        // Fallback: tolerance-based matching (for when pixelMap isn't available)
+        const img = source || imageInfo.image;
+        const srcCanvas = document.createElement('canvas');
+        const srcCtx = srcCanvas.getContext('2d');
+        if (!srcCtx) return null;
+        srcCanvas.width = w;
+        srcCanvas.height = h;
+        srcCtx.drawImage(img, 0, 0);
+        const srcData = srcCtx.getImageData(0, 0, w, h);
+        const pixels = srcData.data;
+        const tol = 30;
+        const len = pixels.length;
+        for (let idx = 0; idx < len; idx += 4) {
+          if (pixels[idx + 3] < 128) continue;
+          const r = pixels[idx], g = pixels[idx + 1], b = pixels[idx + 2];
+          for (let ci = 0; ci < colors.length; ci++) {
+            const info = colorOverlay[ci];
+            if (!info) continue;
+            const c = colors[ci].rgb;
+            if (Math.abs(r - c.r) <= tol && Math.abs(g - c.g) <= tol && Math.abs(b - c.b) <= tol) {
+              const pixelIndex = idx / 4;
+              if (info.regionMap && info.regionSelected) {
+                const regionId = info.regionMap[pixelIndex];
+                if (regionId >= 0 && !info.regionSelected[regionId]) break;
+              }
+              out[idx] = info.overlayR; out[idx + 1] = info.overlayG; out[idx + 2] = info.overlayB; out[idx + 3] = 255;
               break;
             }
           }
-          if (matched) break;
         }
       }
       
       overlayCtx.putImageData(overlayData, 0, 0);
       spotOverlayCacheRef.current = { key: cacheKey, canvas: overlayCanvas };
+      return overlayCanvas;
+    };
+
+    const createHighlightOverlay = (): HTMLCanvasElement | null => {
+      if (highlightedColorIndex == null || highlightedColorIndex < 0) return null;
+      if (!imageInfo || !spotPreviewData?.pixelMap) return null;
+
+      const pixelMap = spotPreviewData.pixelMap;
+      const mapW = spotPreviewData.mapWidth ?? imageInfo.image.width;
+      const mapH = spotPreviewData.mapHeight ?? imageInfo.image.height;
+      const w = mapW || imageInfo.image.width;
+      const h = mapH || imageInfo.image.height;
+
+      const color = spotPreviewData.colors[highlightedColorIndex];
+      if (!color) return null;
+
+      const totalPixels = w * h;
+      if (pixelMap.length < totalPixels) return null;
+
+      const mask = new Uint8Array(totalPixels);
+      for (let i = 0; i < totalPixels; i++) {
+        if (pixelMap[i] !== highlightedColorIndex) continue;
+        if (highlightedRegionId != null && color.regionMap) {
+          if (color.regionMap[i] !== highlightedRegionId) continue;
+        }
+        mask[i] = 1;
+      }
+
+      const overlayCanvas = document.createElement('canvas');
+      overlayCanvas.width = w;
+      overlayCanvas.height = h;
+      const ctx2 = overlayCanvas.getContext('2d');
+      if (!ctx2) return null;
+
+      const imgData = ctx2.createImageData(w, h);
+      const out = imgData.data;
+
+      // Semi-transparent blue fill for the region
+      for (let i = 0; i < w * h; i++) {
+        if (mask[i]) {
+          const off = i * 4;
+          out[off] = 59;
+          out[off + 1] = 130;
+          out[off + 2] = 246;
+          out[off + 3] = 60;
+        }
+      }
+
+      // Blue border: any mask pixel adjacent to a non-mask pixel
+      const borderThickness = Math.max(1, Math.round(Math.max(w, h) / 400));
+      for (let y = 0; y < h; y++) {
+        for (let x = 0; x < w; x++) {
+          const idx = y * w + x;
+          if (!mask[idx]) continue;
+          let isBorder = false;
+          for (let d = 1; d <= borderThickness && !isBorder; d++) {
+            if (x - d < 0 || !mask[idx - d]) isBorder = true;
+            else if (x + d >= w || !mask[idx + d]) isBorder = true;
+            else if (y - d < 0 || !mask[(y - d) * w + x]) isBorder = true;
+            else if (y + d >= h || !mask[(y + d) * w + x]) isBorder = true;
+          }
+          if (isBorder) {
+            const off = idx * 4;
+            out[off] = 59;
+            out[off + 1] = 130;
+            out[off + 2] = 246;
+            out[off + 3] = 220;
+          }
+        }
+      }
+
+      ctx2.putImageData(imgData, 0, 0);
+      return overlayCanvas;
+    };
+
+    const createSegmentOverlayCanvas = (): HTMLCanvasElement | null => {
+      if (!imageInfo || !segmentationData?.enabled || segmentationData.mode !== 'items') return null;
+
+      const visibleLayers = segmentationData.layers.filter(l => l.visible);
+      if (visibleLayers.length === 0) return null;
+
+      const cacheKey = `seg-${visibleLayers.map(l => `${l.id}:${l.spotWhite}:${l.spotGloss}:${l.visible}`).join(',')}`;
+      if (segmentOverlayCacheRef.current?.key === cacheKey) {
+        return segmentOverlayCacheRef.current.canvas;
+      }
+
+      const w = imageInfo.image.width;
+      const h = imageInfo.image.height;
+
+      const overlayCanvas = document.createElement('canvas');
+      overlayCanvas.width = w;
+      overlayCanvas.height = h;
+      const overlayCtx = overlayCanvas.getContext('2d');
+      if (!overlayCtx) return null;
+
+      for (const layer of visibleLayers) {
+        if (!layer.spotWhite && !layer.spotGloss) continue;
+
+        let maskImg = segmentMaskImagesRef.current.get(layer.id);
+        if (!maskImg || maskImg.src !== layer.maskDataUrl) {
+          maskImg = new Image();
+          maskImg.src = layer.maskDataUrl;
+          segmentMaskImagesRef.current.set(layer.id, maskImg);
+        }
+
+        if (!maskImg.complete || maskImg.naturalWidth === 0) continue;
+
+        const tempCanvas = document.createElement('canvas');
+        tempCanvas.width = w;
+        tempCanvas.height = h;
+        const tempCtx = tempCanvas.getContext('2d');
+        if (!tempCtx) continue;
+
+        tempCtx.drawImage(maskImg, 0, 0, w, h);
+        const maskData = tempCtx.getImageData(0, 0, w, h);
+        const pixels = maskData.data;
+
+        for (let i = 0; i < pixels.length; i += 4) {
+          const brightness = pixels[i] + pixels[i + 1] + pixels[i + 2];
+          if (brightness > 128 * 3 && pixels[i + 3] > 128) {
+            if (layer.spotWhite) {
+              pixels[i] = 255;
+              pixels[i + 1] = 0;
+              pixels[i + 2] = 255;
+              pixels[i + 3] = 200;
+            } else if (layer.spotGloss) {
+              pixels[i] = 57;
+              pixels[i + 1] = 255;
+              pixels[i + 2] = 20;
+              pixels[i + 3] = 200;
+            }
+          } else {
+            pixels[i + 3] = 0;
+          }
+        }
+
+        tempCtx.putImageData(maskData, 0, 0);
+        overlayCtx.drawImage(tempCanvas, 0, 0);
+      }
+
+      segmentOverlayCacheRef.current = { key: cacheKey, canvas: overlayCanvas };
       return overlayCanvas;
     };
 
@@ -947,9 +1238,9 @@ const PreviewSection = forwardRef<HTMLCanvasElement, PreviewSectionProps>(
       );
 
       const bleedInches = 0.10; // 0.10" bleed around the shape
-      const padding = Math.max(4, Math.round(Math.min(canvasWidth, canvasHeight) * 0.03));
-      const availableWidth = canvasWidth - (padding * 2);
-      const availableHeight = canvasHeight - (padding * 2);
+      const padding = 0;
+      const availableWidth = canvasWidth;
+      const availableHeight = canvasHeight;
       const shapeAspect = shapeDims.widthInches / shapeDims.heightInches;
       
       let shapeWidth, shapeHeight;
@@ -1136,12 +1427,30 @@ const PreviewSection = forwardRef<HTMLCanvasElement, PreviewSectionProps>(
       
       ctx.clip();
       ctx.drawImage(sourceImage, imageX, imageY, imageWidth, imageHeight);
-      
-      const spotOverlay = createSpotOverlayCanvas(sourceImage);
-      if (spotOverlay) {
+      lastImageRenderRef.current = { x: imageX, y: imageY, width: imageWidth, height: imageHeight };
+
+      if (segmentationData?.mode === 'items') {
+        const segOverlay = createSegmentOverlayCanvas();
+        if (segOverlay) {
+          ctx.save();
+          ctx.globalAlpha = spotPulseRef.current;
+          ctx.drawImage(segOverlay, imageX, imageY, imageWidth, imageHeight);
+          ctx.restore();
+        }
+      } else {
+        const spotOverlay = createSpotOverlayCanvas(sourceImage);
+        if (spotOverlay) {
+          ctx.save();
+          ctx.globalAlpha = spotPulseRef.current;
+          ctx.drawImage(spotOverlay, imageX, imageY, imageWidth, imageHeight);
+          ctx.restore();
+        }
+      }
+
+      const hlOverlay = createHighlightOverlay();
+      if (hlOverlay) {
         ctx.save();
-        ctx.globalAlpha = spotPulseRef.current;
-        ctx.drawImage(spotOverlay, imageX, imageY, imageWidth, imageHeight);
+        ctx.drawImage(hlOverlay, imageX, imageY, imageWidth, imageHeight);
         ctx.restore();
       }
       
@@ -1151,9 +1460,9 @@ const PreviewSection = forwardRef<HTMLCanvasElement, PreviewSectionProps>(
     const drawImageWithResizePreview = (ctx: CanvasRenderingContext2D, canvasWidth: number, canvasHeight: number) => {
       if (!imageInfo) return;
 
-      const viewPadding = Math.max(4, Math.round(Math.min(canvasWidth, canvasHeight) * 0.03));
-      const availableWidth = canvasWidth - (viewPadding * 2);
-      const availableHeight = canvasHeight - (viewPadding * 2);
+      const viewPadding = 0;
+      const availableWidth = canvasWidth;
+      const availableHeight = canvasHeight;
       
       if (strokeSettings.enabled && contourCacheRef.current?.canvas && !isProcessing) {
         const contourCanvas = contourCacheRef.current.canvas;
@@ -1225,27 +1534,76 @@ const PreviewSection = forwardRef<HTMLCanvasElement, PreviewSectionProps>(
         } else {
           ctx.drawImage(contourCanvas, contourX, contourY, contourWidth, contourHeight);
         }
-        
-        const spotOverlay = createSpotOverlayCanvas();
-        if (spotOverlay) {
+
+        {
           const dsScale = contourCacheRef.current?.downsampleScale ?? 1;
           const dsWidth = Math.round(imageInfo.image.width * dsScale);
           const dsHeight = Math.round(imageInfo.image.height * dsScale);
-          const imgX = contourCacheRef.current?.imageCanvasX ?? 0;
-          const imgY = contourCacheRef.current?.imageCanvasY ?? 0;
-          
-          const scaleX = contourWidth / contourCanvas.width;
-          const scaleY = contourHeight / contourCanvas.height;
-          
-          const spotX = contourX + (imgX * scaleX);
-          const spotY = contourY + (imgY * scaleY);
-          const spotWidth = dsWidth * scaleX;
-          const spotHeight = dsHeight * scaleY;
-          
-          ctx.save();
-          ctx.globalAlpha = spotPulseRef.current;
-          ctx.drawImage(spotOverlay, spotX, spotY, spotWidth, spotHeight);
-          ctx.restore();
+          const _imgX = contourCacheRef.current?.imageCanvasX ?? 0;
+          const _imgY = contourCacheRef.current?.imageCanvasY ?? 0;
+          const _scaleX = contourWidth / contourCanvas.width;
+          const _scaleY = contourHeight / contourCanvas.height;
+          lastImageRenderRef.current = {
+            x: contourX + (_imgX * _scaleX),
+            y: contourY + (_imgY * _scaleY),
+            width: dsWidth * _scaleX,
+            height: dsHeight * _scaleY,
+          };
+        }
+        
+        if (segmentationData?.mode === 'items') {
+          const segOverlay = createSegmentOverlayCanvas();
+          if (segOverlay) {
+            const dsScale = contourCacheRef.current?.downsampleScale ?? 1;
+            const dsWidth = Math.round(imageInfo.image.width * dsScale);
+            const dsHeight = Math.round(imageInfo.image.height * dsScale);
+            const imgX = contourCacheRef.current?.imageCanvasX ?? 0;
+            const imgY = contourCacheRef.current?.imageCanvasY ?? 0;
+            const scaleX = contourWidth / contourCanvas.width;
+            const scaleY = contourHeight / contourCanvas.height;
+            const segX = contourX + (imgX * scaleX);
+            const segY = contourY + (imgY * scaleY);
+            const segW = dsWidth * scaleX;
+            const segH = dsHeight * scaleY;
+            ctx.save();
+            ctx.globalAlpha = spotPulseRef.current;
+            ctx.drawImage(segOverlay, segX, segY, segW, segH);
+            ctx.restore();
+          }
+        } else {
+          const spotOverlay = createSpotOverlayCanvas();
+          if (spotOverlay) {
+            const dsScale = contourCacheRef.current?.downsampleScale ?? 1;
+            const dsWidth = Math.round(imageInfo.image.width * dsScale);
+            const dsHeight = Math.round(imageInfo.image.height * dsScale);
+            const imgX = contourCacheRef.current?.imageCanvasX ?? 0;
+            const imgY = contourCacheRef.current?.imageCanvasY ?? 0;
+            const scaleX = contourWidth / contourCanvas.width;
+            const scaleY = contourHeight / contourCanvas.height;
+            const spotX = contourX + (imgX * scaleX);
+            const spotY = contourY + (imgY * scaleY);
+            const spotWidth = dsWidth * scaleX;
+            const spotHeight = dsHeight * scaleY;
+            ctx.save();
+            ctx.globalAlpha = spotPulseRef.current;
+            ctx.drawImage(spotOverlay, spotX, spotY, spotWidth, spotHeight);
+            ctx.restore();
+          }
+        }
+        {
+          const hlOverlay = createHighlightOverlay();
+          if (hlOverlay) {
+            const dsScale = contourCacheRef.current?.downsampleScale ?? 1;
+            const dsWidth = Math.round(imageInfo.image.width * dsScale);
+            const dsHeight = Math.round(imageInfo.image.height * dsScale);
+            const imgX2 = contourCacheRef.current?.imageCanvasX ?? 0;
+            const imgY2 = contourCacheRef.current?.imageCanvasY ?? 0;
+            const scaleX2 = contourWidth / contourCanvas.width;
+            const scaleY2 = contourHeight / contourCanvas.height;
+            ctx.save();
+            ctx.drawImage(hlOverlay, contourX + (imgX2 * scaleX2), contourY + (imgY2 * scaleY2), dsWidth * scaleX2, dsHeight * scaleY2);
+            ctx.restore();
+          }
         }
       } else {
         const aspectRatio = imageInfo.image.width / imageInfo.image.height;
@@ -1262,63 +1620,152 @@ const PreviewSection = forwardRef<HTMLCanvasElement, PreviewSectionProps>(
         const displayY = (canvasHeight - displayHeight) / 2;
         
         ctx.drawImage(imageInfo.image, displayX, displayY, displayWidth, displayHeight);
-        
-        const spotOverlay = createSpotOverlayCanvas();
-        if (spotOverlay) {
-          ctx.save();
-          ctx.globalAlpha = spotPulseRef.current;
-          ctx.drawImage(spotOverlay, displayX, displayY, displayWidth, displayHeight);
-          ctx.restore();
+        lastImageRenderRef.current = { x: displayX, y: displayY, width: displayWidth, height: displayHeight };
+
+        if (segmentationData?.mode === 'items') {
+          const segOverlay = createSegmentOverlayCanvas();
+          if (segOverlay) {
+            ctx.save();
+            ctx.globalAlpha = spotPulseRef.current;
+            ctx.drawImage(segOverlay, displayX, displayY, displayWidth, displayHeight);
+            ctx.restore();
+          }
+        } else {
+          const spotOverlay = createSpotOverlayCanvas();
+          if (spotOverlay) {
+            ctx.save();
+            ctx.globalAlpha = spotPulseRef.current;
+            ctx.drawImage(spotOverlay, displayX, displayY, displayWidth, displayHeight);
+            ctx.restore();
+          }
+        }
+        {
+          const hlOverlay = createHighlightOverlay();
+          if (hlOverlay) {
+            ctx.save();
+            ctx.drawImage(hlOverlay, displayX, displayY, displayWidth, displayHeight);
+            ctx.restore();
+          }
         }
       }
     };
 
-    const getBackgroundStyle = () => {
-      // For PDFs with CutContour, use strokeSettings.backgroundColor
+    const effectiveBackground = (() => {
       const hasPdfCutContour = imageInfo?.isPDF && imageInfo?.pdfCutContourInfo?.hasCutContour;
-      const effectiveBg = hasPdfCutContour ? strokeSettings.backgroundColor : backgroundColor;
-      if (effectiveBg === "transparent") {
-        return "checkerboard";
-      }
-      return "";
-    };
-
-    const getBackgroundColor = () => {
-      // For PDFs with CutContour, use strokeSettings.backgroundColor
-      const hasPdfCutContour = imageInfo?.isPDF && imageInfo?.pdfCutContourInfo?.hasCutContour;
-      const effectiveBg = hasPdfCutContour ? strokeSettings.backgroundColor : backgroundColor;
-      if (effectiveBg === "transparent") {
-        return "transparent";
-      }
-      return effectiveBg;
-    };
+      return hasPdfCutContour ? strokeSettings.backgroundColor : backgroundColor;
+    })();
+    const isTransparentBg = effectiveBackground === "transparent";
 
     return (
       <div className="w-full">
         <Card className="bg-white border-gray-100 shadow-sm rounded-2xl overflow-hidden">
-          <CardContent className="p-3 sm:p-4">
-            {/* Hide preview color selector for PDFs with CutContour - they use PDF Options instead */}
-            {!(imageInfo?.isPDF && imageInfo?.pdfCutContourInfo?.hasCutContour) && (
-              <div className="mb-3 flex items-center gap-3 bg-gray-50/70 p-2 rounded-lg">
-                <Palette className="w-4 h-4 text-gray-500" />
-                <span className="text-sm text-gray-600">Preview</span>
-                <Select value={backgroundColor} onValueChange={setBackgroundColor}>
-                  <SelectTrigger className="w-28 h-8 text-sm bg-white border-gray-200 rounded-md">
-                    <SelectValue>{getColorName(backgroundColor)}</SelectValue>
-                  </SelectTrigger>
-                  <SelectContent>
-                    <SelectItem value="transparent">Transparent</SelectItem>
-                    <SelectItem value="#ffffff">White</SelectItem>
-                    <SelectItem value="#000000">Black</SelectItem>
-                    <SelectItem value="#f3f4f6">Light Gray</SelectItem>
-                    <SelectItem value="#1f2937">Dark Gray</SelectItem>
-                    <SelectItem value="#3b82f6">Blue</SelectItem>
-                    <SelectItem value="#ef4444">Red</SelectItem>
-                    <SelectItem value="#10b981">Green</SelectItem>
-                  </SelectContent>
-                </Select>
+          <CardContent className="p-0">
+            {/* Design info + preview background swatches */}
+            <div className="mx-2 mt-2 mb-0 flex items-center gap-1.5 p-1.5">
+              {imageInfo && (
+                <div className="flex items-center gap-1 min-w-0 flex-shrink-0">
+                  <span className="text-[10px] text-gray-400 font-medium">W</span>
+                  <input
+                    type="number"
+                    step="0.1"
+                    min="0.5"
+                    max="50"
+                    value={resizeSettings.widthInches.toFixed(2)}
+                    onChange={(e) => {
+                      const v = parseFloat(e.target.value);
+                      if (!isNaN(v) && v > 0 && onResizeChange) onResizeChange({ widthInches: v });
+                    }}
+                    className="w-[52px] text-[11px] font-semibold text-gray-700 text-center bg-gray-50 border border-gray-200 rounded px-1 py-0.5 focus:outline-none focus:ring-1 focus:ring-indigo-300 focus:border-indigo-300 [appearance:textfield] [&::-webkit-outer-spin-button]:appearance-none [&::-webkit-inner-spin-button]:appearance-none"
+                  />
+                  <span className="text-[10px] text-gray-400">"</span>
+                  <button
+                    onClick={() => onResizeChange?.({ maintainAspectRatio: !resizeSettings.maintainAspectRatio })}
+                    className={`p-0.5 rounded transition-colors ${resizeSettings.maintainAspectRatio ? 'text-indigo-500 hover:text-indigo-600' : 'text-gray-300 hover:text-gray-400'}`}
+                    title={resizeSettings.maintainAspectRatio ? 'Unlock aspect ratio' : 'Lock aspect ratio'}
+                  >
+                    {resizeSettings.maintainAspectRatio ? <Link2 size={12} /> : <Unlink2 size={12} />}
+                  </button>
+                  <span className="text-[10px] text-gray-400 font-medium">H</span>
+                  <input
+                    type="number"
+                    step="0.1"
+                    min="0.5"
+                    max="50"
+                    value={resizeSettings.heightInches.toFixed(2)}
+                    onChange={(e) => {
+                      const v = parseFloat(e.target.value);
+                      if (!isNaN(v) && v > 0 && onResizeChange) onResizeChange({ heightInches: v });
+                    }}
+                    className="w-[52px] text-[11px] font-semibold text-gray-700 text-center bg-gray-50 border border-gray-200 rounded px-1 py-0.5 focus:outline-none focus:ring-1 focus:ring-indigo-300 focus:border-indigo-300 [appearance:textfield] [&::-webkit-outer-spin-button]:appearance-none [&::-webkit-inner-spin-button]:appearance-none"
+                  />
+                  <span className="text-[10px] text-gray-400">"</span>
+                  <div className="relative ml-1">
+                    <select
+                      className="appearance-none text-[11px] font-semibold text-white bg-gradient-to-r from-indigo-500 to-violet-500 rounded-md pl-2 pr-5 py-1 cursor-pointer hover:from-indigo-400 hover:to-violet-400 transition-all focus:outline-none focus:ring-2 focus:ring-indigo-300 shadow-sm"
+                      value=""
+                      onChange={(e) => {
+                        const longest = parseFloat(e.target.value);
+                        if (!longest || !onResizeChange || !imageInfo) return;
+                        const isWider = imageInfo.originalWidth >= imageInfo.originalHeight;
+                        if (isWider) {
+                          onResizeChange({ widthInches: longest });
+                        } else {
+                          onResizeChange({ heightInches: longest });
+                        }
+                      }}
+                    >
+                      <option value="" disabled className="text-gray-700 bg-white">Size</option>
+                      {[2, 3, 4, 5, 6, 8, 10].map(size => (
+                        <option key={size} value={size} className="text-gray-700 bg-white">{size}" sticker</option>
+                      ))}
+                    </select>
+                    <svg className="absolute right-1 top-1/2 -translate-y-1/2 w-3 h-3 text-white/70 pointer-events-none" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><polyline points="6 9 12 15 18 9" /></svg>
+                  </div>
+                </div>
+              )}
+              <div className="flex items-center gap-0.5 flex-shrink-0">
+                <button
+                  onClick={onUndo}
+                  disabled={!canUndo}
+                  className={`p-1 rounded transition-colors ${canUndo ? 'text-gray-500 hover:text-indigo-600 hover:bg-indigo-50' : 'text-gray-200 cursor-default'}`}
+                  title="Undo"
+                >
+                  <Undo2 size={13} />
+                </button>
+                <button
+                  onClick={onRedo}
+                  disabled={!canRedo}
+                  className={`p-1 rounded transition-colors ${canRedo ? 'text-gray-500 hover:text-indigo-600 hover:bg-indigo-50' : 'text-gray-200 cursor-default'}`}
+                  title="Redo"
+                >
+                  <Redo2 size={13} />
+                </button>
               </div>
-            )}
+              {!(imageInfo?.isPDF && imageInfo?.pdfCutContourInfo?.hasCutContour) && (
+                <div className="flex items-center gap-1.5 ml-auto flex-shrink-0">
+                  {[
+                    { value: 'transparent', bg: 'transparent', label: 'Transparent' },
+                    { value: '#ffffff', bg: '#ffffff', label: 'White' },
+                    { value: '#f3f4f6', bg: '#f3f4f6', label: 'Light Gray' },
+                    { value: '#9ca3af', bg: '#9ca3af', label: 'Gray' },
+                    { value: '#1f2937', bg: '#1f2937', label: 'Dark Gray' },
+                    { value: '#000000', bg: '#000000', label: 'Black' },
+                  ].map(opt => (
+                    <button
+                      key={opt.value}
+                      onClick={() => setBackgroundColor(opt.value)}
+                      title={opt.label}
+                      className={`w-6 h-6 rounded-full border-2 transition-all flex-shrink-0 ${
+                        backgroundColor === opt.value
+                          ? 'border-cyan-400 scale-110 shadow-sm'
+                          : 'border-gray-200 hover:border-gray-300'
+                      } ${opt.value === 'transparent' ? 'checkerboard' : ''}`}
+                      style={opt.value !== 'transparent' ? { backgroundColor: opt.bg } : undefined}
+                    />
+                  ))}
+                </div>
+              )}
+            </div>
 
             <div className="flex flex-col items-start">
               <div className="flex w-full">
@@ -1332,13 +1779,13 @@ const PreviewSection = forwardRef<HTMLCanvasElement, PreviewSectionProps>(
                   onTouchStart={handleTouchStart}
                   onTouchMove={handleTouchMove}
                   onTouchEnd={handleTouchEnd}
-                  className={`relative w-full max-w-[720px] rounded-xl border border-gray-200 flex items-center justify-center ${getBackgroundStyle()} ${zoom !== 1 ? (isDragging ? 'cursor-grabbing' : 'cursor-grab') : 'cursor-zoom-in'} transition-all duration-300 ${showHighlight ? 'ring-4 ring-cyan-400 ring-opacity-75' : ''}`}
+                  className={`relative w-full flex items-center justify-center ${isTransparentBg ? 'checkerboard' : ''} ${selectZoomMode ? 'cursor-crosshair' : zoom > 1 ? (isDragging ? 'cursor-grabbing' : 'cursor-grab') : 'cursor-crosshair'} ${showHighlight ? 'ring-4 ring-indigo-400 ring-opacity-75 transition-shadow duration-300' : ''}`}
                   style={{ 
                     width: '100%',
                     height: '100%',
                     aspectRatio: imageInfo ? `${imageInfo.image.width} / ${imageInfo.image.height}` : '1 / 1',
                     maxHeight: '70vh',
-                    backgroundColor: getBackgroundColor(),
+                    backgroundColor: isTransparentBg ? 'transparent' : effectiveBackground,
                     overflow: 'hidden',
                     userSelect: 'none',
                     touchAction: 'none'
@@ -1350,12 +1797,31 @@ const PreviewSection = forwardRef<HTMLCanvasElement, PreviewSectionProps>(
                   style={{ 
                     maxWidth: '100%',
                     maxHeight: '100%',
-                    transform: `translate(${panX}%, ${panY}%) scale(${zoom})`,
+                    transform: `translate(${panX}%, ${panY}%) scale(${zoom * (resizeAnimState?.scale ?? 1)})`,
                     transformOrigin: 'center',
-                    transition: isDragging ? 'none' : 'transform 0.15s ease-out',
-                    cursor: isDragging ? 'grabbing' : 'grab'
+                    transition: resizeAnimState
+                      ? (resizeAnimState.transitioning
+                        ? 'transform 0.38s cubic-bezier(0.16, 1, 0.3, 1), opacity 0.3s ease-out'
+                        : 'none')
+                      : (isDragging || isSelectingRef.current) ? 'none' : 'transform 0.3s ease-out',
+                    opacity: resizeAnimState?.opacity ?? 1,
                   }}
                 />
+                
+                {selectionRect && selectionRect.w > 0 && selectionRect.h > 0 && (
+                  <div
+                    className="absolute z-30 pointer-events-none"
+                    style={{
+                      left: selectionRect.x,
+                      top: selectionRect.y,
+                      width: selectionRect.w,
+                      height: selectionRect.h,
+                      border: '2px dashed rgba(99, 102, 241, 0.9)',
+                      backgroundColor: 'rgba(99, 102, 241, 0.08)',
+                      boxShadow: '0 0 0 9999px rgba(0, 0, 0, 0.15)',
+                    }}
+                  />
+                )}
                 
                 {!imageInfo && (
                   <div className="absolute inset-0 flex items-center justify-center">
@@ -1386,7 +1852,7 @@ const PreviewSection = forwardRef<HTMLCanvasElement, PreviewSectionProps>(
                             i === 0 ? 'rounded-l' : 'rounded-r'
                           } ${i > 0 ? 'border-l-0' : ''} ${
                             effectiveMode === mode.key
-                              ? 'bg-blue-500 text-white border-blue-500'
+                              ? 'bg-indigo-500 text-white border-indigo-500'
                               : 'bg-white text-gray-500 border-gray-300 hover:bg-gray-100'
                           }`}
                           onClick={() => onStrokeChange({ contourMode: mode.key })}
@@ -1417,136 +1883,62 @@ const PreviewSection = forwardRef<HTMLCanvasElement, PreviewSectionProps>(
                 )}
                 </div>
                 
-                {zoom !== 1 && (
-                  <div className="hidden md:flex w-2 flex-col ml-1" style={{ height: `${previewDims.height}px` }}>
-                    <div 
-                      className="flex-1 bg-gray-300/60 rounded relative cursor-pointer"
-                      onClick={(e) => {
-                        const rect = e.currentTarget.getBoundingClientRect();
-                        const y = (e.clientY - rect.top) / rect.height;
-                        const limit = maxPanXY().y;
-                        setPanY(limit - (y * limit * 2));
-                      }}
-                    >
-                      <div 
-                        className="absolute left-0 right-0 h-12 bg-gray-500 hover:bg-cyan-500 rounded transition-colors"
-                        style={{ top: `${maxPanXY().y > 0 ? ((maxPanXY().y - panY) / (maxPanXY().y * 2)) * 100 : 50}%`, transform: 'translateY(-50%)' }}
-                        onMouseDown={(e) => {
-                          e.stopPropagation();
-                          const startY = e.clientY;
-                          const startPan = panY;
-                          const parent = e.currentTarget.parentElement!;
-                          const height = parent.getBoundingClientRect().height;
-                          const limit = maxPanXY().y;
-                          
-                          const onMove = (ev: MouseEvent) => {
-                            const delta = (ev.clientY - startY) / height * limit * 2;
-                            setPanY(Math.max(-limit, Math.min(limit, startPan - delta)));
-                          };
-                          const onUp = () => {
-                            document.removeEventListener('mousemove', onMove);
-                            document.removeEventListener('mouseup', onUp);
-                          };
-                          document.addEventListener('mousemove', onMove);
-                          document.addEventListener('mouseup', onUp);
-                        }}
-                      />
-                    </div>
-                  </div>
-                )}
-              </div>
-              
-              <div className="flex">
-                {zoom !== 1 && (
-                  <div className="hidden md:flex h-2 mt-1" style={{ width: `${previewDims.width}px` }}>
-                    <div 
-                      className="flex-1 bg-gray-300/60 rounded relative cursor-pointer"
-                      onClick={(e) => {
-                        const rect = e.currentTarget.getBoundingClientRect();
-                        const x = (e.clientX - rect.left) / rect.width;
-                        const limit = maxPanXY().x;
-                        setPanX((x * limit * 2) - limit);
-                      }}
-                    >
-                      <div 
-                        className="absolute top-0 bottom-0 w-12 bg-gray-500 hover:bg-cyan-500 rounded transition-colors"
-                        style={{ left: `${maxPanXY().x > 0 ? ((panX + maxPanXY().x) / (maxPanXY().x * 2)) * 100 : 50}%`, transform: 'translateX(-50%)' }}
-                        onMouseDown={(e) => {
-                          e.stopPropagation();
-                          const startX = e.clientX;
-                          const startPan = panX;
-                          const parent = e.currentTarget.parentElement!;
-                          const width = parent.getBoundingClientRect().width;
-                          const limit = maxPanXY().x;
-                          
-                          const onMove = (ev: MouseEvent) => {
-                            const delta = (ev.clientX - startX) / width * limit * 2;
-                            setPanX(Math.max(-limit, Math.min(limit, startPan + delta)));
-                          };
-                          const onUp = () => {
-                            document.removeEventListener('mousemove', onMove);
-                            document.removeEventListener('mouseup', onUp);
-                          };
-                          document.addEventListener('mousemove', onMove);
-                          document.addEventListener('mouseup', onUp);
-                        }}
-                      />
-                    </div>
-                  </div>
-                )}
-                {zoom !== 1 && <div className="hidden md:block w-2 h-2 mt-1 ml-1" />}
               </div>
             </div>
 
-            <div className="mt-4">
+            <div className="mx-2 my-2">
               <div className="flex items-center justify-center gap-1.5 bg-gray-50/50 rounded-lg p-1.5 border border-gray-100">
                 <Button
                   variant="ghost"
                   size="sm"
-                  onClick={() => setZoom(prev => Math.max(prev - 0.1, 0.2))}
+                  onClick={() => setZoom(prev => Math.min(prev + 0.25, 5))}
+                  className="h-7 w-7 p-0 hover:bg-gray-100 rounded-md"
+                  title="Zoom In"
+                >
+                  <ZoomIn className="h-3.5 w-3.5 text-gray-500" />
+                </Button>
+
+                <Button
+                  variant="ghost"
+                  size="sm"
+                  onClick={() => setZoom(prev => Math.max(prev - 0.25, 0.25))}
                   className="h-7 w-7 p-0 hover:bg-gray-100 rounded-md"
                   title="Zoom Out"
                 >
                   <ZoomOut className="h-3.5 w-3.5 text-gray-500" />
+                </Button>
+
+                <Button
+                  variant="ghost"
+                  size="sm"
+                  onClick={() => setSelectZoomMode(prev => !prev)}
+                  className={`h-7 px-2 rounded-md text-xs transition-colors ${
+                    selectZoomMode
+                      ? 'bg-indigo-500 text-white hover:bg-indigo-600'
+                      : 'hover:bg-gray-100 text-gray-500'
+                  }`}
+                  title="Select area to zoom into"
+                >
+                  <Scan className="h-3.5 w-3.5 mr-1" />
+                  Select Zoom
                 </Button>
                 
                 <span className="text-xs text-gray-500 min-w-[42px] text-center font-medium">
                   {Math.round(zoom * 100)}%
                 </span>
                 
-                <Button
-                  variant="ghost"
-                  size="sm"
-                  onClick={() => setZoom(prev => Math.min(prev + 0.1, 3))}
-                  className="h-7 w-7 p-0 hover:bg-gray-100 rounded-md"
-                  title="Zoom In"
-                >
-                  <ZoomIn className="h-3.5 w-3.5 text-gray-500" />
-                </Button>
-                
-                <div className="w-px h-4 bg-gray-200 mx-0.5" />
-                
-                <Button 
-                  variant="ghost"
-                  size="sm"
-                  onClick={fitToView}
-                  className="h-7 px-2 hover:bg-gray-100 rounded-md text-gray-500 text-xs"
-                  title="Fit to View"
-                >
-                  <Maximize2 className="h-3 w-3 mr-1" />
-                  Fit
-                </Button>
-                
-                <Button 
-                  variant="ghost"
-                  size="sm"
-                  onClick={resetView}
-                  className="h-7 px-2 hover:bg-gray-100 rounded-md text-gray-500 text-xs"
-                  title="Reset"
-                >
-                  <RotateCcw className="h-3 w-3 mr-1" />
-                  Reset
-                </Button>
+                {zoom > 1 && (
+                  <Button 
+                    variant="ghost"
+                    size="sm"
+                    onClick={resetView}
+                    className="h-7 px-2 hover:bg-gray-100 rounded-md text-gray-500 text-xs"
+                    title="Reset to 100%"
+                  >
+                    <RotateCcw className="h-3 w-3 mr-1" />
+                    Reset
+                  </Button>
+                )}
               </div>
             </div>
 

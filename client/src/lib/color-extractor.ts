@@ -1,3 +1,15 @@
+export const COLOR_MATCH_TOLERANCE = 45;
+
+export interface ColorRegion {
+  id: number;
+  bbox: { minX: number; minY: number; maxX: number; maxY: number };
+  pixelCount: number;
+  percentage: number;
+  selected: boolean;
+  pixelIndices: number[];
+  thumbnailUrl?: string;
+}
+
 export interface ExtractedColor {
   hex: string;
   rgb: { r: number; g: number; b: number };
@@ -10,6 +22,8 @@ export interface ExtractedColor {
   spotFluorG: boolean;
   spotFluorOrange: boolean;
   name?: string;
+  regions?: ColorRegion[];
+  regionMap?: Int32Array;
 }
 
 function rgbToHex(r: number, g: number, b: number): string {
@@ -71,17 +85,15 @@ const COLOR_PALETTE: Array<{ name: string; rgb: { r: number; g: number; b: numbe
   { name: 'Yellow', rgb: { r: 250, g: 210, b: 50 }, hex: '#FAD232', isNeutral: false },
   { name: 'Orange', rgb: { r: 240, g: 120, b: 20 }, hex: '#F07814', isNeutral: false },
   
-  // Purples and Lavenders - VERY STRICT matching (maxDistance: 25) for bright purples
-  // Dark purples use wider threshold (35) to avoid merging with black
-  { name: 'Purple', rgb: { r: 140, g: 60, b: 180 }, hex: '#8C3CB4', isNeutral: false, maxDistance: 25 },
-  { name: 'Lavender', rgb: { r: 230, g: 190, b: 230 }, hex: '#E6BEE6', isNeutral: false, maxDistance: 25 },
-  { name: 'Violet', rgb: { r: 148, g: 0, b: 211 }, hex: '#9400D3', isNeutral: false, maxDistance: 25 },
-  { name: 'Light Purple', rgb: { r: 177, g: 156, b: 217 }, hex: '#B19CD9', isNeutral: false, maxDistance: 25 },
-  { name: 'Plum', rgb: { r: 142, g: 69, b: 133 }, hex: '#8E4585', isNeutral: false, maxDistance: 25 },
-  // Dark purples - wider threshold to catch dark purple shades before they match black
-  { name: 'Dark Purple', rgb: { r: 48, g: 25, b: 52 }, hex: '#301934', isNeutral: false, maxDistance: 35 },
-  { name: 'Eggplant', rgb: { r: 65, g: 30, b: 70 }, hex: '#411E46', isNeutral: false, maxDistance: 35 },
-  { name: 'Deep Purple', rgb: { r: 75, g: 0, b: 110 }, hex: '#4B006E', isNeutral: false, maxDistance: 35 },
+  // Purples and Lavenders
+  { name: 'Purple', rgb: { r: 140, g: 60, b: 180 }, hex: '#8C3CB4', isNeutral: false, maxDistance: 45 },
+  { name: 'Lavender', rgb: { r: 230, g: 190, b: 230 }, hex: '#E6BEE6', isNeutral: false, maxDistance: 45 },
+  { name: 'Violet', rgb: { r: 148, g: 0, b: 211 }, hex: '#9400D3', isNeutral: false, maxDistance: 45 },
+  { name: 'Light Purple', rgb: { r: 177, g: 156, b: 217 }, hex: '#B19CD9', isNeutral: false, maxDistance: 45 },
+  { name: 'Plum', rgb: { r: 142, g: 69, b: 133 }, hex: '#8E4585', isNeutral: false, maxDistance: 45 },
+  { name: 'Dark Purple', rgb: { r: 48, g: 25, b: 52 }, hex: '#301934', isNeutral: false, maxDistance: 40 },
+  { name: 'Eggplant', rgb: { r: 65, g: 30, b: 70 }, hex: '#411E46', isNeutral: false, maxDistance: 40 },
+  { name: 'Deep Purple', rgb: { r: 75, g: 0, b: 110 }, hex: '#4B006E', isNeutral: false, maxDistance: 40 },
   
   // Golds - WIDER matching (maxDistance: 60) to catch gold-like colors
   { name: 'Gold', rgb: { r: 255, g: 215, b: 0 }, hex: '#FFD700', isNeutral: false, maxDistance: 60 },
@@ -277,10 +289,10 @@ function nameFromHsl(h: number, s: number, l: number): string {
 export function extractDominantColors(
   imageData: ImageData,
   maxColors: number = 18,
-  minPercentage: number = 0.1
+  minPercentage: number = 0.01
 ): ExtractedColor[] {
   const bgColor = detectBackgroundColor(imageData);
-  const bgColorTolerance = 30;
+  const bgColorTolerance = 20;
   
   const paletteCounts = new Map<string, { 
     color: typeof COLOR_PALETTE[0]; 
@@ -314,7 +326,7 @@ export function extractDominantColors(
     const b = data[i + 2];
     const a = data[i + 3];
 
-    if (a < 250) continue;
+    if (a < 128) continue;
     
     if (bgColor) {
       const bgDist = Math.sqrt(
@@ -333,9 +345,9 @@ export function extractDominantColors(
       entry.totalG += g;
       entry.totalB += b;
     } else {
-      const qr = Math.round(r / 24) * 24;
-      const qg = Math.round(g / 24) * 24;
-      const qb = Math.round(b / 24) * 24;
+      const qr = Math.round(r / 12) * 12;
+      const qg = Math.round(g / 12) * 12;
+      const qb = Math.round(b / 12) * 12;
       const key = `${qr},${qg},${qb}`;
       const existing = unmatchedBuckets.get(key);
       if (existing) {
@@ -386,7 +398,7 @@ export function extractDominantColors(
     
     let merged = false;
     for (const existing of allColors) {
-      if (colorDistance(existing.rgb, { r: avgR, g: avgG, b: avgB }) < 35) {
+      if (colorDistance(existing.rgb, { r: avgR, g: avgG, b: avgB }) < 25) {
         existing.count += bucket.count;
         existing.percentage += pct;
         existing.rgb = {
@@ -526,20 +538,354 @@ export function extractColorsFromCanvas(canvas: HTMLCanvasElement, maxColors: nu
   return extractDominantColors(imageData, maxColors);
 }
 
-export function extractColorsFromImage(image: HTMLImageElement, maxColors: number = 18): ExtractedColor[] {
-  if (!image.complete || image.width === 0 || image.height === 0) return [];
+export interface ColorExtractionResult {
+  colors: ExtractedColor[];
+  pixelMap: Int16Array;
+  width: number;
+  height: number;
+}
+
+export function extractColorsFromImage(image: HTMLImageElement, maxColors: number = 18): ColorExtractionResult {
+  if (!image.complete || image.width === 0 || image.height === 0)
+    return { colors: [], pixelMap: new Int16Array(0), width: 0, height: 0 };
   
-  // Use full image resolution for better color detection
+  const w = image.width;
+  const h = image.height;
   const tempCanvas = document.createElement('canvas');
-  tempCanvas.width = image.width;
-  tempCanvas.height = image.height;
+  tempCanvas.width = w;
+  tempCanvas.height = h;
   const tempCtx = tempCanvas.getContext('2d');
-  if (!tempCtx) return [];
+  if (!tempCtx) return { colors: [], pixelMap: new Int16Array(0), width: 0, height: 0 };
   
   tempCtx.drawImage(image, 0, 0);
-  const imageData = tempCtx.getImageData(0, 0, tempCanvas.width, tempCanvas.height);
+  const imageData = tempCtx.getImageData(0, 0, w, h);
   
   const colors = extractDominantColors(imageData, maxColors);
   console.log('[ColorExtractor] Detected colors:', colors.map(c => ({ name: c.name, hex: c.hex, pct: c.percentage.toFixed(2) })));
-  return colors;
+
+  const totalPixels = w * h;
+  const pixelMap = new Int16Array(totalPixels).fill(-1);
+  const data = imageData.data;
+  const tol = COLOR_MATCH_TOLERANCE;
+
+  // First pass: match pixels within tolerance
+  for (let i = 0; i < totalPixels; i++) {
+    const off = i * 4;
+    if (data[off + 3] < 128) continue;
+    const r = data[off], g = data[off + 1], b = data[off + 2];
+    for (let ci = 0; ci < colors.length; ci++) {
+      const c = colors[ci].rgb;
+      if (Math.abs(r - c.r) <= tol && Math.abs(g - c.g) <= tol && Math.abs(b - c.b) <= tol) {
+        pixelMap[i] = ci;
+        break;
+      }
+    }
+  }
+
+  // Second pass: assign remaining unmapped opaque pixels to nearest color
+  if (colors.length > 0) {
+    for (let i = 0; i < totalPixels; i++) {
+      if (pixelMap[i] !== -1) continue;
+      const off = i * 4;
+      if (data[off + 3] < 128) continue;
+      const r = data[off], g = data[off + 1], b = data[off + 2];
+      let bestDist = Infinity;
+      let bestIdx = 0;
+      for (let ci = 0; ci < colors.length; ci++) {
+        const c = colors[ci].rgb;
+        const dist = (r - c.r) ** 2 + (g - c.g) ** 2 + (b - c.b) ** 2;
+        if (dist < bestDist) {
+          bestDist = dist;
+          bestIdx = ci;
+        }
+      }
+      pixelMap[i] = bestIdx;
+    }
+  }
+
+  return { colors, pixelMap, width: w, height: h };
+}
+
+/**
+ * For each extracted color, find spatially disconnected regions via
+ * connected-component labeling using the pre-built pixelMap.
+ * Only populates `regions` (and `regionMap`) on colors with 2+ distinct regions.
+ * Generates thumbnail previews for each region.
+ */
+export function detectColorRegions(
+  pixelMap: Int16Array,
+  width: number,
+  height: number,
+  colors: ExtractedColor[],
+  imageData?: ImageData,
+): void {
+  const totalPixels = width * height;
+
+  for (let ci = 0; ci < colors.length; ci++) {
+    const mask = new Uint8Array(totalPixels);
+    for (let i = 0; i < totalPixels; i++) {
+      if (pixelMap[i] === ci) mask[i] = 1;
+    }
+
+    const labels = new Int32Array(totalPixels).fill(-1);
+    const components: { id: number; pixels: number[]; minX: number; minY: number; maxX: number; maxY: number }[] = [];
+    const queue: number[] = [];
+    let compId = 0;
+
+    for (let i = 0; i < totalPixels; i++) {
+      if (mask[i] === 0 || labels[i] !== -1) continue;
+
+      let minX = width, minY = height, maxX = 0, maxY = 0;
+      const compPixels: number[] = [];
+      queue.length = 0;
+      queue.push(i);
+      labels[i] = compId;
+
+      let head = 0;
+      while (head < queue.length) {
+        const idx = queue[head++];
+        compPixels.push(idx);
+        const x = idx % width;
+        const y = (idx / width) | 0;
+        if (x < minX) minX = x;
+        if (x > maxX) maxX = x;
+        if (y < minY) minY = y;
+        if (y > maxY) maxY = y;
+
+        for (let dy = -1; dy <= 1; dy++) {
+          for (let dx = -1; dx <= 1; dx++) {
+            if (dx === 0 && dy === 0) continue;
+            const nx = x + dx, ny = y + dy;
+            if (nx < 0 || nx >= width || ny < 0 || ny >= height) continue;
+            const ni = ny * width + nx;
+            if (mask[ni] === 1 && labels[ni] === -1) {
+              labels[ni] = compId;
+              queue.push(ni);
+            }
+          }
+        }
+      }
+
+      components.push({ id: compId, pixels: compPixels, minX, minY, maxX, maxY });
+      compId++;
+    }
+
+    const minArea = totalPixels * 0.0005;
+    const significant = components
+      .filter(c => c.pixels.length >= minArea)
+      .sort((a, b) => b.pixels.length - a.pixels.length);
+
+    if (significant.length < 2) {
+      colors[ci].regions = undefined;
+      colors[ci].regionMap = undefined;
+      continue;
+    }
+
+    const regionMap = new Int32Array(totalPixels).fill(-1);
+    const regions: ColorRegion[] = significant.map((comp, idx) => {
+      for (const pi of comp.pixels) {
+        regionMap[pi] = idx;
+      }
+      return {
+        id: idx,
+        bbox: { minX: comp.minX, minY: comp.minY, maxX: comp.maxX, maxY: comp.maxY },
+        pixelCount: comp.pixels.length,
+        percentage: parseFloat(((comp.pixels.length / totalPixels) * 100).toFixed(2)),
+        selected: true,
+        pixelIndices: [...comp.pixels],
+      };
+    });
+
+    // Assign orphan pixels (small clusters below minArea) to nearest significant region
+    const centroids = significant.map(comp => {
+      let cx = 0, cy = 0;
+      for (const pi of comp.pixels) {
+        cx += pi % width;
+        cy += (pi / width) | 0;
+      }
+      return { x: cx / comp.pixels.length, y: cy / comp.pixels.length };
+    });
+
+    for (let i = 0; i < totalPixels; i++) {
+      if (mask[i] === 1 && regionMap[i] === -1) {
+        const px = i % width;
+        const py = (i / width) | 0;
+        let bestIdx = 0;
+        let bestDist = Infinity;
+        for (let r = 0; r < centroids.length; r++) {
+          const dx = px - centroids[r].x;
+          const dy = py - centroids[r].y;
+          const dist = dx * dx + dy * dy;
+          if (dist < bestDist) {
+            bestDist = dist;
+            bestIdx = r;
+          }
+        }
+        regionMap[i] = bestIdx;
+        const reg = regions[bestIdx];
+        reg.pixelCount++;
+        reg.pixelIndices.push(i);
+        if (px < reg.bbox.minX) reg.bbox.minX = px;
+        if (px > reg.bbox.maxX) reg.bbox.maxX = px;
+        if (py < reg.bbox.minY) reg.bbox.minY = py;
+        if (py > reg.bbox.maxY) reg.bbox.maxY = py;
+      }
+    }
+
+    // Generate thumbnails after all pixels (including orphans) are assigned
+    if (imageData) {
+      for (const reg of regions) {
+        reg.thumbnailUrl = generateRegionThumbnail(
+          imageData, reg.pixelIndices,
+          reg.bbox.minX, reg.bbox.minY, reg.bbox.maxX, reg.bbox.maxY, width, height
+        );
+      }
+    }
+
+    colors[ci].regions = regions;
+    colors[ci].regionMap = regionMap;
+  }
+}
+
+function generateRegionThumbnail(
+  imageData: ImageData,
+  pixels: number[],
+  minX: number, minY: number, maxX: number, maxY: number,
+  imgWidth: number,
+  imgHeight: number,
+): string {
+  // Add padding around the bounding box for context (10% of region size, min 4px)
+  const rawW = maxX - minX + 1;
+  const rawH = maxY - minY + 1;
+  const pad = Math.max(4, Math.round(Math.max(rawW, rawH) * 0.1));
+  const pMinX = Math.max(0, minX - pad);
+  const pMinY = Math.max(0, minY - pad);
+  const pMaxX = Math.min(imgWidth - 1, maxX + pad);
+  const pMaxY = Math.min(imgHeight - 1, maxY + pad);
+  const regionW = pMaxX - pMinX + 1;
+  const regionH = pMaxY - pMinY + 1;
+
+  const maxThumb = 56;
+  const scale = Math.min(1, maxThumb / Math.max(regionW, regionH));
+  const thumbW = Math.max(1, Math.round(regionW * scale));
+  const thumbH = Math.max(1, Math.round(regionH * scale));
+
+  const pixelSet = new Set(pixels);
+  const src = imageData.data;
+
+  // Draw full image content in bbox, dim non-region pixels
+  const cropCanvas = document.createElement('canvas');
+  cropCanvas.width = regionW;
+  cropCanvas.height = regionH;
+  const cropCtx = cropCanvas.getContext('2d')!;
+  const cropData = cropCtx.createImageData(regionW, regionH);
+  const out = cropData.data;
+
+  for (let y = pMinY; y <= pMaxY; y++) {
+    for (let x = pMinX; x <= pMaxX; x++) {
+      const srcIdx = y * imgWidth + x;
+      const srcOff = srcIdx * 4;
+      const dstOff = ((y - pMinY) * regionW + (x - pMinX)) * 4;
+      const inRegion = pixelSet.has(srcIdx);
+      out[dstOff] = src[srcOff];
+      out[dstOff + 1] = src[srcOff + 1];
+      out[dstOff + 2] = src[srcOff + 2];
+      // Region pixels at full opacity, others dimmed to ~25%
+      out[dstOff + 3] = inRegion ? src[srcOff + 3] : Math.round(src[srcOff + 3] * 0.25);
+    }
+  }
+  cropCtx.putImageData(cropData, 0, 0);
+
+  const thumbCanvas = document.createElement('canvas');
+  thumbCanvas.width = thumbW;
+  thumbCanvas.height = thumbH;
+  const thumbCtx = thumbCanvas.getContext('2d')!;
+  thumbCtx.imageSmoothingEnabled = true;
+  thumbCtx.drawImage(cropCanvas, 0, 0, thumbW, thumbH);
+  return thumbCanvas.toDataURL('image/png');
+}
+
+/**
+ * Async version that runs the heavy flood-fill in a Web Worker,
+ * then generates thumbnails on the main thread (needs canvas).
+ */
+export function detectColorRegionsAsync(
+  pixelMap: Int16Array,
+  width: number,
+  height: number,
+  colors: ExtractedColor[],
+  imageData?: ImageData,
+): Promise<void> {
+  return new Promise((resolve) => {
+    let worker: Worker;
+    try {
+      worker = new Worker(new URL('./region-worker.ts', import.meta.url), { type: 'module' });
+    } catch {
+      // Worker creation failed, fall back to sync
+      detectColorRegions(pixelMap, width, height, colors, imageData);
+      return resolve();
+    }
+
+    const mapCopy = new Int16Array(pixelMap);
+
+    worker.onmessage = (e) => {
+      const results: Array<{
+        colorIndex: number;
+        regions: Array<{
+          id: number;
+          bbox: { minX: number; minY: number; maxX: number; maxY: number };
+          pixelCount: number;
+          percentage: number;
+          pixelIndices: number[];
+        }>;
+        regionMap: Int32Array;
+      }> = e.data;
+
+      const processedIndices = new Set(results.map(r => r.colorIndex));
+
+      for (let ci = 0; ci < colors.length; ci++) {
+        if (!processedIndices.has(ci)) {
+          colors[ci].regions = undefined;
+          colors[ci].regionMap = undefined;
+        }
+      }
+
+      for (const result of results) {
+        const color = colors[result.colorIndex];
+        color.regionMap = result.regionMap;
+        color.regions = result.regions.map(r => {
+          let thumbnailUrl: string | undefined;
+          if (imageData) {
+            thumbnailUrl = generateRegionThumbnail(
+              imageData, r.pixelIndices,
+              r.bbox.minX, r.bbox.minY, r.bbox.maxX, r.bbox.maxY, width, height
+            );
+          }
+          return {
+            id: r.id,
+            bbox: r.bbox,
+            pixelCount: r.pixelCount,
+            percentage: r.percentage,
+            selected: true,
+            pixelIndices: r.pixelIndices,
+            thumbnailUrl,
+          };
+        });
+      }
+
+      worker.terminate();
+      resolve();
+    };
+
+    worker.onerror = () => {
+      worker.terminate();
+      detectColorRegions(pixelMap, width, height, colors, imageData);
+      resolve();
+    };
+
+    worker.postMessage(
+      { pixelMap: mapCopy, width, height, colorCount: colors.length },
+      [mapCopy.buffer]
+    );
+  });
 }

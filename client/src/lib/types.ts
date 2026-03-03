@@ -77,6 +77,30 @@ export interface SpotColorData {
   spotGloss: boolean;
 }
 
+export interface SegmentLayer {
+  id: string;
+  label: string;
+  maskDataUrl: string;
+  color: string;
+  visible: boolean;
+  area: number;
+  boundingBox: { x: number; y: number; width: number; height: number };
+  spotWhite: boolean;
+  spotGloss: boolean;
+}
+
+export interface SegmentationData {
+  enabled: boolean;
+  layers: SegmentLayer[];
+  mode: 'colors' | 'items';
+}
+
+export const LAYER_COLORS = [
+  '#FF6B6B', '#4ECDC4', '#45B7D1', '#96CEB4',
+  '#FFEAA7', '#DDA0DD', '#98D8C8', '#F7DC6F',
+  '#BB8FCE', '#85C1E9', '#F0B27A', '#82E0AA',
+];
+
 export interface LockedContour {
   label: string;
   pathPoints: Array<{x: number; y: number}>;
