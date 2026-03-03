@@ -708,10 +708,10 @@ export default function ControlsSection({
           <div className="border-b border-gray-100">
             <button
               onClick={handleSpotColorsToggle}
-              className={`flex items-center justify-between w-full px-4 py-3 text-left hover:bg-gray-50 transition-colors ${showSpotColors ? 'bg-violet-50' : ''}`}
+              className={`flex items-center justify-between w-full px-4 py-3 text-left hover:bg-gray-50 transition-colors ${showSpotColors ? 'bg-amber-50' : ''}`}
             >
               <div className="flex items-center gap-2">
-                <Palette className="w-4 h-4 text-violet-500" />
+                <Palette className="w-4 h-4 text-amber-600" />
                 <span className="text-sm font-medium text-gray-700">Spot Colors & Layers</span>
               </div>
               <ChevronDown className={`w-4 h-4 text-gray-400 transition-transform ${showSpotColors ? 'rotate-180' : ''}`} />
@@ -724,7 +724,7 @@ export default function ControlsSection({
                   onClick={() => setSpotPreviewEnabled(!spotPreviewEnabled)}
                   className={`flex items-center gap-1.5 px-2 py-1 rounded text-xs font-medium transition-colors ${
                     spotPreviewEnabled 
-                      ? 'bg-violet-100 text-violet-700 border border-violet-300' 
+                      ? 'bg-amber-100 text-amber-700 border border-amber-300' 
                       : 'bg-gray-100 text-gray-500 border border-gray-300 hover:bg-gray-200'
                   }`}
                   title={spotPreviewEnabled ? "Hide spot preview" : "Show spot preview"}
@@ -741,7 +741,7 @@ export default function ControlsSection({
                       setSpotPreviewEnabled(true);
                       setExtractedColors(prev => prev.map(c => ({ ...c, spotWhite: true })));
                     }}
-                    className="flex-1 px-2 py-1 rounded text-[10px] font-medium transition-colors bg-fuchsia-50 text-fuchsia-700 border border-fuchsia-200 hover:bg-fuchsia-100"
+                    className="flex-1 px-2 py-1 rounded text-[10px] font-medium transition-colors bg-orange-50 text-orange-700 border border-orange-200 hover:bg-orange-100"
                   >
                     All White
                   </button>
@@ -750,7 +750,7 @@ export default function ControlsSection({
                       setSpotPreviewEnabled(true);
                       setExtractedColors(prev => prev.map(c => ({ ...c, spotGloss: true })));
                     }}
-                    className="flex-1 px-2 py-1 rounded text-[10px] font-medium transition-colors bg-green-50 text-green-700 border border-green-200 hover:bg-green-100"
+                    className="flex-1 px-2 py-1 rounded text-[10px] font-medium transition-colors bg-teal-50 text-teal-700 border border-teal-200 hover:bg-teal-100"
                   >
                     All Gloss
                   </button>
@@ -795,8 +795,8 @@ export default function ControlsSection({
                               />
                               {(color.spotWhite || color.spotGloss) && (
                                 <div className="absolute -top-1.5 -right-1.5 flex gap-px">
-                                  {color.spotWhite && <div className="w-2.5 h-2.5 rounded-full border border-white" style={{ backgroundColor: '#FF00FF' }} title="White" />}
-                                  {color.spotGloss && <div className="w-2.5 h-2.5 rounded-full border border-white" style={{ backgroundColor: '#39FF14' }} title="Gloss" />}
+                                  {color.spotWhite && <div className="w-2.5 h-2.5 rounded-full border border-white" style={{ backgroundColor: '#F97316' }} title="White" />}
+                                  {color.spotGloss && <div className="w-2.5 h-2.5 rounded-full border border-white" style={{ backgroundColor: '#14B8A6' }} title="Gloss" />}
                                 </div>
                               )}
                             </div>
@@ -888,7 +888,7 @@ export default function ControlsSection({
                           setSpotWhiteName(tempWhiteName || "RDG_WHITE");
                           setEditingWhiteName(false);
                         }}
-                        className="p-0.5 hover:bg-green-100 rounded"
+                        className="p-0.5 hover:bg-amber-100 rounded"
                         title="Save"
                       >
                         <Check className="w-3 h-3 text-emerald-600" />
@@ -945,7 +945,7 @@ export default function ControlsSection({
                           setSpotGlossName(tempGlossName || "RDG_GLOSS");
                           setEditingGlossName(false);
                         }}
-                        className="p-0.5 hover:bg-green-100 rounded"
+                        className="p-0.5 hover:bg-amber-100 rounded"
                         title="Save"
                       >
                         <Check className="w-3 h-3 text-emerald-600" />

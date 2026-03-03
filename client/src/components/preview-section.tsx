@@ -1033,11 +1033,11 @@ const PreviewSection = forwardRef<HTMLCanvasElement, PreviewSectionProps>(
         if (!c.spotWhite && !c.spotGloss) return null;
         let oR: number, oG: number, oB: number;
         if (c.spotWhite && c.spotGloss) {
-          oR = 255; oG = 165; oB = 0; // orange = both
+          oR = 234; oG = 179; oB = 8; // yellow-amber = both
         } else if (c.spotWhite) {
-          oR = 255; oG = 0; oB = 255; // magenta
+          oR = 249; oG = 115; oB = 22; // orange
         } else {
-          oR = 57; oG = 255; oB = 20; // green
+          oR = 20; oG = 184; oB = 166; // teal
         }
         let regionSelected: boolean[] | undefined;
         if (c.regions && c.regions.length > 1) {
