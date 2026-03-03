@@ -827,7 +827,19 @@ export default function ControlsSection({
                         </div>
                         {hasRegions && isExpanded && (
                           <div className="border-t border-gray-100 px-2 pb-2 pt-1 space-y-1">
-                            <div className="text-[10px] text-gray-400 font-medium mb-1">Select shapes to include:</div>
+                            <div className="flex items-center justify-between mb-1">
+                              <span className="text-[10px] text-gray-400 font-medium">Select shapes to include:</span>
+                              <button
+                                onClick={() => {
+                                  const regions = color.regions!;
+                                  const allDeselected = regions.every(r => !r.selected);
+                                  regions.forEach(r => toggleColorRegion(index, r.id, allDeselected));
+                                }}
+                                className="text-[9px] px-1.5 py-0.5 rounded bg-gray-100 text-gray-500 hover:bg-gray-200 transition-colors"
+                              >
+                                {color.regions!.every(r => !r.selected) ? 'Select All' : 'Unselect All'}
+                              </button>
+                            </div>
                             {color.regions!.map((region) => {
                               const isRegionHighlighted = isHighlighted && highlightedRegionId === region.id;
                               return (
