@@ -621,72 +621,45 @@ ${pdfData ? '<p><strong>PDF design with CutContour is attached.</strong></p>' : 
     }
   });
 
-  // AI Image Enhancement using Real-ESRGAN via Replicate
+  // Image Enhancement using Sharp Lanczos3 upscaling
   app.post("/api/enhance-image", upload.single('image'), async (req, res) => {
     try {
       if (!req.file) {
         return res.status(400).json({ error: "No image file provided" });
       }
 
-      const apiToken = process.env.REPLICATE_API_TOKEN;
-      if (!apiToken) {
-        return res.status(500).json({ error: "AI enhancement service not configured." });
-      }
-
-      const replicate = new Replicate({ auth: apiToken });
+      const start = Date.now();
       const metadata = await sharp(req.file.buffer).metadata();
       const imgWidth = metadata.width || 1;
       const imgHeight = metadata.height || 1;
 
-      const model = (req.body?.model as string) || 'anime';
       const scale = 2;
-      const faceEnhance = model === 'general_face';
-
-      // Cap output at ~8000px to avoid Replicate OOM
       const longestSide = Math.max(imgWidth, imgHeight);
       const effectiveScale = longestSide * scale > 8000 ? Math.max(1, Math.floor(8000 / longestSide)) : scale;
       if (effectiveScale < 2) {
         return res.status(400).json({ error: "Image is already very large. Enhancement would exceed size limits." });
       }
 
-      const modelName = model === 'anime'
-        ? 'RealESRGAN_x4plus_anime_6B'
-        : 'RealESRGAN_x4plus';
+      const outWidth = Math.round(imgWidth * effectiveScale);
+      const outHeight = Math.round(imgHeight * effectiveScale);
 
-      const base64 = req.file.buffer.toString('base64');
-      const mimeType = metadata.format === 'png' ? 'image/png' : 'image/jpeg';
-      const dataUri = `data:${mimeType};base64,${base64}`;
+      console.log(`[Enhance] Starting Sharp upscale: ${imgWidth}x${imgHeight} → ${outWidth}x${outHeight} (${effectiveScale}x)`);
 
-      console.log(`[Enhance] Starting: ${imgWidth}x${imgHeight}, model=${modelName}, scale=${effectiveScale}, face=${faceEnhance}`);
+      const pngBuffer = await sharp(req.file.buffer)
+        .resize(outWidth, outHeight, {
+          kernel: sharp.kernel.lanczos3,
+          withoutEnlargement: false,
+        })
+        .sharpen({ sigma: 0.8, m1: 1.0, m2: 0.5 })
+        .png()
+        .toBuffer();
 
-      const replicateModel = "nightmareai/real-esrgan:f121d640bd286e1fdc67f9799164c1d5be36ff74576ee11c803ae5b665dd46aa";
-      const output = await replicate.run(replicateModel, {
-        input: {
-          image: dataUri,
-          scale: effectiveScale,
-          face_enhance: faceEnhance,
-        },
-      });
-
-      // Output is a URL string to the enhanced image
-      const outputUrl = typeof output === 'string' ? output : String(output);
-      console.log(`[Enhance] Replicate returned URL, downloading...`);
-
-      const imgResponse = await fetch(outputUrl);
-      if (!imgResponse.ok) {
-        throw new Error(`Failed to download enhanced image: ${imgResponse.status}`);
-      }
-      const enhancedBuffer = Buffer.from(await imgResponse.arrayBuffer());
-
-      // Always output as PNG to preserve alpha
-      const pngBuffer = await sharp(enhancedBuffer).png().toBuffer();
-      const enhancedMeta = await sharp(pngBuffer).metadata();
-
-      console.log(`[Enhance] Done! ${imgWidth}x${imgHeight} → ${enhancedMeta.width}x${enhancedMeta.height}`);
+      const elapsed = Date.now() - start;
+      console.log(`[Enhance] Done in ${elapsed}ms! ${imgWidth}x${imgHeight} → ${outWidth}x${outHeight}`);
 
       res.set('Content-Type', 'image/png');
-      res.set('X-Enhanced-Width', String(enhancedMeta.width || 0));
-      res.set('X-Enhanced-Height', String(enhancedMeta.height || 0));
+      res.set('X-Enhanced-Width', String(outWidth));
+      res.set('X-Enhanced-Height', String(outHeight));
       res.set('X-Original-Width', String(imgWidth));
       res.set('X-Original-Height', String(imgHeight));
       res.send(pngBuffer);

@@ -47,14 +47,10 @@ ctx.onmessage = async (e: MessageEvent<EnhanceRequest>) => {
     postProgress('Encoding PNG…', 15);
     const blob = await offscreen.convertToBlob({ type: 'image/png' });
 
-    const scale = 2;
-
     const formData = new FormData();
     formData.append('image', blob, 'image.png');
-    formData.append('model', mode === 'faces' ? 'general_face' : 'anime');
-    formData.append('scale', String(scale));
 
-    postProgress('Uploading to AI…', 25);
+    postProgress('Uploading…', 25);
 
     const response = await fetch('/api/enhance-image', {
       method: 'POST',
