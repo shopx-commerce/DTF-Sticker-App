@@ -90,7 +90,7 @@ const PreviewSection = forwardRef<HTMLCanvasElement, PreviewSectionProps>(
     const lastImageRef = useRef<string | null>(null);
     const [isProcessing, setIsProcessing] = useState(false);
     const [processingProgress, setProcessingProgress] = useState(0);
-    const contourCacheRef = useRef<{key: string; canvas: HTMLCanvasElement; downsampleScale: number; imageCanvasX: number; imageCanvasY: number} | null>(null);
+    const contourCacheRef = useRef<{key: string; canvas: HTMLCanvasElement; downsampleScale: number; imageCanvasX: number; imageCanvasY: number; previewPathPoints: Array<{x: number; y: number}>; allPreviewPathPoints?: Array<Array<{x: number; y: number}>>} | null>(null);
     const processingIdRef = useRef(0);
     const [showHighlight, setShowHighlight] = useState(false);
     const lastSettingsRef = useRef<string>('');
@@ -625,7 +625,15 @@ const PreviewSection = forwardRef<HTMLCanvasElement, PreviewSectionProps>(
           detectedShapeInfo
         ).then((result) => {
           if (processingIdRef.current === currentId) {
-            contourCacheRef.current = { key: cacheKey, canvas: result.canvas, downsampleScale: result.downsampleScale, imageCanvasX: result.imageCanvasX, imageCanvasY: result.imageCanvasY };
+            contourCacheRef.current = {
+              key: cacheKey,
+              canvas: result.canvas,
+              downsampleScale: result.downsampleScale,
+              imageCanvasX: result.imageCanvasX,
+              imageCanvasY: result.imageCanvasY,
+              previewPathPoints: result.contourData?.previewPathPoints ?? [],
+              allPreviewPathPoints: result.contourData?.allPreviewPathPoints,
+            };
             setIsProcessing(false);
             if (result.detectedAlgorithm && onDetectedAlgorithm) {
               onDetectedAlgorithm(result.detectedAlgorithm);
@@ -1481,6 +1489,9 @@ const PreviewSection = forwardRef<HTMLCanvasElement, PreviewSectionProps>(
           canvasW: contourCanvas.width, canvasH: contourCanvas.height
         };
         
+        const scaleX = contourWidth / contourCanvas.width;
+        const scaleY = contourHeight / contourCanvas.height;
+
         if (strokeSettings.backgroundColor === 'holographic') {
           const holoKey = `${contourCacheRef.current?.key || ''}-${contourCanvas.width}x${contourCanvas.height}`;
           let holoCanvas = holographicCacheRef.current?.contourKey === holoKey ? holographicCacheRef.current.canvas : null;
@@ -1527,6 +1538,39 @@ const PreviewSection = forwardRef<HTMLCanvasElement, PreviewSectionProps>(
           ctx.drawImage(holoCanvas, contourX, contourY, contourWidth, contourHeight);
         } else {
           ctx.drawImage(contourCanvas, contourX, contourY, contourWidth, contourHeight);
+        }
+
+        // Draw magenta dashed contour outline overlay so it's always visible
+        // regardless of stroke color or background color settings
+        {
+          const cache = contourCacheRef.current;
+          const pathArrays: Array<Array<{x: number; y: number}>> =
+            cache?.allPreviewPathPoints && cache.allPreviewPathPoints.length > 0
+              ? cache.allPreviewPathPoints
+              : cache?.previewPathPoints && cache.previewPathPoints.length > 2
+                ? [cache.previewPathPoints]
+                : [];
+
+          if (pathArrays.length > 0) {
+            ctx.save();
+            ctx.strokeStyle = '#FF00FF';
+            ctx.lineWidth = 1.5;
+            ctx.setLineDash([5, 4]);
+            ctx.lineDashOffset = 0;
+
+            for (const pts of pathArrays) {
+              if (pts.length < 2) continue;
+              ctx.beginPath();
+              ctx.moveTo(contourX + pts[0].x * scaleX, contourY + pts[0].y * scaleY);
+              for (let i = 1; i < pts.length; i++) {
+                ctx.lineTo(contourX + pts[i].x * scaleX, contourY + pts[i].y * scaleY);
+              }
+              ctx.closePath();
+              ctx.stroke();
+            }
+
+            ctx.restore();
+          }
         }
 
         {
