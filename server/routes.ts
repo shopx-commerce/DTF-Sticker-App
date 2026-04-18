@@ -672,6 +672,96 @@ ${pdfData ? '<p><strong>PDF design with CutContour is attached.</strong></p>' : 
     }
   });
 
+  // AI Image Enhancement using Replicate Real-ESRGAN (4x)
+  app.post("/api/enhance-image-ai", upload.single('image'), async (req, res) => {
+    try {
+      if (!req.file) {
+        return res.status(400).json({ error: "No image file provided" });
+      }
+
+      const apiToken = process.env.REPLICATE_API_TOKEN;
+      if (!apiToken) {
+        console.error("Replicate API token not configured");
+        return res.status(500).json({ error: "AI enhancement service not configured. Set REPLICATE_API_TOKEN environment variable." });
+      }
+
+      const start = Date.now();
+      const metadata = await sharp(req.file.buffer).metadata();
+      const imgWidth = metadata.width || 1;
+      const imgHeight = metadata.height || 1;
+
+      const longestSide = Math.max(imgWidth, imgHeight);
+      if (longestSide * 4 > 16384) {
+        return res.status(400).json({ error: `Image too large for 4x AI enhancement (${imgWidth}x${imgHeight}). Max input longest side: 4096px.` });
+      }
+
+      const faceEnhance = req.body?.face_enhance === 'true';
+      console.log(`[Enhance-AI] Starting Replicate Real-ESRGAN 4x: ${imgWidth}x${imgHeight} → ${imgWidth * 4}x${imgHeight * 4} (face_enhance: ${faceEnhance})`);
+
+      const replicate = new Replicate({ auth: apiToken, useFileOutput: false });
+
+      const base64 = req.file.buffer.toString('base64');
+      const mimeType = req.file.mimetype || 'image/png';
+      const dataUri = `data:${mimeType};base64,${base64}`;
+
+      const output = await replicate.run(
+        "nightmareai/real-esrgan:f121d640bd286e1fdc67f9799164c1d5be36ff74576ee11c803ae5b665dd46aa",
+        {
+          input: {
+            image: dataUri,
+            scale: 4,
+            face_enhance: faceEnhance,
+          }
+        }
+      );
+
+      let resultUrl: string | null = null;
+      if (typeof output === 'string') {
+        resultUrl = output;
+      } else if (output && typeof (output as any).url === 'function') {
+        resultUrl = (output as any).url();
+      } else if (output && typeof output === 'object') {
+        resultUrl = String(output);
+      }
+
+      console.log(`[Enhance-AI] Replicate output type: ${typeof output}, resultUrl: ${resultUrl ? resultUrl.substring(0, 80) + '...' : 'null'}`);
+
+      if (!resultUrl || resultUrl === '[object Object]' || resultUrl === '[object ReadableStream]') {
+        throw new Error("Unexpected output format from Replicate AI model");
+      }
+
+      console.log(`[Enhance-AI] Replicate done, downloading result...`);
+
+      const imgResponse = await fetch(resultUrl);
+      if (!imgResponse.ok) throw new Error(`Failed to download enhanced image: ${imgResponse.status}`);
+
+      const arrayBuf = await imgResponse.arrayBuffer();
+      const pngBuffer = await sharp(Buffer.from(arrayBuf))
+        .png()
+        .toBuffer();
+
+      const enhancedMeta = await sharp(pngBuffer).metadata();
+      const outWidth = enhancedMeta.width || imgWidth * 4;
+      const outHeight = enhancedMeta.height || imgHeight * 4;
+
+      const elapsed = Date.now() - start;
+      console.log(`[Enhance-AI] Done in ${elapsed}ms! ${imgWidth}x${imgHeight} → ${outWidth}x${outHeight}`);
+
+      res.set('Content-Type', 'image/png');
+      res.set('X-Enhanced-Width', String(outWidth));
+      res.set('X-Enhanced-Height', String(outHeight));
+      res.set('X-Original-Width', String(imgWidth));
+      res.set('X-Original-Height', String(imgHeight));
+      res.send(pngBuffer);
+    } catch (error) {
+      console.error("[Enhance-AI] Error:", error);
+      res.status(500).json({
+        error: "AI enhancement failed",
+        details: error instanceof Error ? error.message : "Unknown error",
+      });
+    }
+  });
+
   const httpServer = createServer(app);
   return httpServer;
 }

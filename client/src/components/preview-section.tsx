@@ -27,6 +27,7 @@ interface PreviewSectionProps {
   lockedContour?: LockedContour | null;
   segmentationData?: SegmentationData;
   onSpotColorClick?: (colorIndex: number, regionId: number | null) => void;
+  spotPaintMode?: 'white' | 'gloss' | 'both' | 'clear' | null;
   fileName?: string;
   onResizeChange?: (settings: Partial<ResizeSettings>) => void;
   onUndo?: () => void;
@@ -35,14 +36,57 @@ interface PreviewSectionProps {
   canRedo?: boolean;
 }
 
+function InchInput({ value, onCommit, min = 0.5, max = 50, className }: {
+  value: number;
+  onCommit: (v: number) => void;
+  min?: number;
+  max?: number;
+  className?: string;
+}) {
+  const [localValue, setLocalValue] = useState(value.toFixed(2));
+  const [isFocused, setIsFocused] = useState(false);
+
+  useEffect(() => {
+    if (!isFocused) setLocalValue(value.toFixed(2));
+  }, [value, isFocused]);
+
+  const commit = () => {
+    const parsed = parseFloat(localValue);
+    if (!isNaN(parsed) && parsed >= min && parsed <= max) {
+      onCommit(parsed);
+    } else {
+      setLocalValue(value.toFixed(2));
+    }
+  };
+
+  return (
+    <input
+      type="text"
+      inputMode="decimal"
+      value={localValue}
+      onChange={(e) => {
+        const raw = e.target.value;
+        if (/^[0-9]*\.?[0-9]*$/.test(raw)) setLocalValue(raw);
+      }}
+      onFocus={() => setIsFocused(true)}
+      onBlur={() => { setIsFocused(false); commit(); }}
+      onKeyDown={(e) => { if (e.key === 'Enter') { (e.target as HTMLInputElement).blur(); } }}
+      className={className}
+    />
+  );
+}
+
 const PreviewSection = forwardRef<HTMLCanvasElement, PreviewSectionProps>(
-  ({ imageInfo, strokeSettings, resizeSettings, shapeSettings, cadCutBounds, spotPreviewData, showCutLineInfo, onDetectedAlgorithm, detectedShapeType, detectedShapeInfo, detectedAlgorithm, onStrokeChange, lockedContour, segmentationData, onSpotColorClick, fileName, onResizeChange, onUndo, onRedo, canUndo, canRedo }, ref) => {
+  ({ imageInfo, strokeSettings, resizeSettings, shapeSettings, cadCutBounds, spotPreviewData, showCutLineInfo, onDetectedAlgorithm, detectedShapeType, detectedShapeInfo, detectedAlgorithm, onStrokeChange, lockedContour, segmentationData, onSpotColorClick, spotPaintMode, fileName, onResizeChange, onUndo, onRedo, canUndo, canRedo }, ref) => {
     const canvasRef = useRef<HTMLCanvasElement>(null);
     const containerRef = useRef<HTMLDivElement>(null);
     const [zoom, setZoom] = useState(1);
-    const [panX, setPanX] = useState(0); // -100 to 100 (percent offset)
-    const [panY, setPanY] = useState(0); // -100 to 100 (percent offset)
-    const [backgroundColor, setBackgroundColor] = useState("transparent");
+    const [panX, setPanX] = useState(0);
+    const [panY, setPanY] = useState(0);
+    const zoomRef = useRef(1);
+    const panXRef = useRef(0);
+    const panYRef = useRef(0);
+    const [backgroundColor, setBackgroundColor] = useState("#9ca3af");
     const lastImageRef = useRef<string | null>(null);
     const [isProcessing, setIsProcessing] = useState(false);
     const [processingProgress, setProcessingProgress] = useState(0);
@@ -84,13 +128,27 @@ const PreviewSection = forwardRef<HTMLCanvasElement, PreviewSectionProps>(
     const selectionStartRef = useRef<{x: number; y: number} | null>(null);
     const isSelectingRef = useRef(false);
     
-    const maxPanXY = useCallback(() => {
-      const limit = 25 + Math.max(0, (zoom - 1) * 50);
+    const applyTransformToDOM = useCallback(() => {
+      const el = canvasRef.current;
+      if (!el) return;
+      el.style.transform = `translate(${panXRef.current}%, ${panYRef.current}%) scale(${zoomRef.current})`;
+      el.style.transition = 'none';
+    }, []);
+
+    const syncRefsToState = useCallback(() => {
+      setZoom(zoomRef.current);
+      setPanX(panXRef.current);
+      setPanY(panYRef.current);
+    }, []);
+
+    const maxPanXY = useCallback((z?: number) => {
+      const effectiveZoom = z ?? zoomRef.current;
+      const limit = 25 + Math.max(0, (effectiveZoom - 1) * 50);
       return { x: limit, y: limit };
-    }, [zoom]);
+    }, []);
     
-    const clampPan = useCallback((px: number, py: number) => {
-      const limit = maxPanXY();
+    const clampPan = useCallback((px: number, py: number, z?: number) => {
+      const limit = maxPanXY(z);
       return {
         x: Math.max(-limit.x, Math.min(limit.x, px)),
         y: Math.max(-limit.y, Math.min(limit.y, py)),
@@ -114,35 +172,29 @@ const PreviewSection = forwardRef<HTMLCanvasElement, PreviewSectionProps>(
       const elemH = containerRect.height;
       if (elemW === 0 || elemH === 0) return;
 
-      // Selection center relative to container, as percentage offset from center
       const scxPct = ((selX + selW / 2) / elemW - 0.5) * 100;
       const scyPct = ((selY + selH / 2) / elemH - 0.5) * 100;
 
-      // Content coordinates of selection center (undo current transform)
-      // CSS: transform-origin center, translate(panX%, panY%) scale(zoom)
-      // screenPct = zoom * contentPct + panPct
-      // contentPct = (screenPct - panPct) / zoom
-      const contentCxPct = (scxPct - panX) / zoom;
-      const contentCyPct = (scyPct - panY) / zoom;
+      const contentCxPct = (scxPct - panXRef.current) / zoomRef.current;
+      const contentCyPct = (scyPct - panYRef.current) / zoomRef.current;
 
-      // Content size of selection
-      const contentWPct = (selW / elemW * 100) / zoom;
-      const contentHPct = (selH / elemH * 100) / zoom;
+      const contentWPct = (selW / elemW * 100) / zoomRef.current;
+      const contentHPct = (selH / elemH * 100) / zoomRef.current;
 
-      // New zoom: fit content rect into container
       const newZoom = Math.min(100 / contentWPct, 100 / contentHPct);
       const clampedZoom = Math.min(Math.max(newZoom, 1), 5);
 
-      // New pan: put content center at screen center
-      // screenCenterPct = 0 = clampedZoom * contentCxPct + newPanX
       const newPanX = -clampedZoom * contentCxPct;
       const newPanY = -clampedZoom * contentCyPct;
       
-      const clamped = clampPan(newPanX, newPanY);
+      const clamped = clampPan(newPanX, newPanY, clampedZoom);
+      zoomRef.current = clampedZoom;
+      panXRef.current = clamped.x;
+      panYRef.current = clamped.y;
       setZoom(clampedZoom);
       setPanX(clamped.x);
       setPanY(clamped.y);
-    }, [zoom, panX, panY, clampPan]);
+    }, [clampPan]);
 
     const handleMouseDown = useCallback((e: React.MouseEvent) => {
       e.preventDefault();
@@ -158,9 +210,9 @@ const PreviewSection = forwardRef<HTMLCanvasElement, PreviewSectionProps>(
       }
       
       setIsDragging(true);
-      dragStartRef.current = { x: e.clientX, y: e.clientY, panX, panY };
+      dragStartRef.current = { x: e.clientX, y: e.clientY, panX: panXRef.current, panY: panYRef.current };
       mouseDownPosRef.current = { x: e.clientX, y: e.clientY };
-    }, [panX, panY, selectZoomMode]);
+    }, [selectZoomMode]);
     
     const handleMouseMove = useCallback((e: React.MouseEvent) => {
       if (isSelectingRef.current && selectionStartRef.current && containerRef.current) {
@@ -178,12 +230,13 @@ const PreviewSection = forwardRef<HTMLCanvasElement, PreviewSectionProps>(
         return;
       }
       
-      if (!isDragging || !dragStartRef.current || zoom <= 1) return;
+      if (!isDragging || !dragStartRef.current || zoomRef.current <= 1) return;
       const d = pxToPanXY(e.clientX - dragStartRef.current.x, e.clientY - dragStartRef.current.y);
       const clamped = clampPan(dragStartRef.current.panX + d.dx, dragStartRef.current.panY + d.dy);
-      setPanX(clamped.x);
-      setPanY(clamped.y);
-    }, [isDragging, pxToPanXY, clampPan, zoom]);
+      panXRef.current = clamped.x;
+      panYRef.current = clamped.y;
+      applyTransformToDOM();
+    }, [isDragging, pxToPanXY, clampPan, applyTransformToDOM]);
     
     const handleMouseUp = useCallback((e: React.MouseEvent) => {
       if (isSelectingRef.current && selectionRect) {
@@ -201,6 +254,7 @@ const PreviewSection = forwardRef<HTMLCanvasElement, PreviewSectionProps>(
       setIsDragging(false);
       dragStartRef.current = null;
       mouseDownPosRef.current = null;
+      syncRefsToState();
 
       if (downPos && onSpotColorClick && spotPreviewData?.pixelMap && imageInfo) {
         const dx = e.clientX - downPos.x;
@@ -209,7 +263,7 @@ const PreviewSection = forwardRef<HTMLCanvasElement, PreviewSectionProps>(
           handleCanvasClick(e);
         }
       }
-    }, [onSpotColorClick, spotPreviewData, imageInfo, selectionRect, applySelectionZoom]);
+    }, [onSpotColorClick, spotPreviewData, imageInfo, selectionRect, applySelectionZoom, syncRefsToState]);
     
     const handleCanvasClick = useCallback((e: React.MouseEvent) => {
       if (!imageInfo || !spotPreviewData?.pixelMap || !onSpotColorClick || !canvasRef.current) return;
@@ -261,33 +315,58 @@ const PreviewSection = forwardRef<HTMLCanvasElement, PreviewSectionProps>(
       if (isDragging) {
         setIsDragging(false);
         dragStartRef.current = null;
+        syncRefsToState();
       }
-    }, [isDragging]);
+    }, [isDragging, syncRefsToState]);
     
+    const pinchRef = useRef<{ dist: number; zoom: number } | null>(null);
+
+    const getTouchDist = (a: React.Touch, b: React.Touch) =>
+      Math.hypot(a.clientX - b.clientX, a.clientY - b.clientY);
+
     const handleTouchStart = useCallback((e: React.TouchEvent) => {
-      if (e.touches.length !== 1) return;
       e.preventDefault();
+      if (e.touches.length === 2) {
+        pinchRef.current = { dist: getTouchDist(e.touches[0], e.touches[1]), zoom: zoomRef.current };
+        setIsDragging(false);
+        dragStartRef.current = null;
+        return;
+      }
+      if (e.touches.length !== 1) return;
       const t = e.touches[0];
       setIsDragging(true);
-      dragStartRef.current = { x: t.clientX, y: t.clientY, panX, panY };
-    }, [panX, panY]);
+      dragStartRef.current = { x: t.clientX, y: t.clientY, panX: panXRef.current, panY: panYRef.current };
+    }, []);
     
     const handleTouchMove = useCallback((e: React.TouchEvent) => {
-      if (!isDragging || !dragStartRef.current || e.touches.length !== 1 || zoom <= 1) return;
       e.preventDefault();
+      if (e.touches.length === 2 && pinchRef.current) {
+        const newDist = getTouchDist(e.touches[0], e.touches[1]);
+        const scale = newDist / pinchRef.current.dist;
+        const newZoom = Math.min(Math.max(pinchRef.current.zoom * scale, 0.5), 5);
+        zoomRef.current = newZoom;
+        if (newZoom <= 1) { panXRef.current = 0; panYRef.current = 0; }
+        applyTransformToDOM();
+        return;
+      }
+      if (!isDragging || !dragStartRef.current || e.touches.length !== 1 || zoomRef.current <= 1) return;
       const t = e.touches[0];
       const d = pxToPanXY(t.clientX - dragStartRef.current.x, t.clientY - dragStartRef.current.y);
       const clamped = clampPan(dragStartRef.current.panX + d.dx, dragStartRef.current.panY + d.dy);
-      setPanX(clamped.x);
-      setPanY(clamped.y);
-    }, [isDragging, pxToPanXY, clampPan, zoom]);
+      panXRef.current = clamped.x;
+      panYRef.current = clamped.y;
+      applyTransformToDOM();
+    }, [isDragging, pxToPanXY, clampPan, applyTransformToDOM]);
     
     const handleTouchEnd = useCallback(() => {
+      pinchRef.current = null;
       setIsDragging(false);
       dragStartRef.current = null;
-    }, []);
+      syncRefsToState();
+    }, [syncRefsToState]);
     
     const resetView = useCallback(() => {
+      zoomRef.current = 1; panXRef.current = 0; panYRef.current = 0;
       setZoom(1);
       setPanX(0);
       setPanY(0);
@@ -311,21 +390,25 @@ const PreviewSection = forwardRef<HTMLCanvasElement, PreviewSectionProps>(
       return () => window.removeEventListener('keydown', handleKeyDown);
     }, [selectZoomMode]);
     
-    // Mouse wheel: scroll up = zoom in, scroll down = zoom back toward 100%
+    const wheelSyncRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+
     const handleWheel = useCallback((e: React.WheelEvent) => {
       e.preventDefault();
       if (e.deltaY < 0) {
-        setZoom(prev => Math.min(prev + 0.15, 5));
+        zoomRef.current = Math.min(zoomRef.current + 0.15, 5);
       } else {
-        setZoom(prev => {
-          const next = Math.max(prev - 0.15, 1);
-          if (next <= 1) { setPanX(0); setPanY(0); }
-          return next;
-        });
+        zoomRef.current = Math.max(zoomRef.current - 0.15, 1);
+        if (zoomRef.current <= 1) { panXRef.current = 0; panYRef.current = 0; }
       }
-    }, []);
+      applyTransformToDOM();
+      if (wheelSyncRef.current) clearTimeout(wheelSyncRef.current);
+      wheelSyncRef.current = setTimeout(() => { wheelSyncRef.current = null; syncRefsToState(); }, 150);
+    }, [applyTransformToDOM, syncRefsToState]);
     
-    // Auto-set zoom to 75% for images with no empty space around them
+    useEffect(() => { zoomRef.current = zoom; }, [zoom]);
+    useEffect(() => { panXRef.current = panX; }, [panX]);
+    useEffect(() => { panYRef.current = panY; }, [panY]);
+
     useEffect(() => {
       if (!imageInfo) {
         lastImageRef.current = null;
@@ -372,6 +455,7 @@ const PreviewSection = forwardRef<HTMLCanvasElement, PreviewSectionProps>(
 
     useEffect(() => {
       if (!containerRef.current) return;
+      let resizeTimer: ReturnType<typeof setTimeout> | null = null;
       const updateSize = () => {
         const width = containerRef.current?.clientWidth || 0;
         const height = containerRef.current?.clientHeight || 0;
@@ -384,9 +468,12 @@ const PreviewSection = forwardRef<HTMLCanvasElement, PreviewSectionProps>(
         });
       };
       updateSize();
-      const observer = new ResizeObserver(updateSize);
+      const observer = new ResizeObserver(() => {
+        if (resizeTimer) clearTimeout(resizeTimer);
+        resizeTimer = setTimeout(updateSize, 150);
+      });
       observer.observe(containerRef.current);
-      return () => observer.disconnect();
+      return () => { observer.disconnect(); if (resizeTimer) clearTimeout(resizeTimer); };
     }, []);
     
     // Check edges using a tiny downsampled version (max 200px) to avoid OOM on large images
@@ -485,8 +572,8 @@ const PreviewSection = forwardRef<HTMLCanvasElement, PreviewSectionProps>(
     const generateContourCacheKey = useCallback(() => {
       if (!imageInfo) return '';
       const bboxKey = detectedShapeInfo ? `${detectedShapeInfo.boundingBox.x},${detectedShapeInfo.boundingBox.y},${detectedShapeInfo.boundingBox.width},${detectedShapeInfo.boundingBox.height}` : 'none';
-      return `v${CONTOUR_CACHE_VERSION}-${imageInfo.image.src}-${imageInfo.originalWidth}x${imageInfo.originalHeight}-${strokeSettings.width}-${strokeSettings.alphaThreshold}-${strokeSettings.backgroundColor}-${strokeSettings.useCustomBackground}-${strokeSettings.contourMode}-${strokeSettings.autoBridging}-${strokeSettings.autoBridgingThreshold}-${resizeSettings.widthInches}-${resizeSettings.heightInches}-shape:${detectedShapeType || 'none'}-bbox:${bboxKey}`;
-    }, [imageInfo, strokeSettings.width, strokeSettings.alphaThreshold, strokeSettings.backgroundColor, strokeSettings.useCustomBackground, strokeSettings.contourMode, strokeSettings.autoBridging, strokeSettings.autoBridgingThreshold, resizeSettings.widthInches, resizeSettings.heightInches, detectedShapeType, detectedShapeInfo]);
+      return `v${CONTOUR_CACHE_VERSION}-${imageInfo.image.src}-${imageInfo.originalWidth}x${imageInfo.originalHeight}-${strokeSettings.width}-${strokeSettings.alphaThreshold}-${strokeSettings.backgroundColor}-${strokeSettings.useCustomBackground}-${strokeSettings.contourMode}-${strokeSettings.autoBridging}-${strokeSettings.autoBridgingThreshold}-${strokeSettings.includeHoles}-${resizeSettings.widthInches}-${resizeSettings.heightInches}-shape:${detectedShapeType || 'none'}-bbox:${bboxKey}`;
+    }, [imageInfo, strokeSettings.width, strokeSettings.alphaThreshold, strokeSettings.backgroundColor, strokeSettings.useCustomBackground, strokeSettings.contourMode, strokeSettings.autoBridging, strokeSettings.autoBridgingThreshold, strokeSettings.includeHoles, resizeSettings.widthInches, resizeSettings.heightInches, detectedShapeType, detectedShapeInfo]);
 
     useEffect(() => {
       // Clear any pending debounce
@@ -506,6 +593,10 @@ const PreviewSection = forwardRef<HTMLCanvasElement, PreviewSectionProps>(
 
       contourCacheRef.current = null;
       contourTransformRef.current = null;
+
+      // Invalidate any in-flight processing results immediately so stale
+      // worker responses (e.g. after image enhancement) are discarded.
+      ++processingIdRef.current;
 
       // Debounce processing to avoid rapid re-renders during slider drags
       contourDebounceRef.current = setTimeout(() => {
@@ -825,12 +916,7 @@ const PreviewSection = forwardRef<HTMLCanvasElement, PreviewSectionProps>(
           ctx.restore();
         }
       } else {
-        // Regular image rendering (non-PDF or no CutContour)
-        
-        // For shape mode, always use a solid light background to show cut area
         if (shapeSettings.enabled) {
-          ctx.fillStyle = '#f0f0f0';
-          ctx.fillRect(0, 0, canvas.width, canvas.height);
           drawShapePreview(ctx, canvas.width, canvas.height);
         } else if (effectiveBackgroundColor === "transparent") {
           drawImageWithResizePreview(ctx, canvas.width, canvas.height);
@@ -855,16 +941,21 @@ const PreviewSection = forwardRef<HTMLCanvasElement, PreviewSectionProps>(
       }
       
       if (lockedContour && lockedContour.previewPathPoints.length > 2 && canvas) {
-        const pts = lockedContour.previewPathPoints;
-        const screenPts: Array<{x: number; y: number}> = [];
-        
+        // Collect all path arrays to draw (multi-path for zero hero, single for normal)
+        const pathArrays: Array<Array<{x: number; y: number}>> =
+          lockedContour.allPreviewPathPoints && lockedContour.allPreviewPathPoints.length > 0
+            ? lockedContour.allPreviewPathPoints
+            : [lockedContour.previewPathPoints];
+
+        // Compute transform parameters once
+        let transformPts: (pts: Array<{x: number; y: number}>) => Array<{x: number; y: number}>;
+
         if (shapeSettings.enabled && imageInfo) {
-          const shapeDims = calculateShapeDimensions(
-            resizeSettings.widthInches,
-            resizeSettings.heightInches,
-            shapeSettings.type,
-            shapeSettings.offset
+          let shapeDims = calculateShapeDimensions(
+            resizeSettings.widthInches, resizeSettings.heightInches, shapeSettings.type, shapeSettings.offset
           );
+          if (shapeSettings.shapeWidthOverride && shapeSettings.shapeWidthOverride > 0) shapeDims = { widthInches: shapeSettings.shapeWidthOverride, heightInches: shapeDims.heightInches };
+          if (shapeSettings.shapeHeightOverride && shapeSettings.shapeHeightOverride > 0) shapeDims = { widthInches: shapeDims.widthInches, heightInches: shapeSettings.shapeHeightOverride };
           const viewPad = Math.max(4, Math.round(Math.min(canvas.width, canvas.height) * 0.03));
           const availW = canvas.width - (viewPad * 2);
           const availH = canvas.height - (viewPad * 2);
@@ -884,7 +975,7 @@ const PreviewSection = forwardRef<HTMLCanvasElement, PreviewSectionProps>(
           const imgH = resizeSettings.heightInches * ppi;
           const imgX = shapeX + (shapeW - imgW) / 2;
           const imgY = shapeY + (shapeH - imgH) / 2;
-          
+
           const icx = lockedContour.imageCanvasX;
           const icy = lockedContour.imageCanvasY;
           const icw = lockedContour.imageCanvasWidth;
@@ -892,24 +983,19 @@ const PreviewSection = forwardRef<HTMLCanvasElement, PreviewSectionProps>(
           const sxScale = imgW / icw;
           const syScale = imgH / ich;
           
-          for (const p of pts) {
-            screenPts.push({
-              x: imgX + (p.x - icx) * sxScale,
-              y: imgY + (p.y - icy) * syScale,
-            });
-          }
+          transformPts = (pts) => pts.map(p => ({
+            x: imgX + (p.x - icx) * sxScale,
+            y: imgY + (p.y - icy) * syScale,
+          }));
         } else if (contourTransformRef.current) {
           const ct = contourTransformRef.current;
           const sxScale = ct.width / lockedContour.contourCanvasWidth;
           const syScale = ct.height / lockedContour.contourCanvasHeight;
-          for (const p of pts) {
-            screenPts.push({
-              x: ct.x + p.x * sxScale,
-              y: ct.y + p.y * syScale,
-            });
-          }
+          transformPts = (pts) => pts.map(p => ({
+            x: ct.x + p.x * sxScale,
+            y: ct.y + p.y * syScale,
+          }));
         } else {
-          const viewPadding = 0;
           const availW = canvas.width;
           const availH = canvas.height;
           const lcAspect = lockedContour.contourCanvasWidth / lockedContour.contourCanvasHeight;
@@ -925,27 +1011,30 @@ const PreviewSection = forwardRef<HTMLCanvasElement, PreviewSectionProps>(
           const lcY = (canvas.height - lcH) / 2;
           const sxScale = lcW / lockedContour.contourCanvasWidth;
           const syScale = lcH / lockedContour.contourCanvasHeight;
-          for (const p of pts) {
-            screenPts.push({
-              x: lcX + p.x * sxScale,
-              y: lcY + p.y * syScale,
-            });
-          }
+          transformPts = (pts) => pts.map(p => ({
+            x: lcX + p.x * sxScale,
+            y: lcY + p.y * syScale,
+          }));
         }
-        
-        if (screenPts.length > 2) {
-          ctx.save();
-          ctx.strokeStyle = '#3B82F6';
-          ctx.lineWidth = 2;
-          ctx.setLineDash([6, 4]);
-          ctx.beginPath();
-          ctx.moveTo(screenPts[0].x, screenPts[0].y);
-          for (let i = 1; i < screenPts.length; i++) {
-            ctx.lineTo(screenPts[i].x, screenPts[i].y);
+
+        // Draw each contour path
+        for (const pathPts of pathArrays) {
+          if (pathPts.length < 3) continue;
+          const screenPts = transformPts(pathPts);
+          if (screenPts.length > 2) {
+            ctx.save();
+            ctx.strokeStyle = '#3B82F6';
+            ctx.lineWidth = 2;
+            ctx.setLineDash([6, 4]);
+            ctx.beginPath();
+            ctx.moveTo(screenPts[0].x, screenPts[0].y);
+            for (let i = 1; i < screenPts.length; i++) {
+              ctx.lineTo(screenPts[i].x, screenPts[i].y);
+            }
+            ctx.closePath();
+            ctx.stroke();
+            ctx.restore();
           }
-          ctx.closePath();
-          ctx.stroke();
-          ctx.restore();
         }
       }
       };
@@ -1003,7 +1092,7 @@ const PreviewSection = forwardRef<HTMLCanvasElement, PreviewSectionProps>(
       if (!hasAny) return null;
       
       const regionKey = (c: typeof colors[0]) =>
-        c.hex + (c.regions ? ':' + c.regions.map(r => r.selected ? '1' : '0').join('') : '');
+        c.hex + (c.regions ? ':' + c.regions.map(r => `${r.spotWhite ? 'w' : ''}${r.spotGloss ? 'g' : ''}`).join('') : '');
       const cacheKey = `pm-${colors.map(c => `${regionKey(c)}:${c.spotWhite}:${c.spotGloss}`).join(',')}`;
       
       if (spotOverlayCacheRef.current?.key === cacheKey) {
@@ -1026,43 +1115,67 @@ const PreviewSection = forwardRef<HTMLCanvasElement, PreviewSectionProps>(
       const overlayData = overlayCtx.createImageData(w, h);
       const out = overlayData.data;
 
-      // Build per-color overlay info: which overlay color, and region selection
-      // When both White and Gloss are on, blend to a distinguishable split color
-      const colorOverlay: Array<{ overlayR: number; overlayG: number; overlayB: number; regionMap?: Int32Array; regionSelected?: boolean[] } | null> = colors.map(c => {
-        if (!c.spotWhite && !c.spotGloss) return null;
-        let oR: number, oG: number, oB: number;
-        if (c.spotWhite && c.spotGloss) {
-          oR = 234; oG = 179; oB = 8; // yellow-amber = both
-        } else if (c.spotWhite) {
-          oR = 249; oG = 115; oB = 22; // orange
-        } else {
-          oR = 20; oG = 184; oB = 166; // teal
+      // Build per-color overlay info with per-region spot support
+      const colorOverlay: Array<{
+        colorR: number; colorG: number; colorB: number;
+        regionMap?: Int32Array;
+        regionSpot?: Array<{ oR: number; oG: number; oB: number } | null>;
+        hasPerRegionSpot: boolean;
+      } | null> = colors.map(c => {
+        const hasRegions = c.regions && c.regions.length > 0;
+        const hasPerRegionSpot = hasRegions ? c.regions!.some(r => r.spotWhite || r.spotGloss) : false;
+
+        if (!c.spotWhite && !c.spotGloss && !hasPerRegionSpot) return null;
+
+        let cR = 0, cG = 0, cB = 0;
+        if (c.spotWhite && c.spotGloss) { cR = 234; cG = 179; cB = 8; }
+        else if (c.spotWhite) { cR = 249; cG = 115; cB = 22; }
+        else if (c.spotGloss) { cR = 20; cG = 184; cB = 166; }
+
+        let regionSpot: Array<{ oR: number; oG: number; oB: number } | null> | undefined;
+
+        if (hasRegions) {
+          const maxId = Math.max(...c.regions!.map(rg => rg.id));
+          regionSpot = new Array(maxId + 1).fill(null);
+          const anyRegionHasExplicitSpot = c.regions!.some(rg => rg.spotWhite !== undefined || rg.spotGloss !== undefined);
+          for (const rg of c.regions!) {
+            const rw = anyRegionHasExplicitSpot ? (rg.spotWhite ?? false) : (rg.spotWhite ?? c.spotWhite);
+            const rg2 = anyRegionHasExplicitSpot ? (rg.spotGloss ?? false) : (rg.spotGloss ?? c.spotGloss);
+            if (rw && rg2) regionSpot[rg.id] = { oR: 234, oG: 179, oB: 8 };
+            else if (rw) regionSpot[rg.id] = { oR: 249, oG: 115, oB: 22 };
+            else if (rg2) regionSpot[rg.id] = { oR: 20, oG: 184, oB: 166 };
+            else regionSpot[rg.id] = null;
+          }
         }
-        let regionSelected: boolean[] | undefined;
-        if (c.regions && c.regions.length > 1) {
-          const maxId = Math.max(...c.regions.map(rg => rg.id));
-          regionSelected = new Array(maxId + 1).fill(true);
-          for (const rg of c.regions) regionSelected[rg.id] = rg.selected;
-        }
-        return { overlayR: oR, overlayG: oG, overlayB: oB, regionMap: c.regionMap, regionSelected };
+
+        return { colorR: cR, colorG: cG, colorB: cB, regionMap: c.regionMap, regionSpot, hasPerRegionSpot };
       });
 
       if (pixelMap && pixelMap.length === w * h) {
-        // Fast path: use pre-built pixelMap for O(1) lookups
         const totalPixels = w * h;
         for (let i = 0; i < totalPixels; i++) {
           const ci = pixelMap[i];
           if (ci < 0) continue;
           const info = colorOverlay[ci];
           if (!info) continue;
-          if (info.regionMap && info.regionSelected) {
+
+          let oR = info.colorR, oG = info.colorG, oB = info.colorB;
+          let show = true;
+
+          if (info.regionMap) {
             const regionId = info.regionMap[i];
-            if (regionId < 0 || !info.regionSelected[regionId]) continue;
+            if (regionId < 0) { show = false; }
+            else if (info.regionSpot) {
+              const rs = info.regionSpot[regionId];
+              if (!rs) { show = false; } else { oR = rs.oR; oG = rs.oG; oB = rs.oB; }
+            }
           }
+
+          if (!show) continue;
           const off = i * 4;
-          out[off] = info.overlayR;
-          out[off + 1] = info.overlayG;
-          out[off + 2] = info.overlayB;
+          out[off] = oR;
+          out[off + 1] = oG;
+          out[off + 2] = oB;
           out[off + 3] = 255;
         }
       } else {
@@ -1087,11 +1200,18 @@ const PreviewSection = forwardRef<HTMLCanvasElement, PreviewSectionProps>(
             const c = colors[ci].rgb;
             if (Math.abs(r - c.r) <= tol && Math.abs(g - c.g) <= tol && Math.abs(b - c.b) <= tol) {
               const pixelIndex = idx / 4;
-              if (info.regionMap && info.regionSelected) {
+              let fR = info.colorR, fG = info.colorG, fB = info.colorB;
+              let skip = false;
+              if (info.regionMap) {
                 const regionId = info.regionMap[pixelIndex];
-                if (regionId >= 0 && !info.regionSelected[regionId]) break;
+                if (regionId < 0) { skip = true; }
+                else if (info.regionSpot) {
+                  const rs = info.regionSpot[regionId];
+                  if (!rs) { skip = true; } else { fR = rs.oR; fG = rs.oG; fB = rs.oB; }
+                }
               }
-              out[idx] = info.overlayR; out[idx + 1] = info.overlayG; out[idx + 2] = info.overlayB; out[idx + 3] = 255;
+              if (skip) break;
+              out[idx] = fR; out[idx + 1] = fG; out[idx + 2] = fB; out[idx + 3] = 255;
               break;
             }
           }
@@ -1123,6 +1243,12 @@ const PreviewSection = forwardRef<HTMLCanvasElement, PreviewSectionProps>(
       const overlayCtx = overlayCanvas.getContext('2d');
       if (!overlayCtx) return null;
 
+      const tempCanvas = document.createElement('canvas');
+      tempCanvas.width = w;
+      tempCanvas.height = h;
+      const tempCtx = tempCanvas.getContext('2d');
+      if (!tempCtx) return null;
+
       for (const layer of visibleLayers) {
         if (!layer.spotWhite && !layer.spotGloss) continue;
 
@@ -1135,12 +1261,7 @@ const PreviewSection = forwardRef<HTMLCanvasElement, PreviewSectionProps>(
 
         if (!maskImg.complete || maskImg.naturalWidth === 0) continue;
 
-        const tempCanvas = document.createElement('canvas');
-        tempCanvas.width = w;
-        tempCanvas.height = h;
-        const tempCtx = tempCanvas.getContext('2d');
-        if (!tempCtx) continue;
-
+        tempCtx.clearRect(0, 0, w, h);
         tempCtx.drawImage(maskImg, 0, 0, w, h);
         const maskData = tempCtx.getImageData(0, 0, w, h);
         const pixels = maskData.data;
@@ -1186,20 +1307,22 @@ const PreviewSection = forwardRef<HTMLCanvasElement, PreviewSectionProps>(
     const drawShapePreview = (ctx: CanvasRenderingContext2D, canvasWidth: number, canvasHeight: number) => {
       if (!imageInfo) return;
 
-      const shapeDims = calculateShapeDimensions(
-        resizeSettings.widthInches,
-        resizeSettings.heightInches,
-        shapeSettings.type,
-        shapeSettings.offset
+      let shapeDims = calculateShapeDimensions(
+        resizeSettings.widthInches, resizeSettings.heightInches, shapeSettings.type, shapeSettings.offset
       );
+      if (shapeSettings.shapeWidthOverride && shapeSettings.shapeWidthOverride > 0) {
+        shapeDims = { widthInches: shapeSettings.shapeWidthOverride, heightInches: shapeDims.heightInches };
+      }
+      if (shapeSettings.shapeHeightOverride && shapeSettings.shapeHeightOverride > 0) {
+        shapeDims = { widthInches: shapeDims.widthInches, heightInches: shapeSettings.shapeHeightOverride };
+      }
 
-      const bleedInches = 0.10; // 0.10" bleed around the shape
-      const padding = 0;
+      const bleedInches = 0.10;
+      const shapeAspect = shapeDims.widthInches / shapeDims.heightInches;
       const availableWidth = canvasWidth;
       const availableHeight = canvasHeight;
-      const shapeAspect = shapeDims.widthInches / shapeDims.heightInches;
-      
-      let shapeWidth, shapeHeight;
+
+      let shapeWidth: number, shapeHeight: number;
       if (shapeAspect > (availableWidth / availableHeight)) {
         shapeWidth = availableWidth;
         shapeHeight = availableWidth / shapeAspect;
@@ -1210,177 +1333,100 @@ const PreviewSection = forwardRef<HTMLCanvasElement, PreviewSectionProps>(
 
       const shapeX = (canvasWidth - shapeWidth) / 2;
       const shapeY = (canvasHeight - shapeHeight) / 2;
-      
-      // Calculate bleed in pixels based on shape scale (only if bleed is enabled)
-      const shapePixelsPerInch = Math.min(shapeWidth / shapeDims.widthInches, shapeHeight / shapeDims.heightInches);
-      const bleedPixels = shapeSettings.bleedEnabled ? bleedInches * shapePixelsPerInch : 0;
-      
-      const cornerRadiusPixels = (shapeSettings.cornerRadius || 0.25) * shapePixelsPerInch;
-      
+      const ppi = Math.min(shapeWidth / shapeDims.widthInches, shapeHeight / shapeDims.heightInches);
+      const bleedPx = shapeSettings.bleedEnabled ? bleedInches * ppi : 0;
+      const cornerRadiusPx = (shapeSettings.cornerRadius || 0.25) * ppi;
+      const rotation = shapeSettings.rotation || 0;
+      const centerX = shapeX + shapeWidth / 2;
+      const centerY = shapeY + shapeHeight / 2;
+
       const sourceImage = getPreviewImage();
-      
-      // Image dimensions within the shape
-      let imageWidth = resizeSettings.widthInches * shapePixelsPerInch;
-      let imageHeight = resizeSettings.heightInches * shapePixelsPerInch;
-      
-      // For circles and ovals, do NOT scale down the image - let it fill naturally
-      // The image will be clipped to the shape boundary below, so corners that extend
-      // beyond the circle/oval are simply cropped away, giving a tight fit
-      
-      const imageX = shapeX + (shapeWidth - imageWidth) / 2;
-      const imageY = shapeY + (shapeHeight - imageHeight) / 2;
-      
-      // Draw background with bleed or fill
+      const imgScale = shapeSettings.imageScale || 1;
+      let imageWidth = resizeSettings.widthInches * ppi * imgScale;
+      let imageHeight = resizeSettings.heightInches * ppi * imgScale;
+      const imageX = shapeX + (shapeWidth - imageWidth) / 2 + (shapeSettings.imageOffsetX || 0) * ppi;
+      const imageY = shapeY + (shapeHeight - imageHeight) / 2 + (shapeSettings.imageOffsetY || 0) * ppi;
+
+      const buildPath = (ctx: CanvasRenderingContext2D, sw: number, sh: number, sx: number, sy: number, cr: number) => {
+        const type = shapeSettings.type;
+        ctx.beginPath();
+        if (type === 'circle') {
+          const r = Math.min(sw, sh) / 2;
+          ctx.arc(sx + sw / 2, sy + sh / 2, r, 0, Math.PI * 2);
+        } else if (type === 'oval') {
+          ctx.ellipse(sx + sw / 2, sy + sh / 2, sw / 2, sh / 2, 0, 0, Math.PI * 2);
+        } else if (type === 'square') {
+          const size = Math.min(sw, sh);
+          ctx.rect(sx + (sw - size) / 2, sy + (sh - size) / 2, size, size);
+        } else if (type === 'rounded-square') {
+          const size = Math.min(sw, sh);
+          ctx.roundRect(sx + (sw - size) / 2, sy + (sh - size) / 2, size, size, cr);
+        } else if (type === 'rounded-rectangle') {
+          ctx.roundRect(sx, sy, sw, sh, cr);
+        } else {
+          ctx.rect(sx, sy, sw, sh);
+        }
+      };
+
+      const applyRotation = () => {
+        if (rotation !== 0) {
+          ctx.translate(centerX, centerY);
+          ctx.rotate(rotation * Math.PI / 180);
+          ctx.translate(-centerX, -centerY);
+        }
+      };
+
+      // Bleed fill
       if (shapeSettings.bleedEnabled) {
-        // Solid color bleed mode - draw bleed area with bleedColor first
+        ctx.save();
+        applyRotation();
         ctx.fillStyle = shapeSettings.bleedColor || '#FFFFFF';
-        ctx.beginPath();
-        
-        if (shapeSettings.type === 'circle') {
-          const radius = Math.min(shapeWidth, shapeHeight) / 2 + bleedPixels;
-          ctx.arc(shapeX + shapeWidth / 2, shapeY + shapeHeight / 2, radius, 0, Math.PI * 2);
-        } else if (shapeSettings.type === 'oval') {
-          ctx.ellipse(shapeX + shapeWidth / 2, shapeY + shapeHeight / 2, shapeWidth / 2 + bleedPixels, shapeHeight / 2 + bleedPixels, 0, 0, Math.PI * 2);
-        } else if (shapeSettings.type === 'square') {
-          const size = Math.min(shapeWidth, shapeHeight);
-          ctx.rect(shapeX + (shapeWidth - size) / 2 - bleedPixels, shapeY + (shapeHeight - size) / 2 - bleedPixels, size + bleedPixels * 2, size + bleedPixels * 2);
-        } else if (shapeSettings.type === 'rounded-square') {
-          const size = Math.min(shapeWidth, shapeHeight);
-          ctx.roundRect(shapeX + (shapeWidth - size) / 2 - bleedPixels, shapeY + (shapeHeight - size) / 2 - bleedPixels, size + bleedPixels * 2, size + bleedPixels * 2, cornerRadiusPixels);
-        } else if (shapeSettings.type === 'rounded-rectangle') {
-          ctx.roundRect(shapeX - bleedPixels, shapeY - bleedPixels, shapeWidth + bleedPixels * 2, shapeHeight + bleedPixels * 2, cornerRadiusPixels);
-        } else {
-          ctx.rect(shapeX - bleedPixels, shapeY - bleedPixels, shapeWidth + bleedPixels * 2, shapeHeight + bleedPixels * 2);
-        }
+        buildPath(ctx, shapeWidth + bleedPx * 2, shapeHeight + bleedPx * 2, shapeX - bleedPx, shapeY - bleedPx, cornerRadiusPx);
         ctx.fill();
-        
-        // Then draw the fill color on top (within the cut line)
-        // Handle holographic fill with animated rainbow gradient for preview
-        if (shapeSettings.fillColor === 'holographic') {
-          const gradient = ctx.createLinearGradient(shapeX, shapeY, shapeX + shapeWidth, shapeY + shapeHeight);
-          gradient.addColorStop(0, '#C8C8D0');
-          gradient.addColorStop(0.17, '#E8B8B8');
-          gradient.addColorStop(0.34, '#B8D8E8');
-          gradient.addColorStop(0.51, '#E8D0F0');
-          gradient.addColorStop(0.68, '#B0C8E0');
-          gradient.addColorStop(0.85, '#C0B0D8');
-          gradient.addColorStop(1, '#C8C8D0');
-          ctx.fillStyle = gradient;
-        } else {
-          ctx.fillStyle = shapeSettings.fillColor;
-        }
-        ctx.beginPath();
-        
-        if (shapeSettings.type === 'circle') {
-          const radius = Math.min(shapeWidth, shapeHeight) / 2;
-          ctx.arc(shapeX + shapeWidth / 2, shapeY + shapeHeight / 2, radius, 0, Math.PI * 2);
-        } else if (shapeSettings.type === 'oval') {
-          ctx.ellipse(shapeX + shapeWidth / 2, shapeY + shapeHeight / 2, shapeWidth / 2, shapeHeight / 2, 0, 0, Math.PI * 2);
-        } else if (shapeSettings.type === 'square') {
-          const size = Math.min(shapeWidth, shapeHeight);
-          ctx.rect(shapeX + (shapeWidth - size) / 2, shapeY + (shapeHeight - size) / 2, size, size);
-        } else if (shapeSettings.type === 'rounded-square') {
-          const size = Math.min(shapeWidth, shapeHeight);
-          ctx.roundRect(shapeX + (shapeWidth - size) / 2, shapeY + (shapeHeight - size) / 2, size, size, cornerRadiusPixels);
-        } else if (shapeSettings.type === 'rounded-rectangle') {
-          ctx.roundRect(shapeX, shapeY, shapeWidth, shapeHeight, cornerRadiusPixels);
-        } else {
-          ctx.rect(shapeX, shapeY, shapeWidth, shapeHeight);
-        }
-        ctx.fill();
-      } else {
-        // Solid fill mode
-        // Handle holographic fill with rainbow gradient for preview
-        if (shapeSettings.fillColor === 'holographic') {
-          const gradient = ctx.createLinearGradient(shapeX, shapeY, shapeX + shapeWidth, shapeY + shapeHeight);
-          gradient.addColorStop(0, '#C8C8D0');
-          gradient.addColorStop(0.17, '#E8B8B8');
-          gradient.addColorStop(0.34, '#B8D8E8');
-          gradient.addColorStop(0.51, '#E8D0F0');
-          gradient.addColorStop(0.68, '#B0C8E0');
-          gradient.addColorStop(0.85, '#C0B0D8');
-          gradient.addColorStop(1, '#C8C8D0');
-          ctx.fillStyle = gradient;
-        } else {
-          ctx.fillStyle = shapeSettings.fillColor;
-        }
-        ctx.beginPath();
-        
-        if (shapeSettings.type === 'circle') {
-          const radius = Math.min(shapeWidth, shapeHeight) / 2;
-          ctx.arc(shapeX + shapeWidth / 2, shapeY + shapeHeight / 2, radius, 0, Math.PI * 2);
-        } else if (shapeSettings.type === 'oval') {
-          ctx.ellipse(shapeX + shapeWidth / 2, shapeY + shapeHeight / 2, shapeWidth / 2, shapeHeight / 2, 0, 0, Math.PI * 2);
-        } else if (shapeSettings.type === 'square') {
-          const size = Math.min(shapeWidth, shapeHeight);
-          ctx.rect(shapeX + (shapeWidth - size) / 2, shapeY + (shapeHeight - size) / 2, size, size);
-        } else if (shapeSettings.type === 'rounded-square') {
-          const size = Math.min(shapeWidth, shapeHeight);
-          ctx.roundRect(shapeX + (shapeWidth - size) / 2, shapeY + (shapeHeight - size) / 2, size, size, cornerRadiusPixels);
-        } else if (shapeSettings.type === 'rounded-rectangle') {
-          ctx.roundRect(shapeX, shapeY, shapeWidth, shapeHeight, cornerRadiusPixels);
-        } else {
-          ctx.rect(shapeX, shapeY, shapeWidth, shapeHeight);
-        }
-        
-        ctx.fill();
+        ctx.restore();
       }
-      
-      // Draw CutContour outline at exact cut position (without bleed)
+
+      // Inner fill
+      ctx.save();
+      applyRotation();
+      if (shapeSettings.fillColor === 'holographic') {
+        const gradient = ctx.createLinearGradient(shapeX, shapeY, shapeX + shapeWidth, shapeY + shapeHeight);
+        gradient.addColorStop(0, '#C8C8D0'); gradient.addColorStop(0.17, '#E8B8B8');
+        gradient.addColorStop(0.34, '#B8D8E8'); gradient.addColorStop(0.51, '#E8D0F0');
+        gradient.addColorStop(0.68, '#B0C8E0'); gradient.addColorStop(0.85, '#C0B0D8');
+        gradient.addColorStop(1, '#C8C8D0');
+        ctx.fillStyle = gradient;
+      } else {
+        ctx.fillStyle = shapeSettings.fillColor;
+      }
+      buildPath(ctx, shapeWidth, shapeHeight, shapeX, shapeY, cornerRadiusPx);
+      ctx.fill();
+      ctx.restore();
+
+      // Border/stroke (visible printed border)
+      if (shapeSettings.strokeEnabled) {
+        ctx.save();
+        applyRotation();
+        ctx.strokeStyle = shapeSettings.strokeColor || '#000000';
+        ctx.lineWidth = (shapeSettings.strokeWidth || 1) * (ppi / 72);
+        buildPath(ctx, shapeWidth, shapeHeight, shapeX, shapeY, cornerRadiusPx);
+        ctx.stroke();
+        ctx.restore();
+      }
+
+      // CutContour outline
+      ctx.save();
+      applyRotation();
       ctx.strokeStyle = '#FF00FF';
       ctx.lineWidth = 2;
-      ctx.beginPath();
-      
-      if (shapeSettings.type === 'circle') {
-        const radius = Math.min(shapeWidth, shapeHeight) / 2;
-        const centerX = shapeX + shapeWidth / 2;
-        const centerY = shapeY + shapeHeight / 2;
-        ctx.arc(centerX, centerY, radius, 0, Math.PI * 2);
-      } else if (shapeSettings.type === 'oval') {
-        const centerX = shapeX + shapeWidth / 2;
-        const centerY = shapeY + shapeHeight / 2;
-        const radiusX = shapeWidth / 2;
-        const radiusY = shapeHeight / 2;
-        ctx.ellipse(centerX, centerY, radiusX, radiusY, 0, 0, Math.PI * 2);
-      } else if (shapeSettings.type === 'square') {
-        const size = Math.min(shapeWidth, shapeHeight);
-        const startX = shapeX + (shapeWidth - size) / 2;
-        const startY = shapeY + (shapeHeight - size) / 2;
-        ctx.rect(startX, startY, size, size);
-      } else if (shapeSettings.type === 'rounded-square') {
-        const size = Math.min(shapeWidth, shapeHeight);
-        const startX = shapeX + (shapeWidth - size) / 2;
-        const startY = shapeY + (shapeHeight - size) / 2;
-        ctx.roundRect(startX, startY, size, size, cornerRadiusPixels);
-      } else if (shapeSettings.type === 'rounded-rectangle') {
-        ctx.roundRect(shapeX, shapeY, shapeWidth, shapeHeight, cornerRadiusPixels);
-      } else {
-        ctx.rect(shapeX, shapeY, shapeWidth, shapeHeight);
-      }
-      
+      buildPath(ctx, shapeWidth, shapeHeight, shapeX, shapeY, cornerRadiusPx);
       ctx.stroke();
+      ctx.restore();
 
-      // Draw the original image on top (clipped to cut line)
+      // Clipped image
       ctx.save();
-      ctx.beginPath();
-      
-      if (shapeSettings.type === 'circle') {
-        const radius = Math.min(shapeWidth, shapeHeight) / 2;
-        ctx.arc(shapeX + shapeWidth / 2, shapeY + shapeHeight / 2, radius, 0, Math.PI * 2);
-      } else if (shapeSettings.type === 'oval') {
-        ctx.ellipse(shapeX + shapeWidth / 2, shapeY + shapeHeight / 2, shapeWidth / 2, shapeHeight / 2, 0, 0, Math.PI * 2);
-      } else if (shapeSettings.type === 'square') {
-        const size = Math.min(shapeWidth, shapeHeight);
-        ctx.rect(shapeX + (shapeWidth - size) / 2, shapeY + (shapeHeight - size) / 2, size, size);
-      } else if (shapeSettings.type === 'rounded-square') {
-        const size = Math.min(shapeWidth, shapeHeight);
-        ctx.roundRect(shapeX + (shapeWidth - size) / 2, shapeY + (shapeHeight - size) / 2, size, size, cornerRadiusPixels);
-      } else if (shapeSettings.type === 'rounded-rectangle') {
-        ctx.roundRect(shapeX, shapeY, shapeWidth, shapeHeight, cornerRadiusPixels);
-      } else {
-        ctx.rect(shapeX, shapeY, shapeWidth, shapeHeight);
-      }
-      
+      applyRotation();
+      buildPath(ctx, shapeWidth, shapeHeight, shapeX, shapeY, cornerRadiusPx);
       ctx.clip();
       ctx.drawImage(sourceImage, imageX, imageY, imageWidth, imageHeight);
       lastImageRenderRef.current = { x: imageX, y: imageY, width: imageWidth, height: imageHeight };
@@ -1402,8 +1448,6 @@ const PreviewSection = forwardRef<HTMLCanvasElement, PreviewSectionProps>(
           ctx.restore();
         }
       }
-
-      
       ctx.restore();
     };
 
@@ -1593,17 +1637,12 @@ const PreviewSection = forwardRef<HTMLCanvasElement, PreviewSectionProps>(
               {imageInfo && (
                 <div className="flex items-center gap-1 min-w-0 flex-shrink-0">
                   <span className="text-[10px] text-gray-400 font-medium">W</span>
-                  <input
-                    type="number"
-                    step="0.1"
-                    min="0.5"
-                    max="50"
-                    value={resizeSettings.widthInches.toFixed(2)}
-                    onChange={(e) => {
-                      const v = parseFloat(e.target.value);
-                      if (!isNaN(v) && v > 0 && onResizeChange) onResizeChange({ widthInches: v });
-                    }}
-                    className="w-[52px] text-[11px] font-semibold text-gray-700 text-center bg-gray-50 border border-gray-200 rounded px-1 py-0.5 focus:outline-none focus:ring-1 focus:ring-indigo-300 focus:border-indigo-300 [appearance:textfield] [&::-webkit-outer-spin-button]:appearance-none [&::-webkit-inner-spin-button]:appearance-none"
+                  <InchInput
+                    value={resizeSettings.widthInches}
+                    onCommit={(v) => onResizeChange?.({ widthInches: v })}
+                    min={0.5}
+                    max={50}
+                    className="w-[52px] text-[11px] font-semibold text-gray-700 text-center bg-gray-50 border border-gray-200 rounded px-1 py-0.5 focus:outline-none focus:ring-1 focus:ring-indigo-300 focus:border-indigo-300"
                   />
                   <span className="text-[10px] text-gray-400">"</span>
                   <button
@@ -1614,17 +1653,12 @@ const PreviewSection = forwardRef<HTMLCanvasElement, PreviewSectionProps>(
                     {resizeSettings.maintainAspectRatio ? <Link2 size={12} /> : <Unlink2 size={12} />}
                   </button>
                   <span className="text-[10px] text-gray-400 font-medium">H</span>
-                  <input
-                    type="number"
-                    step="0.1"
-                    min="0.5"
-                    max="50"
-                    value={resizeSettings.heightInches.toFixed(2)}
-                    onChange={(e) => {
-                      const v = parseFloat(e.target.value);
-                      if (!isNaN(v) && v > 0 && onResizeChange) onResizeChange({ heightInches: v });
-                    }}
-                    className="w-[52px] text-[11px] font-semibold text-gray-700 text-center bg-gray-50 border border-gray-200 rounded px-1 py-0.5 focus:outline-none focus:ring-1 focus:ring-indigo-300 focus:border-indigo-300 [appearance:textfield] [&::-webkit-outer-spin-button]:appearance-none [&::-webkit-inner-spin-button]:appearance-none"
+                  <InchInput
+                    value={resizeSettings.heightInches}
+                    onCommit={(v) => onResizeChange?.({ heightInches: v })}
+                    min={0.5}
+                    max={50}
+                    className="w-[52px] text-[11px] font-semibold text-gray-700 text-center bg-gray-50 border border-gray-200 rounded px-1 py-0.5 focus:outline-none focus:ring-1 focus:ring-indigo-300 focus:border-indigo-300"
                   />
                   <span className="text-[10px] text-gray-400">"</span>
                   <div className="relative ml-1">
@@ -1707,7 +1741,7 @@ const PreviewSection = forwardRef<HTMLCanvasElement, PreviewSectionProps>(
                   onTouchStart={handleTouchStart}
                   onTouchMove={handleTouchMove}
                   onTouchEnd={handleTouchEnd}
-                  className={`relative w-full flex items-center justify-center ${isTransparentBg ? 'checkerboard' : ''} ${selectZoomMode ? 'cursor-crosshair' : zoom > 1 ? (isDragging ? 'cursor-grabbing' : 'cursor-grab') : 'cursor-crosshair'} ${showHighlight ? 'ring-4 ring-indigo-400 ring-opacity-75 transition-shadow duration-300' : ''}`}
+                  className={`relative w-full flex items-center justify-center ${isTransparentBg ? 'checkerboard' : ''} ${spotPaintMode ? 'cursor-cell' : selectZoomMode ? 'cursor-crosshair' : zoom > 1 ? (isDragging ? 'cursor-grabbing' : 'cursor-grab') : 'cursor-crosshair'} ${showHighlight ? 'ring-4 ring-indigo-400 ring-opacity-75 transition-shadow duration-300' : ''}`}
                   style={{ 
                     width: '100%',
                     height: '100%',

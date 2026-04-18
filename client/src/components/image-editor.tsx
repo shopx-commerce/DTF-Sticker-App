@@ -2,6 +2,7 @@ import { useState, useRef, useCallback, useEffect } from "react";
 import UploadSection from "./upload-section";
 import PreviewSection from "./preview-section";
 import ControlsSection, { SpotPreviewData } from "./controls-section";
+import type { ExtractedColor } from "@/lib/color-extractor";
 import { calculateImageDimensions, downloadCanvas } from "@/lib/image-utils";
 import { cropImageToContent } from "@/lib/image-crop";
 import { createVectorStroke, downloadVectorStroke, createVectorPaths, type VectorFormat } from "@/lib/vector-stroke";
@@ -15,6 +16,9 @@ import type { ParsedPDFData } from "@/lib/pdf-parser";
 import { detectShape, mapDetectedShapeToType } from "@/lib/shape-detection";
 import { useToast } from "@/hooks/use-toast";
 import EnhanceWorker from "@/lib/enhance-worker?worker";
+import type { GangSheetItem, GangSheetSettings } from "@/lib/gang-sheet";
+import { DEFAULT_GANG_SHEET_SETTINGS } from "@/lib/gang-sheet";
+import GangSheetPanel from "./gang-sheet-panel";
 
 export type { ImageInfo, StrokeSettings, StrokeMode, ResizeSettings, ShapeSettings, StickerSize, LockedContour, SegmentLayer, SegmentationData } from "@/lib/types";
 import type { ImageInfo, StrokeSettings, StrokeMode, ResizeSettings, ShapeSettings, StickerSize, LockedContour, SegmentLayer, SegmentationData } from "@/lib/types";
@@ -34,6 +38,7 @@ export default function ImageEditor({ onDesignUploaded }: { onDesignUploaded?: (
     autoBridging: true, // Auto-bridge narrow gaps in contour
     autoBridgingThreshold: 0.02, // Gap threshold in inches
     contourMode: undefined,
+    includeHoles: false,
   });
   const [resizeSettings, setResizeSettings] = useState<ResizeSettings>({
     widthInches: 5.0,
@@ -58,6 +63,7 @@ export default function ImageEditor({ onDesignUploaded }: { onDesignUploaded?: (
   const [isProcessing, setIsProcessing] = useState(false);
   const [isRemovingBackground, setIsRemovingBackground] = useState(false);
   const [spotPreviewData, setSpotPreviewData] = useState<SpotPreviewData>({ enabled: false, colors: [] });
+  const [spotColorRestore, setSpotColorRestore] = useState<{ colors: ExtractedColor[]; id: number } | null>(null);
   const [highlightedColor, setHighlightedColor] = useState<{ colorIndex: number; regionId: number | null } | null>(null);
   const highlightTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const [detectedAlgorithm, setDetectedAlgorithm] = useState<DetectedAlgorithm | undefined>(undefined);
@@ -74,12 +80,17 @@ export default function ImageEditor({ onDesignUploaded }: { onDesignUploaded?: (
     mode: 'colors',
   });
   const [isSegmenting, setIsSegmenting] = useState(false);
-  const [enhancingMode, setEnhancingMode] = useState<'design' | 'faces' | null>(null);
+  const [enhancingMode, setEnhancingMode] = useState<'design' | 'faces' | 'ai' | null>(null);
   const [noCutlinesDialog, setNoCutlinesDialog] = useState<{
     pending: boolean;
     args: { downloadType: string; format: VectorFormat; spotColors?: SpotColorInput[]; singleArtboard: boolean } | null;
   }>({ pending: false, args: null });
   const applyAddRef = useRef<HTMLDivElement>(null);
+  const [gangSheetItems, setGangSheetItems] = useState<GangSheetItem[]>([]);
+  const [gangSheetOpen, setGangSheetOpen] = useState(false);
+  const [gangSheetSettings, setGangSheetSettings] = useState<GangSheetSettings>(DEFAULT_GANG_SHEET_SETTINGS);
+  const [spotPaintMode, setSpotPaintMode] = useState<'white' | 'gloss' | 'both' | 'clear' | null>(null);
+  const [pendingSpotPaint, setPendingSpotPaint] = useState<{ colorIndex: number; regionId: number | null; mode: string; id: number } | null>(null);
   
   const canvasRef = useRef<HTMLCanvasElement>(null);
 
@@ -108,6 +119,25 @@ export default function ImageEditor({ onDesignUploaded }: { onDesignUploaded?: (
       imageInfo: imageInfo ? { ...imageInfo } : null,
     };
     const idx = historyIndexRef.current;
+    const prev = idx >= 0 ? historyRef.current[idx] : null;
+    if (prev) {
+      const sameSpot = prev.spotColors.colors.length === snap.spotColors.colors.length &&
+        prev.spotColors.colors.every((pc: any, ci: number) => {
+          const nc = snap.spotColors.colors[ci];
+          if (pc.spotWhite !== nc.spotWhite || pc.spotGloss !== nc.spotGloss) return false;
+          if (!pc.regions && !nc.regions) return true;
+          if (!pc.regions || !nc.regions || pc.regions.length !== nc.regions.length) return false;
+          return pc.regions.every((pr: any, ri: number) => {
+            const nr = nc.regions![ri];
+            return pr.spotWhite === nr.spotWhite && pr.spotGloss === nr.spotGloss;
+          });
+        });
+      const sameStroke = prev.strokeSettings.width === snap.strokeSettings.width &&
+        prev.strokeSettings.enabled === snap.strokeSettings.enabled;
+      if (sameSpot && sameStroke) {
+        return;
+      }
+    }
     historyRef.current = historyRef.current.slice(0, idx + 1);
     historyRef.current.push(snap);
     if (historyRef.current.length > 50) historyRef.current.shift();
@@ -126,45 +156,42 @@ export default function ImageEditor({ onDesignUploaded }: { onDesignUploaded?: (
     return () => { if (snapshotTimerRef.current) clearTimeout(snapshotTimerRef.current); };
   }, [strokeSettings, resizeSettings, shapeSettings, spotPreviewData, imageInfo, pushSnapshot]);
 
-  const handleUndo = useCallback(() => {
-    if (historyIndexRef.current <= 0) return;
-    isRestoringRef.current = true;
-    historyIndexRef.current--;
-    const snap = historyRef.current[historyIndexRef.current];
+  const restoreSnapshot = useCallback((snap: EditorSnapshot) => {
     setStrokeSettings(snap.strokeSettings);
     setResizeSettings(snap.resizeSettings);
     setShapeSettings(snap.shapeSettings);
     setSpotPreviewData(snap.spotColors);
-    if (snap.imageInfo !== undefined) {
+    setSpotColorRestore({ colors: snap.spotColors.colors, id: Date.now() });
+    const imageChanged = snap.imageInfo?.image?.src !== imageInfo?.image?.src;
+    if (imageChanged && snap.imageInfo !== undefined) {
       setImageInfo(snap.imageInfo);
       const workerManager = getContourWorkerManager();
       workerManager.clearCache();
       setCadCutBounds(null);
     }
+  }, [imageInfo]);
+
+  const handleUndo = useCallback(() => {
+    if (historyIndexRef.current <= 0) return;
+    isRestoringRef.current = true;
+    historyIndexRef.current--;
+    const snap = historyRef.current[historyIndexRef.current];
+    restoreSnapshot(snap);
     setCanUndo(historyIndexRef.current > 0);
     setCanRedo(true);
     requestAnimationFrame(() => { isRestoringRef.current = false; });
-  }, []);
+  }, [restoreSnapshot]);
 
   const handleRedo = useCallback(() => {
     if (historyIndexRef.current >= historyRef.current.length - 1) return;
     isRestoringRef.current = true;
     historyIndexRef.current++;
     const snap = historyRef.current[historyIndexRef.current];
-    setStrokeSettings(snap.strokeSettings);
-    setResizeSettings(snap.resizeSettings);
-    setShapeSettings(snap.shapeSettings);
-    setSpotPreviewData(snap.spotColors);
-    if (snap.imageInfo !== undefined) {
-      setImageInfo(snap.imageInfo);
-      const workerManager = getContourWorkerManager();
-      workerManager.clearCache();
-      setCadCutBounds(null);
-    }
+    restoreSnapshot(snap);
     setCanUndo(true);
     setCanRedo(historyIndexRef.current < historyRef.current.length - 1);
     requestAnimationFrame(() => { isRestoringRef.current = false; });
-  }, []);
+  }, [restoreSnapshot]);
 
   const setHighlightWithTimer = useCallback((color: { colorIndex: number; regionId: number | null } | null) => {
     if (highlightTimerRef.current) clearTimeout(highlightTimerRef.current);
@@ -176,6 +203,16 @@ export default function ImageEditor({ onDesignUploaded }: { onDesignUploaded?: (
       }, 3000);
     }
   }, []);
+
+  useEffect(() => {
+    const handleKeyDown = (e: KeyboardEvent) => {
+      if (e.key === 'Escape' && spotPaintMode) {
+        setSpotPaintMode(null);
+      }
+    };
+    window.addEventListener('keydown', handleKeyDown);
+    return () => window.removeEventListener('keydown', handleKeyDown);
+  }, [spotPaintMode]);
 
   // Debounced settings for heavy processing
   const debouncedStrokeSettings = useDebouncedValue(strokeSettings, 100);
@@ -247,6 +284,8 @@ export default function ImageEditor({ onDesignUploaded }: { onDesignUploaded?: (
         label: cutContourLabel,
         pathPoints: [...contourData.pathPoints],
         previewPathPoints: [...contourData.previewPathPoints],
+        allPathPoints: contourData.allPathPoints ? contourData.allPathPoints.map(p => [...p]) : undefined,
+        allPreviewPathPoints: contourData.allPreviewPathPoints ? contourData.allPreviewPathPoints.map(p => [...p]) : undefined,
         widthInches: contourData.widthInches,
         heightInches: contourData.heightInches,
         imageOffsetX: contourData.imageOffsetX,
@@ -300,6 +339,82 @@ export default function ImageEditor({ onDesignUploaded }: { onDesignUploaded?: (
     setShowApplyAddDropdown(false);
   }, [cutContourLabel, toast, imageInfo, shapeSettings, resizeSettings]);
 
+  const handleAddToGangSheet = useCallback(() => {
+    if (!imageInfo) {
+      toast({ title: "No design loaded", description: "Upload a design first.", variant: "destructive" });
+      return;
+    }
+
+    let contourSnapshot: CachedContourData | null = null;
+
+    const workerManager = getContourWorkerManager();
+    const cachedData = workerManager.getCachedContourData();
+
+    if (cachedData && cachedData.pathPoints && cachedData.pathPoints.length >= 3) {
+      contourSnapshot = {
+        pathPoints: [...cachedData.pathPoints],
+        previewPathPoints: [...cachedData.previewPathPoints],
+        allPathPoints: cachedData.allPathPoints?.map(p => [...p]),
+        allPreviewPathPoints: cachedData.allPreviewPathPoints?.map(p => [...p]),
+        widthInches: cachedData.widthInches,
+        heightInches: cachedData.heightInches,
+        imageOffsetX: cachedData.imageOffsetX,
+        imageOffsetY: cachedData.imageOffsetY,
+        backgroundColor: cachedData.backgroundColor,
+        effectiveDPI: cachedData.effectiveDPI,
+        minPathX: cachedData.minPathX,
+        minPathY: cachedData.minPathY,
+        bleedInches: cachedData.bleedInches,
+        holePathStartIndex: cachedData.holePathStartIndex,
+      };
+    } else if (shapeSettings.enabled) {
+      const shapeData = generateShapePathPointsInches(shapeSettings, resizeSettings);
+      contourSnapshot = {
+        pathPoints: shapeData.pathPoints,
+        previewPathPoints: shapeData.pathPoints,
+        widthInches: shapeData.widthInches,
+        heightInches: shapeData.heightInches,
+        imageOffsetX: shapeData.imageOffsetX,
+        imageOffsetY: shapeData.imageOffsetY,
+        backgroundColor: shapeSettings.fillColor || '#ffffff',
+        effectiveDPI: 300,
+        minPathX: 0,
+        minPathY: 0,
+        bleedInches: shapeData.bleedInches,
+      };
+    }
+
+    if (!contourSnapshot) {
+      toast({ title: "No contour available", description: "Enable a contour or shape mode before adding to the gang sheet.", variant: "destructive" });
+      return;
+    }
+
+    const canvas = document.createElement('canvas');
+    const thumbSize = 120;
+    const aspect = imageInfo.image.width / imageInfo.image.height;
+    canvas.width = aspect >= 1 ? thumbSize : Math.round(thumbSize * aspect);
+    canvas.height = aspect >= 1 ? Math.round(thumbSize / aspect) : thumbSize;
+    const ctx = canvas.getContext('2d')!;
+    ctx.drawImage(imageInfo.image, 0, 0, canvas.width, canvas.height);
+    const thumbnail = canvas.toDataURL('image/png');
+
+    const newItem: GangSheetItem = {
+      id: crypto.randomUUID(),
+      thumbnail,
+      imageElement: imageInfo.image,
+      contourData: contourSnapshot,
+      resizeSettings: { ...resizeSettings },
+      strokeSettings: { ...strokeSettings },
+      shapeSettings: shapeSettings.enabled ? { ...shapeSettings } : undefined,
+      cutContourLabel,
+      quantity: 1,
+    };
+
+    setGangSheetItems(prev => [...prev, newItem]);
+    setGangSheetOpen(true);
+    toast({ title: "Added to gang sheet", description: `Sticker added. Upload a new design or adjust quantities, then download.` });
+  }, [imageInfo, resizeSettings, strokeSettings, shapeSettings, cutContourLabel, toast]);
+
   const canvasToImage = useCallback((canvas: HTMLCanvasElement): Promise<HTMLImageElement> => {
     return new Promise((resolve, reject) => {
       canvas.toBlob((blob) => {
@@ -311,6 +426,15 @@ export default function ImageEditor({ onDesignUploaded }: { onDesignUploaded?: (
         img.src = url;
       }, 'image/png');
     });
+  }, []);
+
+  const handleClearDesign = useCallback(() => {
+    setImageInfo(null);
+    setSpotPreviewData({ enabled: false, colors: [] });
+    setDetectedAlgorithm(undefined);
+    setSpotPaintMode(null);
+    const workerManager = getContourWorkerManager();
+    workerManager.clearCache();
   }, []);
 
   const applyNewImage = useCallback((newImageInfo: ImageInfo, widthInches: number, heightInches: number) => {
@@ -334,11 +458,10 @@ export default function ImageEditor({ onDesignUploaded }: { onDesignUploaded?: (
     setDetectedAlgorithm(undefined);
 
     const autoType = detectedType || 'square';
-    const isCircularType = autoType === 'circle' || autoType === 'oval';
     const newShapeSettings: ShapeSettings = {
       enabled: false,
       type: autoType,
-      offset: isCircularType ? 0.05 : 0.25,
+      offset: 0.25,
       fillColor: '#FFFFFF',
       strokeEnabled: false,
       strokeWidth: 2,
@@ -761,11 +884,12 @@ export default function ImageEditor({ onDesignUploaded }: { onDesignUploaded?: (
   const [enhanceStage, setEnhanceStage] = useState('');
   const enhanceWorkerRef = useRef<Worker | null>(null);
 
-  const handleEnhanceImage = useCallback(async (mode: 'design' | 'faces') => {
+  const handleEnhanceImage = useCallback(async (mode: 'design' | 'faces' | 'ai') => {
     if (!imageInfo || enhancingMode) return;
 
+    const isAI = mode === 'ai' || mode === 'faces';
     setEnhancingMode(mode);
-    setEnhanceStage('Preparing…');
+    setEnhanceStage(isAI ? 'Preparing for AI enhancement…' : 'Preparing…');
 
     try {
       const bmpCanvas = document.createElement('canvas');
@@ -793,7 +917,7 @@ export default function ImageEditor({ onDesignUploaded }: { onDesignUploaded?: (
         };
         worker.onerror = (err) => reject(new Error(err.message || 'Worker crashed'));
         worker.postMessage(
-          { type: 'enhance', imageBitmap: bitmap, mode, width: imageInfo.image.width, height: imageInfo.image.height },
+          { type: 'enhance', imageBitmap: bitmap, mode, width: imageInfo.image.width, height: imageInfo.image.height, useAI: isAI },
           [bitmap],
         );
       });
@@ -829,11 +953,12 @@ export default function ImageEditor({ onDesignUploaded }: { onDesignUploaded?: (
       setImageInfo(newImageInfo);
 
       const workerManager = getContourWorkerManager();
+      workerManager.recreateWorker();
       workerManager.clearCache();
       setCadCutBounds(null);
       setLockedContour(null);
 
-      const modeLabel = mode === 'faces' ? 'Faces' : 'Design';
+      const modeLabel = mode === 'ai' ? 'AI Design' : mode === 'faces' ? 'Faces' : 'Design';
 
       toast({
         title: `${modeLabel} Enhanced`,
@@ -895,15 +1020,10 @@ export default function ImageEditor({ onDesignUploaded }: { onDesignUploaded?: (
       setStrokeSettings(prev => ({ ...prev, enabled: false }));
     }
     
-    // Auto-reset offset when switching between shape type categories
+    // Reset dimension overrides when switching shape type so auto-sizing recalculates
     if (newSettings.type !== undefined && newSettings.type !== shapeSettings.type) {
-      const wasCircular = shapeSettings.type === 'circle' || shapeSettings.type === 'oval';
-      const isCircular = newSettings.type === 'circle' || newSettings.type === 'oval';
-      
-      if (wasCircular !== isCircular) {
-        // Switch to appropriate default offset for new shape category
-        updated.offset = isCircular ? 0.05 : 0.125; // Tight fit for circular, Small for rectangular
-      }
+      updated.shapeWidthOverride = 0;
+      updated.shapeHeightOverride = 0;
     }
     
     setShapeSettings(updated);
@@ -1106,7 +1226,7 @@ export default function ImageEditor({ onDesignUploaded }: { onDesignUploaded?: (
             spotColors,
             singleArtboard,
             cutContourLabel,
-            lockedContour ? { label: lockedContour.label, pathPoints: lockedContour.pathPoints, widthInches: lockedContour.widthInches, heightInches: lockedContour.heightInches } : null
+            lockedContour ? { label: lockedContour.label, pathPoints: lockedContour.pathPoints, allPathPoints: lockedContour.allPathPoints, widthInches: lockedContour.widthInches, heightInches: lockedContour.heightInches } : null
           );
         } else if (shapeSettings.enabled) {
           // Shape background mode: Download PDF with shape + CutContour spot color
@@ -1119,7 +1239,7 @@ export default function ImageEditor({ onDesignUploaded }: { onDesignUploaded?: (
             spotColors,
             singleArtboard,
             cutContourLabel,
-            lockedContour ? { label: lockedContour.label, pathPoints: lockedContour.pathPoints, widthInches: lockedContour.widthInches, heightInches: lockedContour.heightInches, imageOffsetX: lockedContour.imageOffsetX, imageOffsetY: lockedContour.imageOffsetY } : null
+            lockedContour ? { label: lockedContour.label, pathPoints: lockedContour.pathPoints, allPathPoints: lockedContour.allPathPoints, widthInches: lockedContour.widthInches, heightInches: lockedContour.heightInches, imageOffsetX: lockedContour.imageOffsetX, imageOffsetY: lockedContour.imageOffsetY } : null
           );
         } else {
           setIsProcessing(false);
@@ -1196,6 +1316,7 @@ export default function ImageEditor({ onDesignUploaded }: { onDesignUploaded?: (
           onRemoveBackground={handleRemoveBackground}
           isRemovingBackground={isRemovingBackground}
           onChangeDesign={() => document.getElementById('imageInput')?.click()}
+          onClearDesign={imageInfo ? handleClearDesign : undefined}
           onSpotPreviewChange={setSpotPreviewData}
           detectedAlgorithm={detectedAlgorithm}
           segmentationData={segmentationData}
@@ -1210,6 +1331,11 @@ export default function ImageEditor({ onDesignUploaded }: { onDesignUploaded?: (
           onHighlightRegion={(colorIndex, regionId) => {
             setHighlightWithTimer({ colorIndex, regionId });
           }}
+          spotPaintMode={spotPaintMode}
+          onSpotPaintModeChange={setSpotPaintMode}
+          pendingSpotPaint={pendingSpotPaint}
+          onSpotPaintApplied={() => setPendingSpotPaint(null)}
+          spotColorRestore={spotColorRestore}
         />
       </div>
       
@@ -1218,53 +1344,23 @@ export default function ImageEditor({ onDesignUploaded }: { onDesignUploaded?: (
         <div className="sticky top-4 space-y-3">
           {/* Top row: Actions bar */}
           <div className="flex items-center gap-2 bg-white rounded-lg border border-gray-100 shadow-sm px-3 py-2">
-            {/* Remove White Background */}
             {imageInfo && (
               <button
                 onClick={() => handleRemoveBackground(85)}
                 disabled={isRemovingBackground}
-                className="flex items-center gap-1 px-2.5 py-1.5 rounded-lg text-[11px] font-medium transition-all whitespace-nowrap bg-gradient-to-r from-indigo-500 to-violet-500 text-white hover:from-indigo-400 hover:to-violet-400 shadow-sm hover:shadow-md disabled:opacity-50"
+                className="group relative flex items-center gap-2 px-4 py-2 rounded-lg text-xs font-semibold whitespace-nowrap text-white shadow-md disabled:opacity-50 overflow-hidden transition-all duration-200 bg-gradient-to-r from-sky-500 to-cyan-500 hover:from-sky-600 hover:to-cyan-600 hover:shadow-lg hover:shadow-sky-200 active:scale-[0.95] active:shadow-sm"
               >
-                {isRemovingBackground ? 'Removing...' : 'Remove White Background'}
+                <span className="absolute inset-0 bg-white/20 translate-y-full group-hover:translate-y-0 transition-transform duration-300 ease-out rounded-lg"></span>
+                {isRemovingBackground ? (
+                  <svg className="relative w-4 h-4 animate-spin" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><path d="M12 2v4M12 18v4M4.93 4.93l2.83 2.83M16.24 16.24l2.83 2.83M2 12h4M18 12h4M4.93 19.07l2.83-2.83M16.24 7.76l2.83-2.83" /></svg>
+                ) : (
+                  <svg className="relative w-4 h-4 transition-transform duration-200 group-hover:rotate-12 group-active:rotate-0" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><rect x="3" y="3" width="18" height="18" rx="2"/><path d="M9 3v18"/><path d="M3 9h6"/><path d="M3 15h6"/></svg>
+                )}
+                <span className="relative">{isRemovingBackground ? 'Removing...' : 'Remove White Background'}</span>
               </button>
             )}
             
             <div className="flex-1"></div>
-            
-            <div className="flex items-center gap-1">
-              {enhancingMode === 'design' ? (
-                <div className="flex items-center gap-1 px-2.5 py-1.5 rounded-lg text-[11px] font-medium bg-amber-100 text-amber-700 cursor-wait whitespace-nowrap">
-                  <svg className="w-3 h-3 animate-spin" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><path d="M12 2v4M12 18v4M4.93 4.93l2.83 2.83M16.24 16.24l2.83 2.83M2 12h4M18 12h4M4.93 19.07l2.83-2.83M16.24 7.76l2.83-2.83" /></svg>
-                  {enhanceStage || 'Enhancing Design…'}
-                </div>
-              ) : enhancingMode === 'faces' ? (
-                <div className="flex items-center gap-1 px-2.5 py-1.5 rounded-lg text-[11px] font-medium bg-violet-100 text-violet-700 cursor-wait whitespace-nowrap">
-                  <svg className="w-3 h-3 animate-spin" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><path d="M12 2v4M12 18v4M4.93 4.93l2.83 2.83M16.24 16.24l2.83 2.83M2 12h4M18 12h4M4.93 19.07l2.83-2.83M16.24 7.76l2.83-2.83" /></svg>
-                  {enhanceStage || 'Enhancing Faces…'}
-                </div>
-              ) : (
-                <>
-                  <button
-                    onClick={() => handleEnhanceImage('design')}
-                    disabled={!imageInfo}
-                    className="flex items-center gap-1 px-2.5 py-1.5 rounded-lg text-[11px] font-medium transition-all whitespace-nowrap bg-gradient-to-r from-amber-500 to-orange-500 text-white hover:from-amber-600 hover:to-orange-600 shadow-sm hover:shadow-md disabled:opacity-50"
-                    title="Enhance design quality (best for illustrations, logos, stickers)"
-                  >
-                    <svg className="w-3 h-3" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M12 3l1.912 5.813a2 2 0 0 0 1.275 1.275L21 12l-5.813 1.912a2 2 0 0 0-1.275 1.275L12 21l-1.912-5.813a2 2 0 0 0-1.275-1.275L3 12l5.813-1.912a2 2 0 0 0 1.275-1.275L12 3z" /></svg>
-                    Enhance Design
-                  </button>
-                  <button
-                    onClick={() => handleEnhanceImage('faces')}
-                    disabled={!imageInfo}
-                    className="flex items-center gap-1 px-2.5 py-1.5 rounded-lg text-[11px] font-medium transition-all whitespace-nowrap bg-gradient-to-r from-violet-500 to-purple-500 text-white hover:from-violet-600 hover:to-purple-600 shadow-sm hover:shadow-md disabled:opacity-50"
-                    title="Enhance faces (best for photo stickers with people)"
-                  >
-                    <svg className="w-3 h-3" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><circle cx="12" cy="8" r="5" /><path d="M20 21a8 8 0 0 0-16 0" /></svg>
-                    Enhance Faces
-                  </button>
-                </>
-              )}
-            </div>
             
             {(strokeSettings.enabled || shapeSettings.enabled || (imageInfo?.isPDF && imageInfo?.pdfCutContourInfo?.hasCutContour)) && (
               <div className="flex flex-col items-end gap-1">
@@ -1333,6 +1429,34 @@ export default function ImageEditor({ onDesignUploaded }: { onDesignUploaded?: (
               </div>
             )}
           </div>
+
+          {/* Gang Sheet - separate from CutContour controls */}
+          {imageInfo && (strokeSettings.enabled || shapeSettings.enabled || (imageInfo?.isPDF && imageInfo?.pdfCutContourInfo?.hasCutContour)) && (
+            <div className="flex items-center gap-2 bg-emerald-50 rounded-lg border border-emerald-200 shadow-sm px-3 py-2">
+              <button
+                onClick={handleAddToGangSheet}
+                className="flex items-center gap-2 px-3 py-1.5 bg-emerald-600 text-white rounded-lg text-[11px] font-semibold hover:bg-emerald-700 transition-colors shadow-sm"
+                title="Add current sticker to the gang sheet for batch printing"
+              >
+                <svg className="w-3.5 h-3.5" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M12 5v14"/><path d="M5 12h14"/></svg>
+                Add to Gang Sheet
+              </button>
+              {gangSheetItems.length > 0 && (
+                <>
+                  <div className="w-px h-5 bg-emerald-300"></div>
+                  <button
+                    onClick={() => setGangSheetOpen(true)}
+                    className="flex items-center gap-2 px-3 py-1.5 rounded-lg text-[11px] font-medium text-emerald-700 hover:bg-emerald-100 transition-colors"
+                  >
+                    <svg className="w-3.5 h-3.5 text-emerald-600" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><rect x="3" y="3" width="7" height="7"/><rect x="14" y="3" width="7" height="7"/><rect x="3" y="14" width="7" height="7"/><rect x="14" y="14" width="7" height="7"/></svg>
+                    View Gang Sheet
+                    <span className="min-w-[18px] h-[18px] flex items-center justify-center bg-emerald-600 text-white text-[9px] font-bold rounded-full px-1">{gangSheetItems.length}</span>
+                    <span className="text-[10px] text-emerald-500">{gangSheetItems.reduce((s, i) => s + i.quantity, 0)} total</span>
+                  </button>
+                </>
+              )}
+            </div>
+          )}
           
           {/* Preview - Square */}
           <PreviewSection
@@ -1357,7 +1481,16 @@ export default function ImageEditor({ onDesignUploaded }: { onDesignUploaded?: (
             onRedo={handleRedo}
             canUndo={canUndo}
             canRedo={canRedo}
+            spotPaintMode={spotPaintMode}
             onSpotColorClick={(colorIndex, regionId) => {
+              if (spotPaintMode) {
+                if (snapshotTimerRef.current) {
+                  clearTimeout(snapshotTimerRef.current);
+                  snapshotTimerRef.current = null;
+                }
+                pushSnapshot();
+                setPendingSpotPaint({ colorIndex, regionId, mode: spotPaintMode, id: Date.now() });
+              }
               setHighlightWithTimer({ colorIndex, regionId });
             }}
           />
@@ -1424,7 +1557,7 @@ export default function ImageEditor({ onDesignUploaded }: { onDesignUploaded?: (
           <div className="bg-slate-900 border border-slate-700/50 rounded-2xl p-8 max-w-sm mx-4 text-center shadow-2xl">
             <div className="relative w-16 h-16 mx-auto mb-5">
               <div className="absolute inset-0 rounded-full border-4 border-slate-700"></div>
-              <div className={`absolute inset-0 rounded-full border-4 border-t-transparent animate-spin ${enhancingMode === 'faces' ? 'border-violet-500' : 'border-amber-500'}`}></div>
+              <div className={`absolute inset-0 rounded-full border-4 border-t-transparent animate-spin ${enhancingMode === 'faces' ? 'border-violet-500' : enhancingMode === 'ai' ? 'border-emerald-500' : 'border-amber-500'}`}></div>
               <div className="absolute inset-0 flex items-center justify-center">
                 {enhancingMode === 'faces' ? (
                   <svg className="w-6 h-6 text-violet-400" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><circle cx="12" cy="8" r="5" /><path d="M20 21a8 8 0 0 0-16 0" /></svg>
@@ -1434,12 +1567,16 @@ export default function ImageEditor({ onDesignUploaded }: { onDesignUploaded?: (
               </div>
             </div>
             <div className="text-white text-lg font-semibold mb-2">
-              {enhancingMode === 'faces' ? 'Enhancing Faces' : 'Enhancing Design'}
+              {enhancingMode === 'faces' ? 'AI Enhancing Faces (4x)' : enhancingMode === 'ai' ? 'AI Enhancing Design (4x)' : 'Enhancing Design'}
             </div>
-            <div className={`text-sm mb-4 ${enhancingMode === 'faces' ? 'text-violet-300' : 'text-amber-300'}`}>
+            <div className={`text-sm mb-4 ${enhancingMode === 'faces' ? 'text-violet-300' : enhancingMode === 'ai' ? 'text-emerald-300' : 'text-amber-300'}`}>
               {enhanceStage || 'Starting up...'}
             </div>
-            <p className="text-xs text-slate-400">This may take up to a minute. Please wait.</p>
+            {enhancingMode === 'ai' || enhancingMode === 'faces' ? (
+              <p className="text-xs text-slate-400">Very slow but very good quality. This can take 1-3 minutes depending on image size. Please be patient.</p>
+            ) : (
+              <p className="text-xs text-slate-400">This may take up to a minute. Please wait.</p>
+            )}
           </div>
         </div>
       )}
@@ -1455,6 +1592,15 @@ export default function ImageEditor({ onDesignUploaded }: { onDesignUploaded?: (
           </div>
         </div>
       )}
+
+      <GangSheetPanel
+        open={gangSheetOpen}
+        onOpenChange={setGangSheetOpen}
+        items={gangSheetItems}
+        onItemsChange={setGangSheetItems}
+        settings={gangSheetSettings}
+        onSettingsChange={setGangSheetSettings}
+      />
 
     </div>
   );

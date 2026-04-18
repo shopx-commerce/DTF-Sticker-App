@@ -8,6 +8,8 @@ export interface ColorRegion {
   selected: boolean;
   pixelIndices: number[];
   thumbnailUrl?: string;
+  spotWhite?: boolean;
+  spotGloss?: boolean;
 }
 
 export interface ExtractedColor {
@@ -676,7 +678,7 @@ export function detectColorRegions(
       compId++;
     }
 
-    const minArea = totalPixels * 0.0005;
+    const minArea = Math.max(16, totalPixels * 0.00005);
     const significant = components
       .filter(c => c.pixels.length >= minArea)
       .sort((a, b) => b.pixels.length - a.pixels.length);

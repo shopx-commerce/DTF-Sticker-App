@@ -38,6 +38,8 @@ export type ContourMode = 'smooth' | 'scattered';
 export interface ContourData {
   pathPoints: Array<{x: number; y: number}>;
   previewPathPoints: Array<{x: number; y: number}>;
+  allPathPoints?: Array<Array<{x: number; y: number}>>;
+  allPreviewPathPoints?: Array<Array<{x: number; y: number}>>;
   widthInches: number;
   heightInches: number;
   imageOffsetX: number;
@@ -48,6 +50,7 @@ export interface ContourData {
   minPathX: number;
   minPathY: number;
   bleedInches: number;
+  holePathStartIndex?: number;
 }
 
 interface WorkerResponse {
@@ -121,6 +124,8 @@ class ContourWorkerManager {
   } | null = null;
   
   private cachedContourData: ContourData | null = null;
+  private lastProcessKey: string | null = null;
+  private lastProcessResult: { canvas: HTMLCanvasElement; downsampleScale: number; imageCanvasX: number; imageCanvasY: number; contourData?: ContourData; detectedAlgorithm?: DetectedAlgorithm } | null = null;
 
   constructor() {
     this.initWorker();
@@ -132,6 +137,8 @@ class ContourWorkerManager {
   
   clearCache() {
     this.cachedContourData = null;
+    this.lastProcessKey = null;
+    this.lastProcessResult = null;
   }
 
   private initWorker() {
@@ -222,6 +229,11 @@ class ContourWorkerManager {
     detectedShapeType?: DetectedShapeType,
     detectedShapeInfo?: DetectedShapeInfo | null
   ): Promise<{ canvas: HTMLCanvasElement; downsampleScale: number; imageCanvasX: number; imageCanvasY: number; contourData?: ContourData; detectedAlgorithm?: DetectedAlgorithm }> {
+    const processKey = `${image.src}|${image.width}x${image.height}|${strokeSettings.width}|${strokeSettings.enabled}|${strokeSettings.alphaThreshold}|${strokeSettings.backgroundColor}|${strokeSettings.autoBridging}|${strokeSettings.autoBridgingThreshold}|${strokeSettings.contourMode}|${strokeSettings.cornerMode}|${resizeSettings.widthInches}|${resizeSettings.heightInches}|${detectedShapeType}|${(strokeSettings as any).includeHoles}`;
+    if (this.lastProcessKey === processKey && this.lastProcessResult) {
+      return this.lastProcessResult;
+    }
+
     if (!this.worker) {
       const canvas = await this.processFallback(image, strokeSettings, resizeSettings);
       return { canvas, downsampleScale: 1, imageCanvasX: 0, imageCanvasY: 0 };
@@ -273,7 +285,7 @@ class ContourWorkerManager {
 
     resultCtx.putImageData(result.imageData, 0, 0);
 
-    return {
+    const processResult = {
       canvas: resultCanvas,
       downsampleScale: scale,
       imageCanvasX: result.imageCanvasX ?? 0,
@@ -281,6 +293,9 @@ class ContourWorkerManager {
       contourData: result.contourData,
       detectedAlgorithm: result.detectedAlgorithm
     };
+    this.lastProcessKey = processKey;
+    this.lastProcessResult = processResult;
+    return processResult;
   }
 
   private processInWorker(request: ProcessRequest, onProgress?: ProgressCallback): Promise<WorkerResult> {

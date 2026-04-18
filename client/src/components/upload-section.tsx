@@ -149,7 +149,7 @@ export default function UploadSection({ onImageUpload, onPDFUpload, showCutLineI
         >
           <div className="flex items-center gap-2">
             <Upload className="w-4 h-4 text-white" />
-            <p className="text-white text-sm font-medium">Change Design</p>
+            <p className="text-white text-sm font-medium">Add/Change Design</p>
           </div>
         </div>
       )}

@@ -4,6 +4,7 @@ interface EnhanceRequest {
   mode: 'design' | 'faces';
   width: number;
   height: number;
+  useAI?: boolean;
 }
 
 interface EnhanceProgress {
@@ -33,7 +34,7 @@ function postProgress(stage: string, percent: number) {
 }
 
 ctx.onmessage = async (e: MessageEvent<EnhanceRequest>) => {
-  const { imageBitmap, mode, width, height } = e.data;
+  const { imageBitmap, mode, width, height, useAI } = e.data;
 
   try {
     postProgress('Preparing image…', 5);
@@ -49,10 +50,14 @@ ctx.onmessage = async (e: MessageEvent<EnhanceRequest>) => {
 
     const formData = new FormData();
     formData.append('image', blob, 'image.png');
+    if (useAI && mode === 'faces') {
+      formData.append('face_enhance', 'true');
+    }
 
-    postProgress('Uploading…', 25);
+    const endpoint = useAI ? '/api/enhance-image-ai' : '/api/enhance-image';
+    postProgress(useAI ? 'Uploading to AI service…' : 'Uploading…', 25);
 
-    const response = await fetch('/api/enhance-image', {
+    const response = await fetch(endpoint, {
       method: 'POST',
       body: formData,
     });
@@ -62,7 +67,7 @@ ctx.onmessage = async (e: MessageEvent<EnhanceRequest>) => {
       throw new Error(errData.error || `Server error ${response.status}`);
     }
 
-    postProgress('Downloading enhanced image…', 75);
+    postProgress(useAI ? 'AI is processing (this may take 1-3 min)…' : 'Downloading enhanced image…', 75);
 
     const enhancedBlob = await response.blob();
 

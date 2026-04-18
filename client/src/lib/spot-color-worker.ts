@@ -35,11 +35,14 @@ interface WorkerMessage {
   widthInches: number;
   heightInches: number;
   dpi: number;
+  whiteInclusionMask?: ArrayBuffer;
+  glossInclusionMask?: ArrayBuffer;
 }
 
 interface WorkerResponse {
-  type: 'result';
-  regions: SpotColorRegionWorker[];
+  type: 'result' | 'error';
+  regions?: SpotColorRegionWorker[];
+  error?: string;
 }
 
 function createClosestColorMask(
@@ -260,7 +263,9 @@ function processSpotColors(
   width: number,
   height: number,
   spotColors: SpotColorInputWorker[],
-  dpi: number
+  dpi: number,
+  whiteInclusionMask?: Uint8Array,
+  glossInclusionMask?: Uint8Array
 ): SpotColorRegionWorker[] {
   const whiteColors = spotColors.filter(c => c.spotWhite);
   const glossColors = spotColors.filter(c => c.spotGloss);
@@ -271,6 +276,11 @@ function processSpotColors(
 
   if (whiteColors.length > 0) {
     const mask = createClosestColorMask(pixelData, width, height, whiteColors, spotColors, 60, 240);
+    if (whiteInclusionMask) {
+      for (let i = 0; i < mask.length; i++) {
+        if (!whiteInclusionMask[i]) mask[i] = 0;
+      }
+    }
     const paths = traceMaskToInchPaths(mask, width, height, dpi);
     if (paths.length > 0) {
       regions.push({ name: whiteName, paths, tintCMYK: [0, 1, 0, 0] });
@@ -279,6 +289,11 @@ function processSpotColors(
 
   if (glossColors.length > 0) {
     const mask = createClosestColorMask(pixelData, width, height, glossColors, spotColors, 60, 240);
+    if (glossInclusionMask) {
+      for (let i = 0; i < mask.length; i++) {
+        if (!glossInclusionMask[i]) mask[i] = 0;
+      }
+    }
     const paths = traceMaskToInchPaths(mask, width, height, dpi);
     if (paths.length > 0) {
       regions.push({ name: glossName, paths, tintCMYK: [0, 1, 0, 0] });
@@ -308,11 +323,18 @@ function processSpotColors(
 }
 
 self.onmessage = function(e: MessageEvent<WorkerMessage>) {
-  if (e.data.type === 'trace') {
-    const { imageBuffer, imageWidth, imageHeight, spotColors, dpi } = e.data;
-    const pixelData = new Uint8ClampedArray(imageBuffer);
-    const regions = processSpotColors(pixelData, imageWidth, imageHeight, spotColors, dpi);
-    const response: WorkerResponse = { type: 'result', regions };
-    self.postMessage(response);
+  try {
+    if (e.data.type === 'trace') {
+      const { imageBuffer, imageWidth, imageHeight, spotColors, dpi, whiteInclusionMask, glossInclusionMask } = e.data;
+      const pixelData = new Uint8ClampedArray(imageBuffer);
+      const whiteMask = whiteInclusionMask ? new Uint8Array(whiteInclusionMask) : undefined;
+      const glossMask = glossInclusionMask ? new Uint8Array(glossInclusionMask) : undefined;
+      const regions = processSpotColors(pixelData, imageWidth, imageHeight, spotColors, dpi, whiteMask, glossMask);
+      const response: WorkerResponse = { type: 'result', regions };
+      self.postMessage(response);
+    }
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    self.postMessage({ type: 'error', error: msg } as WorkerResponse);
   }
 };

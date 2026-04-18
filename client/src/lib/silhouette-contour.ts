@@ -258,59 +258,40 @@ export function createSilhouetteContour(
   return canvas;
 }
 
-// Fill interior of silhouette using flood fill from edges
 function fillSilhouette(mask: Uint8Array, width: number, height: number): Uint8Array {
   const filled = new Uint8Array(mask.length);
   filled.set(mask);
   
-  // Mark all exterior transparent pixels by flood filling from edges
-  const visited = new Uint8Array(width * height);
-  const queue: number[] = [];
+  const totalPixels = width * height;
+  const visited = new Uint8Array(totalPixels);
+  const queue = new Int32Array(totalPixels);
+  let qHead = 0, qTail = 0;
   
-  // Add all edge pixels that are transparent to the queue
   for (let x = 0; x < width; x++) {
-    if (mask[x] === 0) queue.push(x);
-    if (mask[(height - 1) * width + x] === 0) queue.push((height - 1) * width + x);
+    if (mask[x] === 0 && !visited[x]) { visited[x] = 1; queue[qTail++] = x; }
+    const b = (height - 1) * width + x;
+    if (mask[b] === 0 && !visited[b]) { visited[b] = 1; queue[qTail++] = b; }
   }
   for (let y = 0; y < height; y++) {
-    if (mask[y * width] === 0) queue.push(y * width);
-    if (mask[y * width + width - 1] === 0) queue.push(y * width + width - 1);
+    const l = y * width;
+    if (mask[l] === 0 && !visited[l]) { visited[l] = 1; queue[qTail++] = l; }
+    const r = y * width + width - 1;
+    if (mask[r] === 0 && !visited[r]) { visited[r] = 1; queue[qTail++] = r; }
   }
   
-  // Mark initial queue items as visited
-  for (const idx of queue) {
-    visited[idx] = 1;
-  }
-  
-  // Flood fill to find all exterior pixels
-  while (queue.length > 0) {
-    const idx = queue.shift()!;
+  while (qHead < qTail) {
+    const idx = queue[qHead++];
     const x = idx % width;
-    const y = Math.floor(idx / width);
-    
-    // Check 4-connected neighbors
-    const neighbors = [
-      { nx: x - 1, ny: y },
-      { nx: x + 1, ny: y },
-      { nx: x, ny: y - 1 },
-      { nx: x, ny: y + 1 }
-    ];
-    
-    for (const { nx, ny } of neighbors) {
-      if (nx >= 0 && nx < width && ny >= 0 && ny < height) {
-        const nidx = ny * width + nx;
-        if (!visited[nidx] && mask[nidx] === 0) {
-          visited[nidx] = 1;
-          queue.push(nidx);
-        }
-      }
-    }
+    const y = (idx / width) | 0;
+    if (x > 0)          { const n = idx - 1;     if (!visited[n] && mask[n] === 0) { visited[n] = 1; queue[qTail++] = n; } }
+    if (x < width - 1)  { const n = idx + 1;     if (!visited[n] && mask[n] === 0) { visited[n] = 1; queue[qTail++] = n; } }
+    if (y > 0)          { const n = idx - width; if (!visited[n] && mask[n] === 0) { visited[n] = 1; queue[qTail++] = n; } }
+    if (y < height - 1) { const n = idx + width; if (!visited[n] && mask[n] === 0) { visited[n] = 1; queue[qTail++] = n; } }
   }
   
-  // Fill all non-exterior transparent pixels (interior holes)
   for (let i = 0; i < filled.length; i++) {
     if (filled[i] === 0 && !visited[i]) {
-      filled[i] = 1; // Fill interior holes
+      filled[i] = 1;
     }
   }
   
@@ -395,61 +376,33 @@ function bridgeTouchingContours(mask: Uint8Array, width: number, height: number,
     }
   }
   
-  // Second pass: fill any remaining tiny interior holes created by the bridging
-  // Use flood fill from edges to identify exterior, then fill non-exterior gaps
-  const visited = new Uint8Array(width * height);
-  const queue: number[] = [];
+  const totalPixels = width * height;
+  const visited = new Uint8Array(totalPixels);
+  const queue = new Int32Array(totalPixels);
+  let qHead = 0, qTail = 0;
   
-  // Add all edge pixels that are still transparent to the queue
   for (let x = 0; x < width; x++) {
-    if (result[x] === 0 && !visited[x]) {
-      queue.push(x);
-      visited[x] = 1;
-    }
-    const bottomIdx = (height - 1) * width + x;
-    if (result[bottomIdx] === 0 && !visited[bottomIdx]) {
-      queue.push(bottomIdx);
-      visited[bottomIdx] = 1;
-    }
+    if (result[x] === 0 && !visited[x]) { visited[x] = 1; queue[qTail++] = x; }
+    const b = (height - 1) * width + x;
+    if (result[b] === 0 && !visited[b]) { visited[b] = 1; queue[qTail++] = b; }
   }
   for (let y = 0; y < height; y++) {
-    const leftIdx = y * width;
-    if (result[leftIdx] === 0 && !visited[leftIdx]) {
-      queue.push(leftIdx);
-      visited[leftIdx] = 1;
-    }
-    const rightIdx = y * width + width - 1;
-    if (result[rightIdx] === 0 && !visited[rightIdx]) {
-      queue.push(rightIdx);
-      visited[rightIdx] = 1;
-    }
+    const l = y * width;
+    if (result[l] === 0 && !visited[l]) { visited[l] = 1; queue[qTail++] = l; }
+    const r = y * width + width - 1;
+    if (result[r] === 0 && !visited[r]) { visited[r] = 1; queue[qTail++] = r; }
   }
   
-  // Flood fill to find all exterior pixels
-  while (queue.length > 0) {
-    const idx = queue.shift()!;
+  while (qHead < qTail) {
+    const idx = queue[qHead++];
     const x = idx % width;
-    const y = Math.floor(idx / width);
-    
-    const neighbors = [
-      { nx: x - 1, ny: y },
-      { nx: x + 1, ny: y },
-      { nx: x, ny: y - 1 },
-      { nx: x, ny: y + 1 }
-    ];
-    
-    for (const { nx, ny } of neighbors) {
-      if (nx >= 0 && nx < width && ny >= 0 && ny < height) {
-        const nidx = ny * width + nx;
-        if (!visited[nidx] && result[nidx] === 0) {
-          visited[nidx] = 1;
-          queue.push(nidx);
-        }
-      }
-    }
+    const y = (idx / width) | 0;
+    if (x > 0)          { const n = idx - 1;     if (!visited[n] && result[n] === 0) { visited[n] = 1; queue[qTail++] = n; } }
+    if (x < width - 1)  { const n = idx + 1;     if (!visited[n] && result[n] === 0) { visited[n] = 1; queue[qTail++] = n; } }
+    if (y > 0)          { const n = idx - width; if (!visited[n] && result[n] === 0) { visited[n] = 1; queue[qTail++] = n; } }
+    if (y < height - 1) { const n = idx + width; if (!visited[n] && result[n] === 0) { visited[n] = 1; queue[qTail++] = n; } }
   }
   
-  // Fill all non-exterior transparent pixels (tiny interior holes)
   for (let i = 0; i < result.length; i++) {
     if (result[i] === 0 && !visited[i]) {
       result[i] = 1;

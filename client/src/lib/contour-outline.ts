@@ -1,32 +1,42 @@
 import type { StrokeSettings, ResizeSettings } from "@/lib/types";
 import { PDFDocument, PDFName, PDFArray, PDFDict } from 'pdf-lib';
-import { removeLoopsWithClipper, ensureClockwise, detectSelfIntersections, gaussianSmoothContour, subsamplePolygon } from "@/lib/clipper-path";
+import { removeLoopsWithClipper, ensureClockwise, detectSelfIntersections, gaussianSmoothContour, subsamplePolygon, polygonToSplinePath } from "@/lib/clipper-path";
 import { getContourWorkerManager } from "@/lib/contour-worker-manager";
 import { addSpotColorVectorsToPDF } from "@/lib/spot-color-vectors";
 
 export function simplifyPathForPDF(points: Array<{x: number; y: number}>, epsilon: number = 1.0): Array<{x: number; y: number}> {
   if (points.length <= 2) return points;
 
-  let maxDist = 0;
-  let maxIdx = 0;
-  const start = points[0];
-  const end = points[points.length - 1];
+  const keep = new Uint8Array(points.length);
+  keep[0] = 1;
+  keep[points.length - 1] = 1;
 
-  for (let i = 1; i < points.length - 1; i++) {
-    const d = perpendicularDistance(points[i], start, end);
-    if (d > maxDist) {
-      maxDist = d;
-      maxIdx = i;
+  const stack: [number, number][] = [[0, points.length - 1]];
+  while (stack.length > 0) {
+    const [lo, hi] = stack.pop()!;
+    if (hi - lo < 2) continue;
+
+    let maxDist = 0;
+    let maxIdx = lo;
+    const start = points[lo];
+    const end = points[hi];
+
+    for (let i = lo + 1; i < hi; i++) {
+      const d = perpendicularDistance(points[i], start, end);
+      if (d > maxDist) { maxDist = d; maxIdx = i; }
+    }
+
+    if (maxDist > epsilon) {
+      keep[maxIdx] = 1;
+      stack.push([lo, maxIdx], [maxIdx, hi]);
     }
   }
 
-  if (maxDist > epsilon) {
-    const left = simplifyPathForPDF(points.slice(0, maxIdx + 1), epsilon);
-    const right = simplifyPathForPDF(points.slice(maxIdx), epsilon);
-    return left.slice(0, -1).concat(right);
+  const result: Array<{x: number; y: number}> = [];
+  for (let i = 0; i < points.length; i++) {
+    if (keep[i]) result.push(points[i]);
   }
-
-  return [start, end];
+  return result;
 }
 
 function perpendicularDistance(
@@ -57,13 +67,17 @@ export function buildSmoothPdfPath(
 
   let path = `${pts[0].x.toFixed(4)} ${pts[0].y.toFixed(4)} m\n`;
 
-  if (n === 2) {
-    path += `${pts[1].x.toFixed(4)} ${pts[1].y.toFixed(4)} l\n`;
+  if (n < 16) {
+    for (let i = 1; i < n; i++) {
+      path += `${pts[i].x.toFixed(4)} ${pts[i].y.toFixed(4)} l\n`;
+    }
     if (closed) path += 'h\n';
     return path;
   }
 
   const segCount = closed ? n : n - 1;
+  const MAX_CP_RATIO = 0.4;
+  const MIN_SEG_LEN = 1.5;
 
   for (let i = 0; i < segCount; i++) {
     const p1 = pts[i];
@@ -80,10 +94,35 @@ export function buildSmoothPdfPath(
       p3 = i + 2 < n ? pts[i + 2] : { x: 2 * p2.x - p1.x, y: 2 * p2.y - p1.y };
     }
 
-    const cp1x = p1.x + (p2.x - p0.x) / 6;
-    const cp1y = p1.y + (p2.y - p0.y) / 6;
-    const cp2x = p2.x - (p3.x - p1.x) / 6;
-    const cp2y = p2.y - (p3.y - p1.y) / 6;
+    const segDx = p2.x - p1.x, segDy = p2.y - p1.y;
+    const segLen = Math.sqrt(segDx * segDx + segDy * segDy);
+
+    if (segLen < MIN_SEG_LEN) {
+      path += `${p2.x.toFixed(4)} ${p2.y.toFixed(4)} l\n`;
+      continue;
+    }
+
+    let cp1x = p1.x + (p2.x - p0.x) / 6;
+    let cp1y = p1.y + (p2.y - p0.y) / 6;
+    let cp2x = p2.x - (p3.x - p1.x) / 6;
+    let cp2y = p2.y - (p3.y - p1.y) / 6;
+
+    const maxDisp = segLen * MAX_CP_RATIO;
+    const d1x = cp1x - p1.x, d1y = cp1y - p1.y;
+    const d1 = Math.sqrt(d1x * d1x + d1y * d1y);
+    if (d1 > maxDisp) {
+      const s = maxDisp / d1;
+      cp1x = p1.x + d1x * s;
+      cp1y = p1.y + d1y * s;
+    }
+    const d2x = cp2x - p2.x, d2y = cp2y - p2.y;
+    const d2 = Math.sqrt(d2x * d2x + d2y * d2y);
+    if (d2 > maxDisp) {
+      const s = maxDisp / d2;
+      cp2x = p2.x + d2x * s;
+      cp2y = p2.y + d2y * s;
+    }
+
     path += `${cp1x.toFixed(4)} ${cp1y.toFixed(4)} ${cp2x.toFixed(4)} ${cp2y.toFixed(4)} ${p2.x.toFixed(4)} ${p2.y.toFixed(4)} c\n`;
   }
 
@@ -92,17 +131,16 @@ export function buildSmoothPdfPath(
   return path;
 }
 
-function contourPointsToPDFPathOps(
+export function contourPointsToPDFPathOps(
   pathPointsInches: Array<{x: number; y: number}>,
   pageHeightInches: number,
   spotColorName: string = 'CutContour'
 ): string {
-  const simplified = simplifyPathForPDF(pathPointsInches, 0.005);
-  console.log(`[PDF ${spotColorName}] Simplified ${pathPointsInches.length} points to ${simplified.length} points`);
+  console.log(`[PDF ${spotColorName}] Using ${pathPointsInches.length} points`);
   console.log(`[PDF ${spotColorName}] Page height: ${pageHeightInches.toFixed(3)}in`);
 
-  if (simplified.length < 2) {
-    console.warn(`[PDF ${spotColorName}] Too few points after simplification, skipping`);
+  if (pathPointsInches.length < 2) {
+    console.warn(`[PDF ${spotColorName}] Too few points, skipping`);
     return '';
   }
 
@@ -110,16 +148,66 @@ function contourPointsToPDFPathOps(
   pathOps += `/${spotColorName} CS 1 SCN\n`;
   pathOps += '0.5 w\n';
 
-  const pts = simplified.map(p => ({ x: p.x * 72, y: p.y * 72 }));
-  pathOps += `${pts[0].x.toFixed(4)} ${pts[0].y.toFixed(4)} m\n`;
-  for (let i = 1; i < pts.length; i++) {
-    pathOps += `${pts[i].x.toFixed(4)} ${pts[i].y.toFixed(4)} l\n`;
+  const pts = pathPointsInches.map(p => ({ x: p.x * 72, y: p.y * 72 }));
+
+  // Geometric shape paths (rectangle=4, square=4) have very few points;
+  // spline interpolation would curve their straight edges.
+  // Only use splines for paths dense enough to benefit from smoothing.
+  const useSplines = pts.length >= 16;
+
+  if (useSplines) {
+    const n = pts.length;
+    const MAX_CP_RATIO = 0.4;
+    const MIN_SEG_LEN = 1.5;
+    pathOps += `${pts[0].x.toFixed(4)} ${pts[0].y.toFixed(4)} m\n`;
+    for (let i = 0; i < n; i++) {
+      const p0 = pts[(i - 1 + n) % n];
+      const p1 = pts[i];
+      const p2 = pts[(i + 1) % n];
+      const p3 = pts[(i + 2) % n];
+      const segDx = p2.x - p1.x, segDy = p2.y - p1.y;
+      const segLen = Math.sqrt(segDx * segDx + segDy * segDy);
+
+      if (segLen < MIN_SEG_LEN) {
+        pathOps += `${p2.x.toFixed(4)} ${p2.y.toFixed(4)} l\n`;
+        continue;
+      }
+
+      let cp1x = p1.x + (p2.x - p0.x) / 12;
+      let cp1y = p1.y + (p2.y - p0.y) / 12;
+      let cp2x = p2.x - (p3.x - p1.x) / 12;
+      let cp2y = p2.y - (p3.y - p1.y) / 12;
+
+      const d1x = cp1x - p1.x, d1y = cp1y - p1.y;
+      const d1 = Math.sqrt(d1x * d1x + d1y * d1y);
+      const maxDisp = segLen * MAX_CP_RATIO;
+      if (d1 > maxDisp) {
+        const s = maxDisp / d1;
+        cp1x = p1.x + d1x * s;
+        cp1y = p1.y + d1y * s;
+      }
+
+      const d2x = cp2x - p2.x, d2y = cp2y - p2.y;
+      const d2 = Math.sqrt(d2x * d2x + d2y * d2y);
+      if (d2 > maxDisp) {
+        const s = maxDisp / d2;
+        cp2x = p2.x + d2x * s;
+        cp2y = p2.y + d2y * s;
+      }
+
+      pathOps += `${cp1x.toFixed(4)} ${cp1y.toFixed(4)} ${cp2x.toFixed(4)} ${cp2y.toFixed(4)} ${p2.x.toFixed(4)} ${p2.y.toFixed(4)} c\n`;
+    }
+  } else {
+    pathOps += `${pts[0].x.toFixed(4)} ${pts[0].y.toFixed(4)} m\n`;
+    for (let i = 1; i < pts.length; i++) {
+      pathOps += `${pts[i].x.toFixed(4)} ${pts[i].y.toFixed(4)} l\n`;
+    }
   }
+
   pathOps += 'h\n';
   pathOps += 'S\n';
   pathOps += 'Q\n';
 
-  console.log(`[PDF ${spotColorName}] Generated pathOps: ${pathOps.length} chars, first 200: ${pathOps.substring(0, 200)}`);
   return pathOps;
 }
 
@@ -436,43 +524,31 @@ function fillSilhouette(mask: Uint8Array, width: number, height: number): Uint8A
   const filled = new Uint8Array(mask.length);
   filled.set(mask);
   
-  const visited = new Uint8Array(width * height);
-  const queue: number[] = [];
+  const totalPixels = width * height;
+  const visited = new Uint8Array(totalPixels);
+  const queue = new Int32Array(totalPixels);
+  let qHead = 0, qTail = 0;
   
   for (let x = 0; x < width; x++) {
-    if (mask[x] === 0) queue.push(x);
-    if (mask[(height - 1) * width + x] === 0) queue.push((height - 1) * width + x);
+    if (mask[x] === 0 && !visited[x]) { visited[x] = 1; queue[qTail++] = x; }
+    const b = (height - 1) * width + x;
+    if (mask[b] === 0 && !visited[b]) { visited[b] = 1; queue[qTail++] = b; }
   }
   for (let y = 0; y < height; y++) {
-    if (mask[y * width] === 0) queue.push(y * width);
-    if (mask[y * width + width - 1] === 0) queue.push(y * width + width - 1);
+    const l = y * width;
+    if (mask[l] === 0 && !visited[l]) { visited[l] = 1; queue[qTail++] = l; }
+    const r = y * width + width - 1;
+    if (mask[r] === 0 && !visited[r]) { visited[r] = 1; queue[qTail++] = r; }
   }
   
-  for (const idx of queue) {
-    visited[idx] = 1;
-  }
-  
-  while (queue.length > 0) {
-    const idx = queue.shift()!;
+  while (qHead < qTail) {
+    const idx = queue[qHead++];
     const x = idx % width;
-    const y = Math.floor(idx / width);
-    
-    const neighbors = [
-      { nx: x - 1, ny: y },
-      { nx: x + 1, ny: y },
-      { nx: x, ny: y - 1 },
-      { nx: x, ny: y + 1 }
-    ];
-    
-    for (const { nx, ny } of neighbors) {
-      if (nx >= 0 && nx < width && ny >= 0 && ny < height) {
-        const nidx = ny * width + nx;
-        if (!visited[nidx] && mask[nidx] === 0) {
-          visited[nidx] = 1;
-          queue.push(nidx);
-        }
-      }
-    }
+    const y = (idx / width) | 0;
+    if (x > 0)          { const n = idx - 1;     if (!visited[n] && mask[n] === 0) { visited[n] = 1; queue[qTail++] = n; } }
+    if (x < width - 1)  { const n = idx + 1;     if (!visited[n] && mask[n] === 0) { visited[n] = 1; queue[qTail++] = n; } }
+    if (y > 0)          { const n = idx - width; if (!visited[n] && mask[n] === 0) { visited[n] = 1; queue[qTail++] = n; } }
+    if (y < height - 1) { const n = idx + width; if (!visited[n] && mask[n] === 0) { visited[n] = 1; queue[qTail++] = n; } }
   }
   
   for (let i = 0; i < filled.length; i++) {
@@ -549,54 +625,31 @@ function bridgeTouchingContours(mask: Uint8Array, width: number, height: number,
     }
   }
   
-  const visited = new Uint8Array(width * height);
-  const queue: number[] = [];
+  const totalPixels = width * height;
+  const visited = new Uint8Array(totalPixels);
+  const queue = new Int32Array(totalPixels);
+  let qHead = 0, qTail = 0;
   
   for (let x = 0; x < width; x++) {
-    if (result[x] === 0 && !visited[x]) {
-      queue.push(x);
-      visited[x] = 1;
-    }
-    const bottomIdx = (height - 1) * width + x;
-    if (result[bottomIdx] === 0 && !visited[bottomIdx]) {
-      queue.push(bottomIdx);
-      visited[bottomIdx] = 1;
-    }
+    if (result[x] === 0 && !visited[x]) { visited[x] = 1; queue[qTail++] = x; }
+    const b = (height - 1) * width + x;
+    if (result[b] === 0 && !visited[b]) { visited[b] = 1; queue[qTail++] = b; }
   }
   for (let y = 0; y < height; y++) {
-    const leftIdx = y * width;
-    if (result[leftIdx] === 0 && !visited[leftIdx]) {
-      queue.push(leftIdx);
-      visited[leftIdx] = 1;
-    }
-    const rightIdx = y * width + width - 1;
-    if (result[rightIdx] === 0 && !visited[rightIdx]) {
-      queue.push(rightIdx);
-      visited[rightIdx] = 1;
-    }
+    const l = y * width;
+    if (result[l] === 0 && !visited[l]) { visited[l] = 1; queue[qTail++] = l; }
+    const r = y * width + width - 1;
+    if (result[r] === 0 && !visited[r]) { visited[r] = 1; queue[qTail++] = r; }
   }
   
-  while (queue.length > 0) {
-    const idx = queue.shift()!;
+  while (qHead < qTail) {
+    const idx = queue[qHead++];
     const x = idx % width;
-    const y = Math.floor(idx / width);
-    
-    const neighbors = [
-      { nx: x - 1, ny: y },
-      { nx: x + 1, ny: y },
-      { nx: x, ny: y - 1 },
-      { nx: x, ny: y + 1 }
-    ];
-    
-    for (const { nx, ny } of neighbors) {
-      if (nx >= 0 && nx < width && ny >= 0 && ny < height) {
-        const nidx = ny * width + nx;
-        if (!visited[nidx] && result[nidx] === 0) {
-          visited[nidx] = 1;
-          queue.push(nidx);
-        }
-      }
-    }
+    const y = (idx / width) | 0;
+    if (x > 0)          { const n = idx - 1;     if (!visited[n] && result[n] === 0) { visited[n] = 1; queue[qTail++] = n; } }
+    if (x < width - 1)  { const n = idx + 1;     if (!visited[n] && result[n] === 0) { visited[n] = 1; queue[qTail++] = n; } }
+    if (y > 0)          { const n = idx - width; if (!visited[n] && result[n] === 0) { visited[n] = 1; queue[qTail++] = n; } }
+    if (y < height - 1) { const n = idx + width; if (!visited[n] && result[n] === 0) { visited[n] = 1; queue[qTail++] = n; } }
   }
   
   for (let i = 0; i < result.length; i++) {
@@ -1527,28 +1580,37 @@ function removeSpikes(points: Point[], neighborDistance: number, threshold: numb
 
 function douglasPeucker(points: Point[], epsilon: number): Point[] {
   if (points.length < 3) return points;
-  
-  let maxDist = 0;
-  let maxIndex = 0;
-  
-  const first = points[0];
-  const last = points[points.length - 1];
-  
-  for (let i = 1; i < points.length - 1; i++) {
-    const dist = perpendicularDistance(points[i], first, last);
-    if (dist > maxDist) {
-      maxDist = dist;
-      maxIndex = i;
+
+  const keep = new Uint8Array(points.length);
+  keep[0] = 1;
+  keep[points.length - 1] = 1;
+
+  const stack: [number, number][] = [[0, points.length - 1]];
+  while (stack.length > 0) {
+    const [lo, hi] = stack.pop()!;
+    if (hi - lo < 2) continue;
+
+    let maxDist = 0;
+    let maxIndex = lo;
+    const first = points[lo];
+    const last = points[hi];
+
+    for (let i = lo + 1; i < hi; i++) {
+      const dist = perpendicularDistance(points[i], first, last);
+      if (dist > maxDist) { maxDist = dist; maxIndex = i; }
+    }
+
+    if (maxDist > epsilon) {
+      keep[maxIndex] = 1;
+      stack.push([lo, maxIndex], [maxIndex, hi]);
     }
   }
-  
-  if (maxDist > epsilon) {
-    const left = douglasPeucker(points.slice(0, maxIndex + 1), epsilon);
-    const right = douglasPeucker(points.slice(maxIndex), epsilon);
-    return left.slice(0, -1).concat(right);
-  } else {
-    return [first, last];
+
+  const result: Point[] = [];
+  for (let i = 0; i < points.length; i++) {
+    if (keep[i]) result.push(points[i]);
   }
+  return result;
 }
 
 function drawSmoothContour(ctx: CanvasRenderingContext2D, contour: Point[], color: string, offsetX: number, offsetY: number): void {
@@ -1746,6 +1808,8 @@ export function getContourPath(
 export interface CachedContourData {
   pathPoints: Array<{x: number; y: number}>;
   previewPathPoints: Array<{x: number; y: number}>;
+  allPathPoints?: Array<Array<{x: number; y: number}>>;
+  allPreviewPathPoints?: Array<Array<{x: number; y: number}>>;
   widthInches: number;
   heightInches: number;
   imageOffsetX: number;
@@ -1755,6 +1819,7 @@ export interface CachedContourData {
   minPathX: number;
   minPathY: number;
   bleedInches: number;
+  holePathStartIndex?: number;
 }
 
 export interface SpotColorInput {
@@ -1772,6 +1837,8 @@ export interface SpotColorInput {
   spotFluorMName?: string;
   spotFluorGName?: string;
   spotFluorOrangeName?: string;
+  regions?: Array<{ id: number; spotWhite?: boolean; spotGloss?: boolean; selected: boolean }>;
+  regionMap?: Int32Array;
 }
 
 export async function downloadContourPDF(
@@ -1783,7 +1850,7 @@ export async function downloadContourPDF(
   spotColors?: SpotColorInput[],
   singleArtboard: boolean = false,
   cutContourLabel: string = 'CutContour',
-  lockedContour?: { label: string; pathPoints: Array<{x: number; y: number}>; widthInches: number; heightInches: number } | null
+  lockedContour?: { label: string; pathPoints: Array<{x: number; y: number}>; allPathPoints?: Array<Array<{x: number; y: number}>>; widthInches: number; heightInches: number } | null
 ): Promise<void> {
   try {
     console.log('[downloadContourPDF] Starting, cached:', !!cachedContourData);
@@ -1794,6 +1861,7 @@ export async function downloadContourPDF(
     
     let pathPoints: Array<{x: number; y: number}>;
     let previewPathPoints: Array<{x: number; y: number}>;
+    let allPathPoints: Array<Array<{x: number; y: number}>> | undefined;
     let widthInches: number;
     let heightInches: number;
     let imageOffsetX: number;
@@ -1803,6 +1871,7 @@ export async function downloadContourPDF(
     let minPathX: number;
     let minPathY: number;
     let bleedInches: number;
+    let holePathStartIndex: number | undefined;
     {
       const workerManager = getContourWorkerManager();
       const contourData = workerManager.getCachedContourData();
@@ -1810,6 +1879,7 @@ export async function downloadContourPDF(
         console.log('[downloadContourPDF] Using cached preview contour data (instant)');
         pathPoints = contourData.pathPoints;
         previewPathPoints = contourData.previewPathPoints;
+        allPathPoints = contourData.allPathPoints;
         widthInches = contourData.widthInches;
         heightInches = contourData.heightInches;
         imageOffsetX = contourData.imageOffsetX;
@@ -1819,6 +1889,7 @@ export async function downloadContourPDF(
         minPathX = contourData.minPathX;
         minPathY = contourData.minPathY;
         bleedInches = contourData.bleedInches;
+        holePathStartIndex = contourData.holePathStartIndex;
       } else {
         console.error('[downloadContourPDF] No contour data available - generate preview first');
         return;
@@ -1828,7 +1899,7 @@ export async function downloadContourPDF(
     console.log('[downloadContourPDF] Contour data ready in', (performance.now() - startTime).toFixed(0), 'ms');
     console.log('[downloadContourPDF] Page:', widthInches.toFixed(3), 'x', heightInches.toFixed(3), 'in, DPI:', effectiveDPI, ', pathPts:', pathPoints.length, ', bleed:', bleedInches);
     console.log('[downloadContourPDF] Image offset:', imageOffsetX.toFixed(3), imageOffsetY.toFixed(3), 'in');
-  
+
     const widthPts = widthInches * 72;
     const heightPts = heightInches * 72;
     
@@ -1841,7 +1912,7 @@ export async function downloadContourPDF(
     const bgBleedInches = 0.10;
     const bleedPixels = bgBleedInches * bgDPI;
     const fillColor = backgroundColor || '#ffffff';
-    const drawPath = pathPoints;
+    const drawPaths = allPathPoints && allPathPoints.length > 0 ? allPathPoints : [pathPoints];
     
     // Create background canvas (lower DPI for speed)
     const createBackgroundBlob = (): Promise<Blob> => {
@@ -1861,16 +1932,42 @@ export async function downloadContourPDF(
         bgCtx.lineWidth = bleedPixels * 2;
         bgCtx.lineJoin = 'round';
         bgCtx.lineCap = 'round';
+
+        const outerPaths = holePathStartIndex != null
+          ? drawPaths.slice(0, holePathStartIndex)
+          : drawPaths;
+        const holePaths = holePathStartIndex != null
+          ? drawPaths.slice(holePathStartIndex)
+          : [];
         
-        if (drawPath.length > 0) {
-          bgCtx.beginPath();
-          bgCtx.moveTo(drawPath[0].x * bgDPI, drawPath[0].y * bgDPI);
-          for (let i = 1; i < drawPath.length; i++) {
-            bgCtx.lineTo(drawPath[i].x * bgDPI, drawPath[i].y * bgDPI);
+        for (const drawPath of outerPaths) {
+          if (drawPath.length > 0) {
+            bgCtx.beginPath();
+            bgCtx.moveTo(drawPath[0].x * bgDPI, drawPath[0].y * bgDPI);
+            for (let i = 1; i < drawPath.length; i++) {
+              bgCtx.lineTo(drawPath[i].x * bgDPI, drawPath[i].y * bgDPI);
+            }
+            bgCtx.closePath();
+            bgCtx.stroke();
+            bgCtx.fill();
           }
-          bgCtx.closePath();
-          bgCtx.stroke();
-          bgCtx.fill();
+        }
+
+        if (holePaths.length > 0) {
+          bgCtx.globalCompositeOperation = 'destination-out';
+          bgCtx.fillStyle = 'rgba(0,0,0,1)';
+          for (const hp of holePaths) {
+            if (hp.length > 0) {
+              bgCtx.beginPath();
+              bgCtx.moveTo(hp[0].x * bgDPI, hp[0].y * bgDPI);
+              for (let i = 1; i < hp.length; i++) {
+                bgCtx.lineTo(hp[i].x * bgDPI, hp[i].y * bgDPI);
+              }
+              bgCtx.closePath();
+              bgCtx.fill();
+            }
+          }
+          bgCtx.globalCompositeOperation = 'source-over';
         }
         
         // Flip for PDF coordinate system
@@ -1937,10 +2034,26 @@ export async function downloadContourPDF(
     });
   
   const pngImage = await pdfDoc.embedPng(pngBytes);
-  
+
+  // Compute the image size as the contour pipeline sees it.
+  // effectiveDPI = min(dpiFromWidth, dpiFromHeight); when the image's natural AR
+  // differs from the resize settings AR, one axis will have a larger effective
+  // size than resizeSettings specifies. We must draw the image at that size so
+  // the contour and image stay aligned.
+  const natAR = image.naturalWidth / image.naturalHeight;
+  const resAR = resizeSettings.widthInches / resizeSettings.heightInches;
+  let contourImageW: number, contourImageH: number;
+  if (natAR <= resAR) {
+    contourImageW = resizeSettings.widthInches;
+    contourImageH = resizeSettings.widthInches / natAR;
+  } else {
+    contourImageH = resizeSettings.heightInches;
+    contourImageW = resizeSettings.heightInches * natAR;
+  }
+
   const imageXPts = imageOffsetX * 72;
-  const imageWidthPts = resizeSettings.widthInches * 72;
-  const imageHeightPts = resizeSettings.heightInches * 72;
+  const imageWidthPts = contourImageW * 72;
+  const imageHeightPts = contourImageH * 72;
   const imageYPts = heightPts - (imageOffsetY * 72) - imageHeightPts;
   
   page.drawImage(pngImage, {
@@ -1981,12 +2094,18 @@ export async function downloadContourPDF(
       (colorSpaceDict as PDFDict).set(PDFName.of(cutContourLabel), separationRef);
     }
     
-    const pathOps = contourPointsToPDFPathOps(pathPoints, heightInches, cutContourLabel);
-    
-    if (pathOps.length > 0) {
+    // Generate CutContour path operations — multiple paths for zero hero mode
+    const pathsToEmit = allPathPoints && allPathPoints.length > 0 ? allPathPoints : [pathPoints];
+    let combinedPathOps = '';
+    for (const singlePath of pathsToEmit) {
+      combinedPathOps += contourPointsToPDFPathOps(singlePath, heightInches, cutContourLabel);
+    }
+    console.log('[downloadContourPDF] Emitting', pathsToEmit.length, 'CutContour path(s)');
+
+    if (combinedPathOps.length > 0) {
       const existingContents = page.node.Contents();
       if (existingContents) {
-        const contentStream = context.stream(pathOps);
+        const contentStream = context.stream(combinedPathOps);
         const contentStreamRef = context.register(contentStream);
         
         if (existingContents instanceof PDFArray) {
@@ -2029,8 +2148,13 @@ export async function downloadContourPDF(
       }
     }
     
-    const lockedPathOps = contourPointsToPDFPathOps(lockedContour.pathPoints, heightInches, lockedContour.label);
-    
+    const lockedPathsToEmit = lockedContour.allPathPoints && lockedContour.allPathPoints.length > 0
+      ? lockedContour.allPathPoints : [lockedContour.pathPoints];
+    let lockedPathOps = '';
+    for (const lp of lockedPathsToEmit) {
+      lockedPathOps += contourPointsToPDFPathOps(lp, heightInches, lockedContour.label);
+    }
+
     if (lockedPathOps.length > 0) {
       const existingContents = page.node.Contents();
       if (existingContents) {
@@ -2164,6 +2288,7 @@ export async function generateContourPDFBase64(
 ): Promise<string | null> {
   let pathPoints: Array<{x: number; y: number}>;
   let previewPathPoints: Array<{x: number; y: number}>;
+  let allPathPoints: Array<Array<{x: number; y: number}>> | undefined;
   let widthInches: number;
   let heightInches: number;
   let imageOffsetX: number;
@@ -2173,10 +2298,12 @@ export async function generateContourPDFBase64(
   let minPathX: number;
   let minPathY: number;
   let bleedInches: number;
+  let holePathStartIndex: number | undefined;
   if (cachedContourData && cachedContourData.pathPoints.length > 0) {
     console.log('[generateContourPDFBase64] Using cached contour data for fast export');
     pathPoints = cachedContourData.pathPoints;
     previewPathPoints = cachedContourData.previewPathPoints;
+    allPathPoints = cachedContourData.allPathPoints;
     widthInches = cachedContourData.widthInches;
     heightInches = cachedContourData.heightInches;
     imageOffsetX = cachedContourData.imageOffsetX;
@@ -2186,12 +2313,14 @@ export async function generateContourPDFBase64(
     minPathX = cachedContourData.minPathX;
     minPathY = cachedContourData.minPathY;
     bleedInches = cachedContourData.bleedInches;
+    holePathStartIndex = cachedContourData.holePathStartIndex;
   } else {
     const workerManager = getContourWorkerManager();
     const contourData = workerManager.getCachedContourData();
     if (contourData) {
       pathPoints = contourData.pathPoints;
       previewPathPoints = contourData.previewPathPoints;
+      allPathPoints = contourData.allPathPoints;
       widthInches = contourData.widthInches;
       heightInches = contourData.heightInches;
       imageOffsetX = contourData.imageOffsetX;
@@ -2201,6 +2330,7 @@ export async function generateContourPDFBase64(
       minPathX = contourData.minPathX;
       minPathY = contourData.minPathY;
       bleedInches = contourData.bleedInches;
+      holePathStartIndex = contourData.holePathStartIndex;
     } else {
       console.error('[generateContourPDFBase64] No contour data available - generate preview first');
       return null;
@@ -2219,7 +2349,7 @@ export async function generateContourPDFBase64(
   const bgBleedInches = 0.10;
   const bleedPixels = bgBleedInches * bgDPI;
   const fillColor = backgroundColor || '#ffffff';
-  const drawPath = pathPoints;
+  const drawPaths2 = allPathPoints && allPathPoints.length > 0 ? allPathPoints : [pathPoints];
   
   // Create background canvas (lower DPI for speed)
   const createBackgroundBlob = (): Promise<Blob> => {
@@ -2239,16 +2369,42 @@ export async function generateContourPDFBase64(
       bgCtx.lineWidth = bleedPixels * 2;
       bgCtx.lineJoin = 'round';
       bgCtx.lineCap = 'round';
+
+      const outerPaths2 = holePathStartIndex != null
+        ? drawPaths2.slice(0, holePathStartIndex)
+        : drawPaths2;
+      const holePaths2 = holePathStartIndex != null
+        ? drawPaths2.slice(holePathStartIndex)
+        : [];
       
-      if (drawPath.length > 0) {
-        bgCtx.beginPath();
-        bgCtx.moveTo(drawPath[0].x * bgDPI, drawPath[0].y * bgDPI);
-        for (let i = 1; i < drawPath.length; i++) {
-          bgCtx.lineTo(drawPath[i].x * bgDPI, drawPath[i].y * bgDPI);
+      for (const drawPath of outerPaths2) {
+        if (drawPath.length > 0) {
+          bgCtx.beginPath();
+          bgCtx.moveTo(drawPath[0].x * bgDPI, drawPath[0].y * bgDPI);
+          for (let i = 1; i < drawPath.length; i++) {
+            bgCtx.lineTo(drawPath[i].x * bgDPI, drawPath[i].y * bgDPI);
+          }
+          bgCtx.closePath();
+          bgCtx.stroke();
+          bgCtx.fill();
         }
-        bgCtx.closePath();
-        bgCtx.stroke();
-        bgCtx.fill();
+      }
+
+      if (holePaths2.length > 0) {
+        bgCtx.globalCompositeOperation = 'destination-out';
+        bgCtx.fillStyle = 'rgba(0,0,0,1)';
+        for (const hp of holePaths2) {
+          if (hp.length > 0) {
+            bgCtx.beginPath();
+            bgCtx.moveTo(hp[0].x * bgDPI, hp[0].y * bgDPI);
+            for (let i = 1; i < hp.length; i++) {
+              bgCtx.lineTo(hp[i].x * bgDPI, hp[i].y * bgDPI);
+            }
+            bgCtx.closePath();
+            bgCtx.fill();
+          }
+        }
+        bgCtx.globalCompositeOperation = 'source-over';
       }
       
       // Flip for PDF coordinate system
@@ -2315,10 +2471,21 @@ export async function generateContourPDFBase64(
   });
   
   const pngImage = await pdfDoc.embedPng(pngBytes);
-  
+
+  const natAR2 = image.naturalWidth / image.naturalHeight;
+  const resAR2 = resizeSettings.widthInches / resizeSettings.heightInches;
+  let contourImageW2: number, contourImageH2: number;
+  if (natAR2 <= resAR2) {
+    contourImageW2 = resizeSettings.widthInches;
+    contourImageH2 = resizeSettings.widthInches / natAR2;
+  } else {
+    contourImageH2 = resizeSettings.heightInches;
+    contourImageW2 = resizeSettings.heightInches * natAR2;
+  }
+
   const imageXPts = imageOffsetX * 72;
-  const imageWidthPts = resizeSettings.widthInches * 72;
-  const imageHeightPts = resizeSettings.heightInches * 72;
+  const imageWidthPts = contourImageW2 * 72;
+  const imageHeightPts = contourImageH2 * 72;
   const imageYPts = heightPts - (imageOffsetY * 72) - imageHeightPts;
   
   page.drawImage(pngImage, {
@@ -2358,12 +2525,16 @@ export async function generateContourPDFBase64(
       (colorSpaceDict as PDFDict).set(PDFName.of(cutContourLabel), separationRef);
     }
     
-    const pathOps = contourPointsToPDFPathOps(pathPoints, heightInches, cutContourLabel);
-    
-    if (pathOps.length > 0) {
+    const base64PathsToEmit = allPathPoints && allPathPoints.length > 0 ? allPathPoints : [pathPoints];
+    let combinedPathOps = '';
+    for (const singlePath of base64PathsToEmit) {
+      combinedPathOps += contourPointsToPDFPathOps(singlePath, heightInches, cutContourLabel);
+    }
+
+    if (combinedPathOps.length > 0) {
       const existingContents = page.node.Contents();
       if (existingContents) {
-        const contentStream = context.stream(pathOps);
+        const contentStream = context.stream(combinedPathOps);
         const contentStreamRef = context.register(contentStream);
         
         if (existingContents instanceof PDFArray) {

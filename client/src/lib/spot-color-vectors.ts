@@ -14,6 +14,53 @@ interface SpotColorRegion {
 }
 
 const SPOT_COLOR_DPI = 300;
+const MAX_CANVAS_DIM = 16384;
+const MAX_CANVAS_PIXELS = 268_435_456;
+
+function buildRegionInclusionMasks(
+  spotColors: SpotColorInput[],
+  canvasW: number,
+  canvasH: number,
+  srcW: number,
+  srcH: number
+): { whiteMask: Uint8Array; glossMask: Uint8Array } | null {
+  const colorsWithRegions = spotColors.filter(c =>
+    c.regions && c.regions.length > 0 && c.regionMap &&
+    c.regions.some(r => r.spotWhite !== undefined || r.spotGloss !== undefined)
+  );
+  if (colorsWithRegions.length === 0) return null;
+
+  const totalPixels = canvasW * canvasH;
+  const whiteMask = new Uint8Array(totalPixels);
+  const glossMask = new Uint8Array(totalPixels);
+  whiteMask.fill(1);
+  glossMask.fill(1);
+
+  for (let y = 0; y < canvasH; y++) {
+    const srcY = Math.min(Math.floor(y * srcH / canvasH), srcH - 1);
+    for (let x = 0; x < canvasW; x++) {
+      const srcX = Math.min(Math.floor(x * srcW / canvasW), srcW - 1);
+      const srcIdx = srcY * srcW + srcX;
+      const pIdx = y * canvasW + x;
+
+      for (const color of colorsWithRegions) {
+        const regionId = color.regionMap![srcIdx];
+        if (regionId < 0) continue;
+
+        const region = color.regions!.find(r => r.id === regionId);
+        if (!region) continue;
+
+        const rWhite = region.spotWhite ?? false;
+        const rGloss = region.spotGloss ?? false;
+        if (!rWhite) whiteMask[pIdx] = 0;
+        if (!rGloss) glossMask[pIdx] = 0;
+        break;
+      }
+    }
+  }
+
+  return { whiteMask, glossMask };
+}
 
 function traceColorRegionsAsync(
   image: HTMLImageElement,
@@ -22,12 +69,29 @@ function traceColorRegionsAsync(
   heightInches: number
 ): Promise<SpotColorRegion[]> {
   return new Promise((resolve) => {
+    let cW = Math.round(widthInches * SPOT_COLOR_DPI);
+    let cH = Math.round(heightInches * SPOT_COLOR_DPI);
+    let scale = 1;
+    if (cW > MAX_CANVAS_DIM) { scale = MAX_CANVAS_DIM / cW; }
+    if (cH * scale > MAX_CANVAS_DIM) { scale = MAX_CANVAS_DIM / cH; }
+    cW = Math.round(cW * scale); cH = Math.round(cH * scale);
+    if (cW * cH > MAX_CANVAS_PIXELS) {
+      const ps = Math.sqrt(MAX_CANVAS_PIXELS / (cW * cH));
+      cW = Math.round(cW * ps); cH = Math.round(cH * ps);
+    }
     const canvas = document.createElement('canvas');
-    canvas.width = Math.round(widthInches * SPOT_COLOR_DPI);
-    canvas.height = Math.round(heightInches * SPOT_COLOR_DPI);
-    const ctx = canvas.getContext('2d')!;
+    canvas.width = cW;
+    canvas.height = cH;
+    const ctx = canvas.getContext('2d');
+    if (!ctx) { console.warn('[SpotColor] Canvas context creation failed'); resolve([]); return; }
     ctx.drawImage(image, 0, 0, canvas.width, canvas.height);
     const imageData = ctx.getImageData(0, 0, canvas.width, canvas.height);
+
+    const srcW = image.naturalWidth;
+    const srcH = image.naturalHeight;
+    const inclusionMasks = buildRegionInclusionMasks(
+      spotColors, canvas.width, canvas.height, srcW, srcH
+    );
 
     const workerColors = spotColors.map(c => ({
       hex: c.hex,
@@ -88,7 +152,8 @@ function traceColorRegionsAsync(
 
     console.log(`[SpotColor] Sending to worker: ${canvas.width}x${canvas.height} at ${SPOT_COLOR_DPI} DPI`);
     const buffer = imageData.data.buffer;
-    worker.postMessage({
+    const transferables: Transferable[] = [buffer];
+    const msg: any = {
       type: 'trace',
       imageBuffer: buffer,
       imageWidth: canvas.width,
@@ -97,7 +162,15 @@ function traceColorRegionsAsync(
       widthInches,
       heightInches,
       dpi: SPOT_COLOR_DPI,
-    }, [buffer]);
+    };
+
+    if (inclusionMasks) {
+      msg.whiteInclusionMask = inclusionMasks.whiteMask.buffer;
+      msg.glossInclusionMask = inclusionMasks.glossMask.buffer;
+      transferables.push(inclusionMasks.whiteMask.buffer, inclusionMasks.glossMask.buffer);
+    }
+
+    worker.postMessage(msg, transferables);
   });
 }
 

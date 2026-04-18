@@ -24,6 +24,7 @@ interface WorkerMessage {
     autoBridging: boolean;
     autoBridgingThreshold: number;
     contourMode?: 'smooth' | 'scattered';
+    includeHoles?: boolean;
   };
   effectiveDPI: number;
   previewMode?: boolean;
@@ -41,6 +42,8 @@ interface WorkerResponse {
   contourData?: {
     pathPoints: Array<{x: number; y: number}>;
     previewPathPoints: Array<{x: number; y: number}>;
+    allPathPoints?: Array<Array<{x: number; y: number}>>;
+    allPreviewPathPoints?: Array<Array<{x: number; y: number}>>;
     widthInches: number;
     heightInches: number;
     imageOffsetX: number;
@@ -51,6 +54,7 @@ interface WorkerResponse {
     minPathX: number;
     minPathY: number;
     bleedInches: number;
+    holePathStartIndex?: number;
   };
   detectedAlgorithm?: 'complex' | 'scattered';
 }
@@ -146,9 +150,27 @@ self.onmessage = function(e: MessageEvent<WorkerMessage>) {
         const recomputedImgOffX = ((0 - spMinX) / effectiveDPI) + bleedInches;
         const recomputedImgOffY = ((0 - spMinY) / effectiveDPI) + bleedInches;
 
+        // Rescale allPreviewPathPoints and recompute allPathPoints if present (zero hero mode)
+        let rescaledAllPreview: Array<Array<{x: number; y: number}>> | undefined;
+        let recomputedAllPath: Array<Array<{x: number; y: number}>> | undefined;
+        if (result.contourData.allPreviewPathPoints && result.contourData.allPreviewPathPoints.length > 0) {
+          rescaledAllPreview = result.contourData.allPreviewPathPoints.map(pts =>
+            pts.map(p => ({ x: p.x / scale, y: p.y / scale }))
+          );
+          recomputedAllPath = rescaledAllPreview.map(pts => {
+            const sm = pts.map(p => ({ x: p.x - rescaledImgX, y: p.y - rescaledImgY }));
+            return sm.map(p => ({
+              x: ((p.x - spMinX) / effectiveDPI) + bleedInches,
+              y: pageH - (((p.y - spMinY) / effectiveDPI) + bleedInches)
+            }));
+          });
+        }
+
         contourData = {
           pathPoints: recomputedPathPoints,
           previewPathPoints: rescaledPreviewPts,
+          allPathPoints: recomputedAllPath,
+          allPreviewPathPoints: rescaledAllPreview,
           widthInches: pageW,
           heightInches: pageH,
           imageOffsetX: recomputedImgOffX,
@@ -163,6 +185,7 @@ self.onmessage = function(e: MessageEvent<WorkerMessage>) {
         imageCanvasX = Math.round(result.imageCanvasX / scale);
         imageCanvasY = Math.round(result.imageCanvasY / scale);
         detectedAlg = result.detectedAlgorithm;
+
       } else {
         const result = processContour(imageData, strokeSettings, effectiveDPI, previewMode, detectedShapeType, detectedShapeBBox);
         processedData = result.imageData;
@@ -170,6 +193,7 @@ self.onmessage = function(e: MessageEvent<WorkerMessage>) {
         imageCanvasX = result.imageCanvasX;
         imageCanvasY = result.imageCanvasY;
         detectedAlg = result.detectedAlgorithm;
+
       }
       
       postProgress(100);
@@ -266,6 +290,8 @@ interface ContourResult {
   contourData: {
     pathPoints: Array<{x: number; y: number}>;
     previewPathPoints: Array<{x: number; y: number}>;
+    allPathPoints?: Array<Array<{x: number; y: number}>>;
+    allPreviewPathPoints?: Array<Array<{x: number; y: number}>>;
     widthInches: number;
     heightInches: number;
     imageOffsetX: number;
@@ -276,6 +302,7 @@ interface ContourResult {
     minPathX: number;
     minPathY: number;
     bleedInches: number;
+    holePathStartIndex?: number;
   };
   detectedAlgorithm: 'complex' | 'scattered';
 }
@@ -359,7 +386,8 @@ function processGeometricContour(
   canvasHeight: number,
   effectiveBackgroundColor: string,
   isHolographic: boolean,
-  shapeBBox?: { x: number; y: number; width: number; height: number } | null
+  shapeBBox?: { x: number; y: number; width: number; height: number } | null,
+  previewMode?: boolean
 ): ContourResult {
   console.log('[Worker] Using geometric contour for detected shape:', shapeType, 'bbox:', shapeBBox ? `${shapeBBox.x},${shapeBBox.y} ${shapeBBox.width}x${shapeBBox.height}` : 'full image');
   postProgress(20);
@@ -385,14 +413,19 @@ function processGeometricContour(
     const extendedImage = createEdgeExtendedImage(imageData, extendRadius);
     const extendedImageOffsetX = padding - extendRadius;
     const extendedImageOffsetY = padding - extendRadius;
-    drawContourToDataWithExtendedEdge(output, canvasWidth, canvasHeight, smoothedPath, strokeSettings.color, offsetX, offsetY, effectiveDPI, extendedImage, extendedImageOffsetX, extendedImageOffsetY);
+    drawContourToDataWithExtendedEdge(output, canvasWidth, canvasHeight, smoothedPath, strokeSettings.color, offsetX, offsetY, effectiveDPI, extendedImage, extendedImageOffsetX, extendedImageOffsetY, previewMode);
   } else {
-    drawContourToData(output, canvasWidth, canvasHeight, smoothedPath, strokeSettings.color, effectiveBackgroundColor, offsetX, offsetY, effectiveDPI);
+    drawContourToData(output, canvasWidth, canvasHeight, smoothedPath, strokeSettings.color, effectiveBackgroundColor, offsetX, offsetY, effectiveDPI, previewMode);
   }
 
   const imageCanvasX = 0 + offsetX;
   const imageCanvasY = 0 + offsetY;
-  drawImageToData(output, canvasWidth, canvasHeight, imageData, Math.round(imageCanvasX), Math.round(imageCanvasY));
+  const geoMask = previewMode ? buildContourMask(canvasWidth, canvasHeight, [smoothedPath], offsetX, offsetY, bleedPixels) : undefined;
+  drawImageToData(output, canvasWidth, canvasHeight, imageData, Math.round(imageCanvasX), Math.round(imageCanvasY), geoMask);
+
+  if (previewMode && geoMask) {
+    applyMaskToOutput(output, canvasWidth, canvasHeight, geoMask);
+  }
 
   postProgress(90);
 
@@ -459,6 +492,7 @@ function processContour(
     autoBridging: boolean;
     autoBridgingThreshold: number;
     contourMode?: 'smooth' | 'scattered';
+    includeHoles?: boolean;
   },
   effectiveDPI: number,
   previewMode?: boolean,
@@ -469,9 +503,10 @@ function processContour(
   const height = imageData.height;
   const data = imageData.data;
   
-  // Super-sampling factor for sub-pixel precision tracing
-  // Preview: 2x for speed, Export: 4x for quality
-  const SUPER_SAMPLE = previewMode ? 2 : 4;
+  // Adaptive super-sampling: high-res inputs already have sub-pixel detail,
+  // so 2x suffices and avoids 256M+ pixel buffers that can OOM the worker.
+  const maxInputDim = Math.max(width, height);
+  const SUPER_SAMPLE = previewMode ? 2 : (maxInputDim > 2000 ? 2 : 4);
   
   // Holographic uses white as placeholder for preview (will be replaced with gradient in UI)
   // Export functions will treat holographic as transparent separately
@@ -481,7 +516,9 @@ function processContour(
     : strokeSettings.backgroundColor;
   
   const baseOffsetInches = 0.015;
-  const baseOffsetPixels = Math.round(baseOffsetInches * effectiveDPI);
+  const baseOffsetPixels = detectedShapeType
+    ? 0
+    : Math.round(baseOffsetInches * effectiveDPI);
   
   // Auto-bridging: close narrow gaps/caves using configurable threshold
   const autoBridgeInches = strokeSettings.autoBridging ? strokeSettings.autoBridgingThreshold : 0;
@@ -490,10 +527,21 @@ function processContour(
   const userOffsetPixels = Math.round(strokeSettings.width * effectiveDPI);
   const totalOffsetPixels = baseOffsetPixels + userOffsetPixels;
   
-  // Add bleed to padding so expanded background isn't clipped
-  const bleedInches = 0.10;
+  // Full bleed for PDF export, minimal for preview (reduces visible padding around contour)
+  const bleedInches = previewMode ? 0.02 : 0.10;
   const bleedPixels = Math.round(bleedInches * effectiveDPI);
-  const padding = totalOffsetPixels + bleedPixels + 10;
+  let padding = totalOffsetPixels + bleedPixels + 4;
+
+  // For circles the contour uses max(w,h) radius which can extend beyond the shorter axis
+  if (detectedShapeType === 'circle') {
+    const bw = detectedShapeBBox?.width ?? width;
+    const bh = detectedShapeBBox?.height ?? height;
+    const radius = Math.max(bw, bh) / 2 + totalOffsetPixels;
+    const extraH = Math.max(0, radius - width / 2);
+    const extraV = Math.max(0, radius - height / 2);
+    padding = Math.max(padding, Math.ceil(Math.max(extraH, extraV)) + bleedPixels + 4);
+  }
+
   const canvasWidth = width + (padding * 2);
   const canvasHeight = height + (padding * 2);
   
@@ -502,24 +550,27 @@ function processContour(
       imageData, strokeSettings, effectiveDPI, detectedShapeType,
       width, height, totalOffsetPixels, bleedInches, bleedPixels,
       padding, canvasWidth, canvasHeight, effectiveBackgroundColor, isHolographic,
-      detectedShapeBBox
+      detectedShapeBBox, previewMode
     );
   }
   
   postProgress(20);
   
+  const isZeroHero = strokeSettings.width === 0;
+
   // Create 4x upscaled alpha buffer using bilinear interpolation
   // This converts pixel-locked edges into smooth sub-pixel boundaries
   const hiResWidth = width * SUPER_SAMPLE;
   const hiResHeight = height * SUPER_SAMPLE;
   const hiResAlpha = upscaleAlphaChannel(data, width, height, SUPER_SAMPLE);
   
-  // Apply box blur to alpha channel to smooth out anti-aliasing artifacts
-  // This makes straight edges with slight transparency variations appear cleaner
-  // Radius of 2px at super-sampled resolution (= 0.5px at original resolution)
-  const blurRadius = 2;
-  const smoothedAlpha = boxBlurAlpha(hiResAlpha, hiResWidth, hiResHeight, blurRadius);
-  console.log('[Worker] Applied alpha blur radius:', blurRadius, 'px');
+  // Zero hero: skip blur entirely for maximum edge accuracy
+  // Normal: radius 2 at super-sampled resolution (~0.5px original)
+  const blurRadius = isZeroHero ? 0 : 2;
+  const smoothedAlpha = blurRadius > 0
+    ? boxBlurAlpha(hiResAlpha, hiResWidth, hiResHeight, blurRadius)
+    : hiResAlpha;
+  console.log('[Worker] Applied alpha blur radius:', blurRadius, 'px', isZeroHero ? '(zero hero: no blur)' : '');
   
   const cropAlphaThreshold = 1;
   if (cropAlphaThreshold > 0) {
@@ -528,30 +579,46 @@ function processContour(
     }
   }
   
-  const loThreshold = 20;
-  let hiThreshold = Math.max(strokeSettings.alphaThreshold, 128);
-  let hysteresisResult = buildHysteresisMaskWithRGBRescue(
-    smoothedAlpha, data, hiResWidth, hiResHeight, width, height,
-    hiThreshold, loThreshold, SUPER_SAMPLE
-  );
-  let hiResMask = hysteresisResult.mask;
-  let faintArtMode = hysteresisResult.faintArtMode;
-  
-  let hasMaskPixels = false;
-  for (let i = 0; i < hiResMask.length; i++) {
-    if (hiResMask[i] === 1) { hasMaskPixels = true; break; }
-  }
-  if (!hasMaskPixels) {
-    hiThreshold = strokeSettings.alphaThreshold;
-    hysteresisResult = buildHysteresisMaskWithRGBRescue(
+  let hiResMask: Uint8Array;
+  let faintArtMode = false;
+
+  if (isZeroHero) {
+    // Zero hero: sharp single threshold — no hysteresis, no RGB rescue
+    // Uses alphaThreshold directly (default 128) for a crisp binary mask
+    const threshold = Math.max(strokeSettings.alphaThreshold, 128);
+    hiResMask = new Uint8Array(hiResWidth * hiResHeight);
+    for (let i = 0; i < smoothedAlpha.length; i++) {
+      if (smoothedAlpha[i] >= threshold) hiResMask[i] = 1;
+    }
+    console.log('[Worker] Zero hero: sharp threshold at', threshold, '(no hysteresis)');
+  } else {
+    const loThreshold = 20;
+    let hiThreshold = Math.max(strokeSettings.alphaThreshold, 128);
+    let hysteresisResult = buildHysteresisMaskWithRGBRescue(
       smoothedAlpha, data, hiResWidth, hiResHeight, width, height,
-      hiThreshold, Math.min(loThreshold, hiThreshold - 1), SUPER_SAMPLE
+      hiThreshold, loThreshold, SUPER_SAMPLE
     );
     hiResMask = hysteresisResult.mask;
     faintArtMode = hysteresisResult.faintArtMode;
+    
+    let hasMaskPixels = false;
     for (let i = 0; i < hiResMask.length; i++) {
       if (hiResMask[i] === 1) { hasMaskPixels = true; break; }
     }
+    if (!hasMaskPixels) {
+      hiThreshold = strokeSettings.alphaThreshold;
+      hysteresisResult = buildHysteresisMaskWithRGBRescue(
+        smoothedAlpha, data, hiResWidth, hiResHeight, width, height,
+        hiThreshold, Math.min(loThreshold, hiThreshold - 1), SUPER_SAMPLE
+      );
+      hiResMask = hysteresisResult.mask;
+      faintArtMode = hysteresisResult.faintArtMode;
+    }
+  }
+
+  let hasMaskPixels = false;
+  for (let i = 0; i < hiResMask.length; i++) {
+    if (hiResMask[i] === 1) { hasMaskPixels = true; break; }
   }
   
   if (!hasMaskPixels) {
@@ -593,10 +660,19 @@ function processContour(
 
   const mainComponentMask = selectMainComponentWithOrphans(
     hiResMask, hiResWidth, hiResHeight, hiResDPI,
-    minComponentAreaPx, keepNearMainDistInches, bladeWidthInches, faintArtMode
+    minComponentAreaPx, keepNearMainDistInches, bladeWidthInches, faintArtMode,
+    isZeroHero
   );
-  
+
   const filledMainMask = fillSilhouette(mainComponentMask, hiResWidth, hiResHeight);
+
+  // Detect interior holes before they get filled (for Include Holes feature)
+  const includeHoles = !!strokeSettings.includeHoles;
+  let holeMasks: Uint8Array[] = [];
+  if (includeHoles) {
+    holeMasks = detectHoles(mainComponentMask, hiResWidth, hiResHeight);
+    console.log('[Worker] Include holes: detected', holeMasks.length, 'interior hole(s)');
+  }
   
   postProgress(40);
   
@@ -632,6 +708,193 @@ function processContour(
 
   console.log('[Worker] Effective mode:', effectiveMode, '| Detected algorithm:', detectedAlgorithm, prelimCompositeDetected ? '(forced by composite detection)' : '');
 
+  // ─── ZERO HERO MODE ───
+  if (isZeroHero) {
+    console.log('[Worker] ZERO HERO MODE: tracing exact design edges, no dilation');
+
+    // Re-label connected components in the filled mask
+    const zeroComps = labelComponents(filledMainMask, hiResWidth, hiResHeight);
+    console.log('[Worker] Zero hero: found', zeroComps.length, 'components in filled mask');
+
+    if (zeroComps.length === 0) {
+      return createOutputWithImage(imageData, canvasWidth, canvasHeight, padding, effectiveDPI, effectiveBackgroundColor);
+    }
+
+    postProgress(50);
+
+    // Trace each component's boundary independently using Marching Squares
+    // for sub-pixel accuracy (no vectorWeld, no Chaikin — MS output is already smooth)
+    const allZeroPaths: Point[][] = [];
+    for (const comp of zeroComps) {
+      const compMask = new Uint8Array(hiResWidth * hiResHeight);
+      for (const idx of comp.pixels) compMask[idx] = 1;
+
+      const boundary = traceBoundaryMarchingSquares(compMask, hiResWidth, hiResHeight);
+      if (boundary.length < 3) continue;
+
+      // Downscale from hi-res to original resolution (no dilation offset)
+      let scaled = boundary.map(p => ({
+        x: p.x / SUPER_SAMPLE,
+        y: p.y / SUPER_SAMPLE
+      }));
+
+      // Simplify, deduplicate, then smooth curves while preserving sharp corners
+      scaled = approxPolyDP(scaled, 0.002);
+      scaled = removeNearDuplicatePoints(scaled, 0.01);
+      scaled = smoothPolyChaikin(scaled, 1, 45);
+
+      if (scaled.length >= 3) {
+        allZeroPaths.push(scaled);
+        console.log('[Worker] Zero hero component:', scaled.length, 'pts, area:', comp.area);
+      }
+    }
+
+    const outerPathCount = allZeroPaths.length;
+
+    // Trace hole boundaries for zero-hero when includeHoles is enabled
+    if (includeHoles && holeMasks.length > 0) {
+      for (const holeMask of holeMasks) {
+        const boundary = traceBoundaryMarchingSquares(holeMask, hiResWidth, hiResHeight);
+        if (boundary.length < 3) continue;
+
+        let scaled = boundary.map(p => ({
+          x: p.x / SUPER_SAMPLE,
+          y: p.y / SUPER_SAMPLE
+        }));
+        scaled = approxPolyDP(scaled, 0.002);
+        scaled = removeNearDuplicatePoints(scaled, 0.01);
+        scaled = smoothPolyChaikin(scaled, 1, 45);
+
+        if (scaled.length >= 3) {
+          allZeroPaths.push(scaled);
+          console.log('[Worker] Zero hero hole contour:', scaled.length, 'pts');
+        }
+      }
+    }
+
+    if (allZeroPaths.length === 0) {
+      console.log('[Worker] Zero hero: no valid contours traced');
+      return createOutputWithImage(imageData, canvasWidth, canvasHeight, padding, effectiveDPI, effectiveBackgroundColor);
+    }
+
+    console.log('[Worker] Zero hero: traced', allZeroPaths.length, 'independent contours (incl. holes)');
+
+    postProgress(60);
+
+    // Use the largest path (by area) as the primary smoothedPath
+    let largestIdx = 0;
+    let largestArea = 0;
+    for (let i = 0; i < allZeroPaths.length; i++) {
+      const a = Math.abs(polygonArea(allZeroPaths[i]));
+      if (a > largestArea) { largestArea = a; largestIdx = i; }
+    }
+    const smoothedPath = allZeroPaths[largestIdx];
+
+    postProgress(70);
+
+    // Compute bounding box across ALL paths for canvas sizing and coordinate mapping
+    let globalMinX = Infinity, globalMinY = Infinity;
+    let globalMaxX = -Infinity, globalMaxY = -Infinity;
+    for (const path of allZeroPaths) {
+      for (const p of path) {
+        if (p.x < globalMinX) globalMinX = p.x;
+        if (p.y < globalMinY) globalMinY = p.y;
+        if (p.x > globalMaxX) globalMaxX = p.x;
+        if (p.y > globalMaxY) globalMaxY = p.y;
+      }
+    }
+
+    const offsetX = bleedPixels - globalMinX;
+    const offsetY = bleedPixels - globalMinY;
+
+    const output = new Uint8ClampedArray(canvasWidth * canvasHeight * 4);
+    const useEdgeBleed = !strokeSettings.useCustomBackground;
+
+    // Draw each contour path onto the same output buffer
+    // Outer paths get background fill; hole paths get cutout treatment
+    for (let pi = 0; pi < allZeroPaths.length; pi++) {
+      const path = allZeroPaths[pi];
+      const isHolePath = pi >= outerPathCount;
+
+      if (isHolePath) {
+        drawHoleCutout(output, canvasWidth, canvasHeight, path, strokeSettings.color, offsetX, offsetY, effectiveDPI);
+      } else if (useEdgeBleed) {
+        const extendRadius = bleedPixels;
+        const extendedImage = createEdgeExtendedImage(imageData, extendRadius);
+        const extendedImageOffsetX = padding - extendRadius;
+        const extendedImageOffsetY = padding - extendRadius;
+        drawContourToDataWithExtendedEdge(output, canvasWidth, canvasHeight, path, strokeSettings.color, offsetX, offsetY, effectiveDPI, extendedImage, extendedImageOffsetX, extendedImageOffsetY, previewMode);
+      } else {
+        drawContourToData(output, canvasWidth, canvasHeight, path, strokeSettings.color, effectiveBackgroundColor, offsetX, offsetY, effectiveDPI, previewMode);
+      }
+    }
+
+    const imageCanvasX = 0 + offsetX;
+    const imageCanvasY = 0 + offsetY;
+    const zhMask = previewMode ? buildContourMask(canvasWidth, canvasHeight, allZeroPaths, offsetX, offsetY, bleedPixels) : undefined;
+    drawImageToData(output, canvasWidth, canvasHeight, imageData, Math.round(imageCanvasX), Math.round(imageCanvasY), zhMask);
+
+    if (previewMode && zhMask) {
+      applyMaskToOutput(output, canvasWidth, canvasHeight, zhMask);
+    }
+
+    postProgress(80);
+
+    // PDF coordinate conversion for all paths
+    const minPathX = globalMinX;
+    const minPathY = globalMinY;
+    const pathWidthPixels = globalMaxX - globalMinX;
+    const pathHeightPixels = globalMaxY - globalMinY;
+    const pathWidthInches = pathWidthPixels / effectiveDPI;
+    const pathHeightInches = pathHeightPixels / effectiveDPI;
+    const pageWidthInches = pathWidthInches + (bleedInches * 2);
+    const pageHeightInches = pathHeightInches + (bleedInches * 2);
+
+    const convertPathToInches = (path: Point[]) => path.map(p => ({
+      x: ((p.x - minPathX) / effectiveDPI) + bleedInches,
+      y: pageHeightInches - (((p.y - minPathY) / effectiveDPI) + bleedInches)
+    }));
+
+    const primaryPathInInches = convertPathToInches(smoothedPath);
+    const allPathsInInches = allZeroPaths.map(convertPathToInches);
+
+    const imageOffsetXCalc = ((0 - minPathX) / effectiveDPI) + bleedInches;
+    const imageOffsetYCalc = ((0 - minPathY) / effectiveDPI) + bleedInches;
+
+    console.log('[Worker] Zero hero page size (inches):', pageWidthInches.toFixed(4), 'x', pageHeightInches.toFixed(4));
+    console.log('[Worker] Zero hero paths:', allZeroPaths.length, ', primary:', smoothedPath.length, 'pts');
+
+    postProgress(90);
+
+    return {
+      imageData: new ImageData(output, canvasWidth, canvasHeight),
+      imageCanvasX: Math.round(imageCanvasX),
+      imageCanvasY: Math.round(imageCanvasY),
+      contourData: {
+        pathPoints: primaryPathInInches,
+        previewPathPoints: smoothedPath.map(p => ({ x: p.x + offsetX, y: p.y + offsetY })),
+        allPathPoints: allPathsInInches,
+        allPreviewPathPoints: allZeroPaths.map(path =>
+          path.map(p => ({ x: p.x + offsetX, y: p.y + offsetY }))
+        ),
+        widthInches: pageWidthInches,
+        heightInches: pageHeightInches,
+        imageOffsetX: imageOffsetXCalc,
+        imageOffsetY: imageOffsetYCalc,
+        backgroundColor: isHolographic ? 'holographic' : effectiveBackgroundColor,
+        useEdgeBleed: useEdgeBleed,
+        effectiveDPI,
+        minPathX,
+        minPathY,
+        bleedInches,
+        holePathStartIndex: includeHoles && holeMasks.length > 0 ? outerPathCount : undefined
+      },
+      detectedAlgorithm
+    };
+  }
+
+  // ─── NORMAL MODE (non-zero stroke width) ───
+
   let dilateRadiusHiRes = totalOffsetPixels * SUPER_SAMPLE;
   
   // Size guard: limit dilated mask to ~16M pixels to avoid memory blowups
@@ -652,21 +915,59 @@ function processContour(
   const dilatedHeight = hiResHeight + dilateRadiusHiRes * 2;
   
   postProgress(50);
-  
-  // Trace the outer boundary of the dilated mask
-  const dilatedContour = traceBoundary(dilatedMask, dilatedWidth, dilatedHeight);
-  
-  if (dilatedContour.length < 3) {
-    console.log('[Worker] Dilated contour too small, returning empty');
+
+  // Trace ALL boundaries of the dilated mask (not just the first one found)
+  // This ensures disconnected orphan shapes that survived dilation are not dropped
+  const allDilatedContours = traceAllContours(dilatedMask, dilatedWidth, dilatedHeight);
+
+  const validDilatedContours = allDilatedContours.filter(c => c.length >= 3);
+
+  if (validDilatedContours.length === 0) {
+    console.log('[Worker] No valid dilated contours found, returning empty');
     return createOutputWithImage(imageData, canvasWidth, canvasHeight, padding, effectiveDPI, effectiveBackgroundColor);
   }
-  
-  // Downscale contour points from hi-res to original resolution
-  let smoothedPath = dilatedContour.map(p => ({
-    x: (p.x - dilateRadiusHiRes) / SUPER_SAMPLE,
-    y: (p.y - dilateRadiusHiRes) / SUPER_SAMPLE
-  }));
-  
+
+  // Downscale all contour points from hi-res to original resolution
+  const scaledContours = validDilatedContours.map(contour =>
+    contour.map(p => ({
+      x: (p.x - dilateRadiusHiRes) / SUPER_SAMPLE,
+      y: (p.y - dilateRadiusHiRes) / SUPER_SAMPLE
+    }))
+  );
+
+  let smoothedPath: Point[];
+
+  if (scaledContours.length === 1) {
+    smoothedPath = scaledContours[0];
+    console.log('[Worker] Single dilated contour:', smoothedPath.length, 'points');
+  } else {
+    // Multiple disconnected contours — merge them into a single outline.
+    // Compute the actual minimum distance between the closest pair of contours
+    // so we expand only as much as needed to bridge the gap.
+    let maxMinDist = 0;
+    for (let i = 0; i < scaledContours.length; i++) {
+      let closestToAny = Infinity;
+      for (let j = 0; j < scaledContours.length; j++) {
+        if (i === j) continue;
+        const d = minDistanceBetweenContours(scaledContours[i], scaledContours[j]);
+        if (d < closestToAny) closestToAny = d;
+      }
+      if (closestToAny > maxMinDist && closestToAny < Infinity) maxMinDist = closestToAny;
+    }
+
+    const mergeGap = Math.ceil(maxMinDist / 2) + 4;
+    console.log('[Worker] Multiple dilated contours:', scaledContours.length,
+      '- max nearest-neighbor gap:', maxMinDist.toFixed(1), 'px, merge gap:', mergeGap, 'px');
+
+    smoothedPath = multiPathVectorMerge(scaledContours, mergeGap);
+
+    if (smoothedPath.length < 3) {
+      console.log('[Worker] Merge failed, falling back to largest contour');
+      smoothedPath = scaledContours.reduce((best, c) =>
+        c.length > best.length ? c : best, scaledContours[0]);
+    }
+  }
+
   // Vector weld: expand then shrink by small amount to merge nearby path segments
   const weldPx = previewMode ? 1.0 : 3.0;
   smoothedPath = vectorWeld(smoothedPath, weldPx);
@@ -675,8 +976,11 @@ function processContour(
   const tightEpsilon = 0.0005;
   smoothedPath = approxPolyDP(smoothedPath, tightEpsilon);
   smoothedPath = removeNearDuplicatePoints(smoothedPath, 0.01);
-  
+
   console.log('[Worker] Dilated contour traced, welded, and simplified:', smoothedPath.length, 'points');
+
+  const minGapPx = Math.max(2, Math.round(bladeWidthInches * effectiveDPI));
+  smoothedPath = enforceMinGap(smoothedPath, minGapPx);
 
   if (effectiveMode === 'smooth') {
     const compositeResult = fitCompositeShape(smoothedPath, effectiveDPI);
@@ -744,19 +1048,19 @@ function processContour(
     // Draw contour with edge-extended background
     const extendedImageOffsetX = padding - extendRadius;
     const extendedImageOffsetY = padding - extendRadius;
-    drawContourToDataWithExtendedEdge(output, canvasWidth, canvasHeight, smoothedPath, strokeSettings.color, offsetX, offsetY, effectiveDPI, extendedImage, extendedImageOffsetX, extendedImageOffsetY);
+    drawContourToDataWithExtendedEdge(output, canvasWidth, canvasHeight, smoothedPath, strokeSettings.color, offsetX, offsetY, effectiveDPI, extendedImage, extendedImageOffsetX, extendedImageOffsetY, previewMode);
   } else {
-    // Custom background: use solid color bleed
-    drawContourToData(output, canvasWidth, canvasHeight, smoothedPath, strokeSettings.color, effectiveBackgroundColor, offsetX, offsetY, effectiveDPI);
+    drawContourToData(output, canvasWidth, canvasHeight, smoothedPath, strokeSettings.color, effectiveBackgroundColor, offsetX, offsetY, effectiveDPI, previewMode);
   }
   
-  // Draw original image on top
-  // In the new pipeline, smoothedPath coordinates are in original image space
-  // (0,0) = top-left of original image. So the image canvas position is simply:
   const imageCanvasX = 0 + offsetX;
   const imageCanvasY = 0 + offsetY;
-  console.log('[Worker] Image canvas position:', imageCanvasX.toFixed(1), imageCanvasY.toFixed(1));
-  drawImageToData(output, canvasWidth, canvasHeight, imageData, Math.round(imageCanvasX), Math.round(imageCanvasY));
+  const ctrMask = previewMode ? buildContourMask(canvasWidth, canvasHeight, [smoothedPath], offsetX, offsetY, bleedPixels) : undefined;
+  drawImageToData(output, canvasWidth, canvasHeight, imageData, Math.round(imageCanvasX), Math.round(imageCanvasY), ctrMask);
+
+  if (previewMode && ctrMask) {
+    applyMaskToOutput(output, canvasWidth, canvasHeight, ctrMask);
+  }
   
   // Calculate contour data for PDF export
   // Store raw pixel coordinates and let PDF export handle the conversion
@@ -811,6 +1115,77 @@ function processContour(
   const pathYsInches = pathInInches.map(p => p.y);
   console.log('[Worker] Path bounds (inches): X:', Math.min(...pathXsInches).toFixed(4), 'to', Math.max(...pathXsInches).toFixed(4),
               'Y:', Math.min(...pathYsInches).toFixed(4), 'to', Math.max(...pathYsInches).toFixed(4));
+
+  // ─── HOLE TRACING (normal mode) ───
+  let allPathsInInches: Array<Array<{x: number; y: number}>> | undefined;
+  let allPreviewPaths: Array<Array<{x: number; y: number}>> | undefined;
+
+  if (includeHoles && holeMasks.length > 0) {
+    const holePaths: Point[][] = [];
+
+    for (const holeMask of holeMasks) {
+      const boundary = traceBoundaryMarchingSquares(holeMask, hiResWidth, hiResHeight);
+      if (boundary.length < 3) continue;
+
+      let scaled = boundary.map(p => ({
+        x: p.x / SUPER_SAMPLE,
+        y: p.y / SUPER_SAMPLE
+      }));
+
+      // Shrink the hole polygon inward by the stroke offset so the cut
+      // doesn't eat into the design. This is a negative Clipper offset.
+      if (totalOffsetPixels > 0) {
+        const shrinkDist = totalOffsetPixels;
+        const co = new ClipperLib.ClipperOffset();
+        co.ArcTolerance = CLIPPER_SCALE * 0.25;
+        co.MiterLimit = 2.0;
+        const clipperPath = scaled.map(p => ({
+          X: Math.round(p.x * CLIPPER_SCALE),
+          Y: Math.round(p.y * CLIPPER_SCALE)
+        }));
+        co.AddPath(clipperPath, ClipperLib.JoinType.jtRound, ClipperLib.EndType.etClosedPolygon);
+        const shrunk: Array<Array<{X: number; Y: number}>> = [];
+        co.Execute(shrunk, -shrinkDist * CLIPPER_SCALE);
+        if (shrunk.length > 0 && shrunk[0].length >= 3) {
+          scaled = shrunk[0].map(p => ({
+            x: p.X / CLIPPER_SCALE,
+            y: p.Y / CLIPPER_SCALE
+          }));
+        } else {
+          continue;
+        }
+      }
+
+      scaled = approxPolyDP(scaled, 0.001);
+      scaled = removeNearDuplicatePoints(scaled, 0.01);
+      scaled = smoothPolyChaikin(scaled, 1, 45);
+
+      if (scaled.length >= 3) {
+        holePaths.push(scaled);
+        console.log('[Worker] Hole contour (normal):', scaled.length, 'pts');
+      }
+    }
+
+    if (holePaths.length > 0) {
+      allPathsInInches = [pathInInches];
+      allPreviewPaths = [smoothedPath.map(p => ({ x: p.x + offsetX, y: p.y + offsetY }))];
+
+      for (const hp of holePaths) {
+        drawHoleCutout(output, canvasWidth, canvasHeight, hp, strokeSettings.color, offsetX, offsetY, effectiveDPI);
+
+        const holeInInches = hp.map(p => ({
+          x: ((p.x - minPathX) / effectiveDPI) + bleedInches,
+          y: pageHeightInches - (((p.y - minPathY) / effectiveDPI) + bleedInches)
+        }));
+        allPathsInInches.push(holeInInches);
+        allPreviewPaths.push(hp.map(p => ({ x: p.x + offsetX, y: p.y + offsetY })));
+      }
+
+      drawImageToData(output, canvasWidth, canvasHeight, imageData, Math.round(imageCanvasX), Math.round(imageCanvasY), ctrMask);
+
+      console.log('[Worker] Include holes: total paths =', allPathsInInches.length, '(1 outer +', holePaths.length, 'holes)');
+    }
+  }
   
   return {
     imageData: new ImageData(output, canvasWidth, canvasHeight),
@@ -822,6 +1197,8 @@ function processContour(
         x: p.x + offsetX,
         y: p.y + offsetY
       })),
+      allPathPoints: allPathsInInches,
+      allPreviewPathPoints: allPreviewPaths,
       widthInches: pageWidthInches,
       heightInches: pageHeightInches,
       imageOffsetX: imageOffsetXCalc,
@@ -831,7 +1208,8 @@ function processContour(
       effectiveDPI,
       minPathX,
       minPathY,
-      bleedInches
+      bleedInches,
+      holePathStartIndex: allPathsInInches && allPathsInInches.length > 1 ? 1 : undefined
     },
     detectedAlgorithm
   };
@@ -1098,7 +1476,8 @@ function pickMainComponent(comps: LabeledComponent[]): LabeledComponent {
 function selectMainComponentWithOrphans(
   mask: Uint8Array, w: number, h: number, effectiveDPI: number,
   minComponentAreaPx: number, keepNearMainDistInches: number, bladeWidthInches: number,
-  faintArtMode: boolean = false
+  faintArtMode: boolean = false,
+  skipMorphClose: boolean = false
 ): Uint8Array {
   const comps = labelComponents(mask, w, h);
   if (comps.length === 0) return new Uint8Array(w * h);
@@ -1321,6 +1700,11 @@ function selectMainComponentWithOrphans(
     'kept=', kept,
     'removed=', removed
   );
+
+  if (skipMorphClose) {
+    console.log('[Worker] Morphological close skipped (zero hero mode)');
+    return outMask;
+  }
 
   const bladeWidthPx = Math.max(0, bladeWidthInches * effectiveDPI);
   let closingRadiusPx = Math.round(bladeWidthPx / 2);
@@ -1598,52 +1982,45 @@ function fillSilhouette(mask: Uint8Array, width: number, height: number): Uint8A
   const filled = new Uint8Array(mask.length);
   filled.set(mask);
   
-  const visited = new Uint8Array(width * height);
-  const queue: number[] = [];
+  const totalPixels = width * height;
+  const visited = new Uint8Array(totalPixels);
+  const queue = new Int32Array(totalPixels);
+  let qHead = 0, qTail = 0;
   
   for (let x = 0; x < width; x++) {
     if (mask[x] === 0 && visited[x] === 0) {
-      queue.push(x);
       visited[x] = 1;
+      queue[qTail++] = x;
     }
     const bottomIdx = (height - 1) * width + x;
     if (mask[bottomIdx] === 0 && visited[bottomIdx] === 0) {
-      queue.push(bottomIdx);
       visited[bottomIdx] = 1;
+      queue[qTail++] = bottomIdx;
     }
   }
   
   for (let y = 0; y < height; y++) {
     const leftIdx = y * width;
     if (mask[leftIdx] === 0 && visited[leftIdx] === 0) {
-      queue.push(leftIdx);
       visited[leftIdx] = 1;
+      queue[qTail++] = leftIdx;
     }
     const rightIdx = y * width + (width - 1);
     if (mask[rightIdx] === 0 && visited[rightIdx] === 0) {
-      queue.push(rightIdx);
       visited[rightIdx] = 1;
+      queue[qTail++] = rightIdx;
     }
   }
   
-  while (queue.length > 0) {
-    const idx = queue.shift()!;
+  while (qHead < qTail) {
+    const idx = queue[qHead++];
     const x = idx % width;
-    const y = Math.floor(idx / width);
+    const y = (idx / width) | 0;
     
-    const neighbors = [
-      y > 0 ? idx - width : -1,
-      y < height - 1 ? idx + width : -1,
-      x > 0 ? idx - 1 : -1,
-      x < width - 1 ? idx + 1 : -1
-    ];
-    
-    for (const nIdx of neighbors) {
-      if (nIdx >= 0 && visited[nIdx] === 0 && mask[nIdx] === 0) {
-        visited[nIdx] = 1;
-        queue.push(nIdx);
-      }
-    }
+    if (y > 0)          { const n = idx - width; if (visited[n] === 0 && mask[n] === 0) { visited[n] = 1; queue[qTail++] = n; } }
+    if (y < height - 1) { const n = idx + width; if (visited[n] === 0 && mask[n] === 0) { visited[n] = 1; queue[qTail++] = n; } }
+    if (x > 0)          { const n = idx - 1;     if (visited[n] === 0 && mask[n] === 0) { visited[n] = 1; queue[qTail++] = n; } }
+    if (x < width - 1)  { const n = idx + 1;     if (visited[n] === 0 && mask[n] === 0) { visited[n] = 1; queue[qTail++] = n; } }
   }
   
   for (let i = 0; i < filled.length; i++) {
@@ -1653,6 +2030,72 @@ function fillSilhouette(mask: Uint8Array, width: number, height: number): Uint8A
   }
   
   return filled;
+}
+
+/**
+ * Detect interior holes in a binary mask.
+ * A hole is a connected background region (value 0) that is NOT connected to
+ * the image border. Returns an array of hole masks, one per hole.
+ */
+function detectHoles(mask: Uint8Array, width: number, height: number): Uint8Array[] {
+  const totalPixels = width * height;
+  const visited = new Uint8Array(totalPixels);
+  const queue = new Int32Array(totalPixels);
+  let qHead = 0, qTail = 0;
+
+  for (let x = 0; x < width; x++) {
+    if (mask[x] === 0 && visited[x] === 0) { visited[x] = 1; queue[qTail++] = x; }
+    const b = (height - 1) * width + x;
+    if (mask[b] === 0 && visited[b] === 0) { visited[b] = 1; queue[qTail++] = b; }
+  }
+  for (let y = 0; y < height; y++) {
+    const l = y * width;
+    if (mask[l] === 0 && visited[l] === 0) { visited[l] = 1; queue[qTail++] = l; }
+    const r = y * width + (width - 1);
+    if (mask[r] === 0 && visited[r] === 0) { visited[r] = 1; queue[qTail++] = r; }
+  }
+  while (qHead < qTail) {
+    const idx = queue[qHead++];
+    const x = idx % width;
+    const y = (idx / width) | 0;
+    if (y > 0)          { const n = idx - width; if (visited[n] === 0 && mask[n] === 0) { visited[n] = 1; queue[qTail++] = n; } }
+    if (y < height - 1) { const n = idx + width; if (visited[n] === 0 && mask[n] === 0) { visited[n] = 1; queue[qTail++] = n; } }
+    if (x > 0)          { const n = idx - 1;     if (visited[n] === 0 && mask[n] === 0) { visited[n] = 1; queue[qTail++] = n; } }
+    if (x < width - 1)  { const n = idx + 1;     if (visited[n] === 0 && mask[n] === 0) { visited[n] = 1; queue[qTail++] = n; } }
+  }
+
+  const holeLabel = new Int32Array(totalPixels);
+  const holes: Uint8Array[] = [];
+  let nextLabel = 1;
+
+  const holeQueue = new Int32Array(totalPixels);
+
+  for (let i = 0; i < mask.length; i++) {
+    if (mask[i] === 0 && visited[i] === 0 && holeLabel[i] === 0) {
+      const holeMask = new Uint8Array(totalPixels);
+      let hqHead = 0, hqTail = 0;
+      holeLabel[i] = nextLabel;
+      holeQueue[hqTail++] = i;
+      let pixelCount = 0;
+      while (hqHead < hqTail) {
+        const idx = holeQueue[hqHead++];
+        holeMask[idx] = 1;
+        pixelCount++;
+        const x = idx % width;
+        const y = (idx / width) | 0;
+        if (y > 0)          { const n = idx - width; if (mask[n] === 0 && visited[n] === 0 && holeLabel[n] === 0) { holeLabel[n] = nextLabel; holeQueue[hqTail++] = n; } }
+        if (y < height - 1) { const n = idx + width; if (mask[n] === 0 && visited[n] === 0 && holeLabel[n] === 0) { holeLabel[n] = nextLabel; holeQueue[hqTail++] = n; } }
+        if (x > 0)          { const n = idx - 1;     if (mask[n] === 0 && visited[n] === 0 && holeLabel[n] === 0) { holeLabel[n] = nextLabel; holeQueue[hqTail++] = n; } }
+        if (x < width - 1)  { const n = idx + 1;     if (mask[n] === 0 && visited[n] === 0 && holeLabel[n] === 0) { holeLabel[n] = nextLabel; holeQueue[hqTail++] = n; } }
+      }
+      if (pixelCount >= 20) {
+        holes.push(holeMask);
+      }
+      nextLabel++;
+    }
+  }
+
+  return holes;
 }
 
 /**
@@ -3626,6 +4069,20 @@ function roundCorners(points: Point[], radius: number): Point[] {
 }
 
 /**
+ * Signed area of a closed polygon (shoelace formula)
+ */
+function polygonArea(points: Point[]): number {
+  if (points.length < 3) return 0;
+  let area = 0;
+  for (let i = 0; i < points.length; i++) {
+    const j = (i + 1) % points.length;
+    area += points[i].x * points[j].y;
+    area -= points[j].x * points[i].y;
+  }
+  return area / 2;
+}
+
+/**
  * Calculate the perimeter (arc length) of a closed polygon
  */
 function calculatePerimeter(points: Point[]): number {
@@ -3680,6 +4137,51 @@ function vectorWeld(path: Point[], radiusPx: number): Point[] {
   }
 
   return longest.map(p => ({ x: p.X / CLIPPER_SCALE, y: p.Y / CLIPPER_SCALE }));
+}
+
+function enforceMinGap(path: Point[], minGapPx: number): Point[] {
+  if (path.length < 3 || minGapPx <= 0) return path;
+
+  const clipperPath = path.map(p => ({
+    X: Math.round(p.x * CLIPPER_SCALE),
+    Y: Math.round(p.y * CLIPPER_SCALE)
+  }));
+
+  const halfGap = Math.round((minGapPx / 2) * CLIPPER_SCALE);
+
+  const co1 = new ClipperLib.ClipperOffset();
+  co1.ArcTolerance = 0.25 * CLIPPER_SCALE;
+  co1.AddPath(clipperPath, ClipperLib.JoinType.jtRound, ClipperLib.EndType.etClosedPolygon);
+  const shrunk: Array<Array<{X: number; Y: number}>> = [];
+  co1.Execute(shrunk, -halfGap);
+
+  if (shrunk.length === 0) return path;
+
+  const co2 = new ClipperLib.ClipperOffset();
+  co2.ArcTolerance = 0.25 * CLIPPER_SCALE;
+  for (const p of shrunk) {
+    co2.AddPath(p, ClipperLib.JoinType.jtRound, ClipperLib.EndType.etClosedPolygon);
+  }
+  const restored: Array<Array<{X: number; Y: number}>> = [];
+  co2.Execute(restored, halfGap);
+
+  if (restored.length === 0) return path;
+
+  let largest = restored[0];
+  let largestArea = Math.abs(ClipperLib.Clipper.Area(restored[0]));
+  for (let i = 1; i < restored.length; i++) {
+    const area = Math.abs(ClipperLib.Clipper.Area(restored[i]));
+    if (area > largestArea) {
+      largestArea = area;
+      largest = restored[i];
+    }
+  }
+
+  const result = largest.map(p => ({ x: p.X / CLIPPER_SCALE, y: p.Y / CLIPPER_SCALE }));
+  if (result.length < 3) return path;
+
+  console.log('[Worker] enforceMinGap: minGap', minGapPx.toFixed(1), 'px, input', path.length, 'pts -> output', result.length, 'pts');
+  return result;
 }
 
 function approxPolyDP(points: Point[], epsilonFactor: number = 0.001): Point[] {
@@ -4516,21 +5018,13 @@ function drawContourToData(
   backgroundColorHex: string, 
   offsetX: number, 
   offsetY: number,
-  effectiveDPI: number
+  effectiveDPI: number,
+  isPreview?: boolean
 ): void {
-  // Parse background color - default to white if undefined
   const bgColorHex = backgroundColorHex || '#ffffff';
   
-  // CRITICAL: Use exact same bleed calculation as PDF export
-  // The bleed must be 0.10 inches regardless of preview DPI
-  const bleedInches = 0.10;
-  
-  // The path is in pixel coordinates at effectiveDPI scale
-  // bleedPixels must be relative to the same scale
+  const bleedInches = isPreview ? 0.02 : 0.10;
   const bleedPixels = Math.round(bleedInches * effectiveDPI);
-  
-  // Debug: log values to console
-  console.log('[drawContourToData] effectiveDPI:', effectiveDPI, 'bleedPixels:', bleedPixels, 'lineWidth:', bleedPixels * 2, 'canvasSize:', width, 'x', height);
   
   // Use the same path for bleed that PDF uses (no gap closing modification)
   // PDF export uses the smoothed path directly without modification
@@ -4579,10 +5073,15 @@ function drawContourToData(
       ctx.stroke();
     }
     
-    // Copy canvas data to output
+    // Composite canvas data onto output (preserve previously drawn paths)
     const imageData = ctx.getImageData(0, 0, width, height);
-    for (let i = 0; i < imageData.data.length; i++) {
-      output[i] = imageData.data[i];
+    for (let i = 0; i < imageData.data.length; i += 4) {
+      if (imageData.data[i + 3] > 0) {
+        output[i]     = imageData.data[i];
+        output[i + 1] = imageData.data[i + 1];
+        output[i + 2] = imageData.data[i + 2];
+        output[i + 3] = imageData.data[i + 3];
+      }
     }
   } else {
     // Fallback to manual rendering if OffscreenCanvas not available
@@ -4612,6 +5111,61 @@ function drawContourToData(
   }
 }
 
+/**
+ * Draw a hole cutout: erase the hole interior (make transparent) and draw the cut line.
+ * Uses OffscreenCanvas with destination-out composite to punch through the background.
+ */
+function drawHoleCutout(
+  output: Uint8ClampedArray,
+  width: number,
+  height: number,
+  path: Point[],
+  strokeColorHex: string,
+  offsetX: number,
+  offsetY: number,
+  effectiveDPI: number
+): void {
+  if (path.length < 3) return;
+
+  const offscreen = new OffscreenCanvas(width, height);
+  const ctx = offscreen.getContext('2d');
+  if (!ctx) return;
+
+  // Copy current output to the offscreen canvas
+  const existingData = new ImageData(new Uint8ClampedArray(output), width, height);
+  ctx.putImageData(existingData, 0, 0);
+
+  // Erase the hole interior using destination-out
+  ctx.globalCompositeOperation = 'destination-out';
+  ctx.fillStyle = 'rgba(0,0,0,1)';
+  ctx.beginPath();
+  ctx.moveTo(path[0].x + offsetX, path[0].y + offsetY);
+  for (let i = 1; i < path.length; i++) {
+    ctx.lineTo(path[i].x + offsetX, path[i].y + offsetY);
+  }
+  ctx.closePath();
+  ctx.fill();
+
+  // Draw cut line on top
+  ctx.globalCompositeOperation = 'source-over';
+  const cutLineWidth = Math.max(2, Math.round(0.01 * effectiveDPI));
+  ctx.strokeStyle = strokeColorHex;
+  ctx.lineWidth = cutLineWidth;
+  ctx.lineJoin = 'round';
+  ctx.lineCap = 'round';
+  ctx.beginPath();
+  ctx.moveTo(path[0].x + offsetX, path[0].y + offsetY);
+  for (let i = 1; i < path.length; i++) {
+    ctx.lineTo(path[i].x + offsetX, path[i].y + offsetY);
+  }
+  ctx.closePath();
+  ctx.stroke();
+
+  // Copy back to output
+  const result = ctx.getImageData(0, 0, width, height);
+  output.set(result.data);
+}
+
 // Draw contour with edge-extended background (uses nearest edge colors for bleed)
 function drawContourToDataWithExtendedEdge(
   output: Uint8ClampedArray, 
@@ -4624,9 +5178,10 @@ function drawContourToDataWithExtendedEdge(
   effectiveDPI: number,
   extendedImage: ImageData,
   extendedImageOffsetX: number,
-  extendedImageOffsetY: number
+  extendedImageOffsetY: number,
+  isPreview?: boolean
 ): void {
-  const bleedInches = 0.10;
+  const bleedInches = isPreview ? 0.02 : 0.10;
   const bleedPixels = Math.round(bleedInches * effectiveDPI);
   
   const offscreen = new OffscreenCanvas(width, height);
@@ -4681,10 +5236,15 @@ function drawContourToDataWithExtendedEdge(
       ctx.stroke();
     }
     
-    // Copy canvas data to output
+    // Composite canvas data onto output (preserve previously drawn paths)
     const imageData = ctx.getImageData(0, 0, width, height);
-    for (let i = 0; i < imageData.data.length; i++) {
-      output[i] = imageData.data[i];
+    for (let i = 0; i < imageData.data.length; i += 4) {
+      if (imageData.data[i + 3] > 0) {
+        output[i]     = imageData.data[i];
+        output[i + 1] = imageData.data[i + 1];
+        output[i + 2] = imageData.data[i + 2];
+        output[i + 3] = imageData.data[i + 3];
+      }
     }
   }
 }
@@ -5092,13 +5652,67 @@ function createEdgeExtendedImage(
   return new ImageData(newData, newWidth, newHeight);
 }
 
+function buildContourMask(
+  width: number,
+  height: number,
+  paths: Point[][],
+  offsetX: number,
+  offsetY: number,
+  bleedPixels: number
+): Uint8Array {
+  const mask = new Uint8Array(width * height);
+  const offscreen = new OffscreenCanvas(width, height);
+  const ctx = offscreen.getContext('2d');
+  if (!ctx) return mask;
+  ctx.fillStyle = 'white';
+  ctx.strokeStyle = 'white';
+  ctx.lineWidth = bleedPixels * 2;
+  ctx.lineJoin = 'round';
+  ctx.lineCap = 'round';
+  for (const path of paths) {
+    if (path.length < 3) continue;
+    ctx.beginPath();
+    ctx.moveTo(path[0].x + offsetX, path[0].y + offsetY);
+    for (let i = 1; i < path.length; i++) {
+      ctx.lineTo(path[i].x + offsetX, path[i].y + offsetY);
+    }
+    ctx.closePath();
+    ctx.stroke();
+    ctx.fill();
+  }
+  const id = ctx.getImageData(0, 0, width, height);
+  for (let i = 0; i < mask.length; i++) {
+    mask[i] = id.data[i * 4 + 3] > 0 ? 1 : 0;
+  }
+  return mask;
+}
+
+function applyMaskToOutput(
+  output: Uint8ClampedArray,
+  width: number,
+  height: number,
+  mask: Uint8Array
+): void {
+  const len = width * height;
+  for (let i = 0; i < len; i++) {
+    if (mask[i] === 0) {
+      const idx = i * 4;
+      output[idx] = 0;
+      output[idx + 1] = 0;
+      output[idx + 2] = 0;
+      output[idx + 3] = 0;
+    }
+  }
+}
+
 function drawImageToData(
   output: Uint8ClampedArray,
   outputWidth: number,
   outputHeight: number,
   imageData: ImageData,
   offsetX: number,
-  offsetY: number
+  offsetY: number,
+  contourMask?: Uint8Array
 ): void {
   const srcData = imageData.data;
   const srcWidth = imageData.width;
@@ -5114,6 +5728,7 @@ function drawImageToData(
         const destY = y + offsetY;
         
         if (destX >= 0 && destX < outputWidth && destY >= 0 && destY < outputHeight) {
+          if (contourMask && contourMask[destY * outputWidth + destX] === 0) continue;
           const destIdx = (destY * outputWidth + destX) * 4;
           
           if (alpha === 255) {

@@ -30,6 +30,7 @@ export interface StrokeSettings {
   autoBridging: boolean;
   autoBridgingThreshold: number;
   contourMode?: ContourMode;
+  includeHoles?: boolean;
 }
 
 export type StrokeMode = 'none' | 'contour' | 'shape';
@@ -52,6 +53,12 @@ export interface ShapeSettings {
   cornerRadius?: number;
   bleedEnabled?: boolean;
   bleedColor?: string;
+  imageOffsetX?: number;
+  imageOffsetY?: number;
+  imageScale?: number;
+  shapeWidthOverride?: number;
+  shapeHeightOverride?: number;
+  lockShapeAspect?: boolean;
 }
 
 export type CutlineVisibility = 'thin' | 'normal' | 'bold';
@@ -105,6 +112,8 @@ export interface LockedContour {
   label: string;
   pathPoints: Array<{x: number; y: number}>;
   previewPathPoints: Array<{x: number; y: number}>;
+  allPathPoints?: Array<Array<{x: number; y: number}>>;
+  allPreviewPathPoints?: Array<Array<{x: number; y: number}>>;
   widthInches: number;
   heightInches: number;
   imageOffsetX: number;
