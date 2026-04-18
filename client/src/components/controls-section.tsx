@@ -610,7 +610,8 @@ export default function ControlsSection({
                   <button
                     onClick={() => {
                       if (strokeSettings.enabled) {
-                        setContourPanelOpen(prev => !prev);
+                        onStrokeChange({ enabled: false });
+                        setContourPanelOpen(false);
                       } else {
                         onShapeChange({ enabled: false });
                         onStrokeChange({ enabled: true });
@@ -629,7 +630,8 @@ export default function ControlsSection({
                   <button
                     onClick={() => {
                       if (shapeSettings.enabled) {
-                        setShapePanelOpen(prev => !prev);
+                        onShapeChange({ enabled: false });
+                        setShapePanelOpen(false);
                       } else {
                         onStrokeChange({ enabled: false });
                         onShapeChange({ enabled: true });
