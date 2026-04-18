@@ -582,9 +582,13 @@ const PreviewSection = forwardRef<HTMLCanvasElement, PreviewSectionProps>(
         contourDebounceRef.current = null;
       }
       
-      if (!imageInfo || !strokeSettings.enabled || shapeSettings.enabled) {
+      if (!imageInfo) {
         contourCacheRef.current = null;
         contourTransformRef.current = null;
+        return;
+      }
+
+      if (!strokeSettings.enabled || shapeSettings.enabled) {
         return;
       }
 
