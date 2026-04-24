@@ -1,5 +1,10 @@
 import { PDFDocument, PDFName, PDFDict, PDFArray } from 'pdf-lib';
-import { contourPointsToPDFPathOps, type CachedContourData } from './contour-outline';
+import {
+  contourPointsToPDFPathOps,
+  bezierPathToPDFPathOps,
+  type CachedContourData,
+} from './contour-outline';
+import type { BezierPath } from './contour-worker-manager';
 import type { ResizeSettings, StrokeSettings, ShapeSettings } from './types';
 
 const MAX_CANVAS_DIM = 16384;
@@ -72,9 +77,44 @@ export const DEFAULT_GANG_SHEET_SETTINGS: GangSheetSettings = {
   edgePadding: 0.25,
 };
 
-// ─── Shelf-based bin packer ───
+// ─── Bin packer ───
+/** Hard cap so pathological quantities cannot freeze the tab (each copy is one pack entry). */
+export const MAX_GANG_SHEET_USER_QUANTITY = 100_000;
 
-const MAX_GANG_SHEET_COPIES = 500;
+/** Theoretical grid count for one w×h sticker on an empty sheet (upper bound for search / caps). */
+function gridPlacementUpperBound(
+  usableW: number,
+  usableH: number,
+  gap: number,
+  w: number,
+  h: number
+): number {
+  if (usableW <= 0 || usableH <= 0 || w <= 0 || h <= 0) return 0;
+  const ew = w + gap;
+  const eh = h + gap;
+  const cols = Math.floor((usableW + gap) / ew);
+  const rows = Math.floor((usableH + gap) / eh);
+  return Math.max(0, cols * rows);
+}
+
+/** Clamp gang sheet line quantity to a safe integer (avoids string concat bugs from `<input type="number">`). */
+export function clampGangSheetQuantity(q: unknown): number {
+  const n = Math.floor(Number(q));
+  if (!Number.isFinite(n) || n < 1) return 1;
+  return Math.min(n, MAX_GANG_SHEET_USER_QUANTITY);
+}
+
+function containsRect(
+  outer: { x: number; y: number; w: number; h: number },
+  inner: { x: number; y: number; w: number; h: number }
+): boolean {
+  return (
+    inner.x >= outer.x &&
+    inner.y >= outer.y &&
+    inner.x + inner.w <= outer.x + outer.w &&
+    inner.y + inner.h <= outer.y + outer.h
+  );
+}
 
 export function packGangSheet(
   items: GangSheetItem[],
@@ -100,7 +140,7 @@ export function packGangSheet(
   const buildEntries = (rotate: boolean): { entries: Entry[]; isRotated: boolean } => {
     const out: Entry[] = [];
     for (const item of items) {
-      const qty = Math.min(Math.max(1, item.quantity), MAX_GANG_SHEET_COPIES);
+      const qty = clampGangSheetQuantity(item.quantity);
       const origW = item.contourData.widthInches;
       const origH = item.contourData.heightInches;
       if (origW <= 0 || origH <= 0) continue;
@@ -114,40 +154,133 @@ export function packGangSheet(
     return { entries: out, isRotated: rotate };
   };
 
-  const shelfPack = (data: { entries: Entry[]; isRotated: boolean }): { placements: PlacedItem[]; overflow: number } => {
+  /**
+   * Optimal tiling when every sticker has the same footprint (any number of line items / SKUs).
+   * The guillotine heuristic can stop far short of this for many identical copies.
+   */
+  const homogeneousGridPack = (data: { entries: Entry[]; isRotated: boolean }): { placements: PlacedItem[]; overflow: number } | null => {
+    const { entries } = data;
+    if (entries.length === 0) return { placements: [], overflow: 0 };
+    const w0 = entries[0].w;
+    const h0 = entries[0].h;
+    if (!entries.every((e) => e.w === w0 && e.h === h0)) return null;
+
+    const ew = w0 + gap;
+    const eh = h0 + gap;
+    const cols = Math.floor((usableWidth + gap) / ew);
+    const rows = Math.floor((usableHeight + gap) / eh);
+    const maxCells = Math.max(0, cols * rows);
+    const placedCount = Math.min(entries.length, maxCells);
     const placements: PlacedItem[] = [];
-    let cursorX = 0;
-    let cursorY = 0;
-    let shelfH = 0;
+    for (let idx = 0; idx < placedCount; idx++) {
+      const col = idx % cols;
+      const row = Math.floor(idx / cols);
+      const e = entries[idx];
+      placements.push({
+        itemId: e.itemId,
+        instanceIndex: e.instanceIndex,
+        x: edgePadding + col * ew,
+        y: edgePadding + row * eh,
+        width: w0,
+        height: h0,
+        rotated: data.isRotated,
+      });
+    }
+    return { placements, overflow: entries.length - placedCount };
+  };
+
+  /** Guillotine BL pack with gap between stickers (same spacing model as the old shelf packer). */
+  const guillotinePack = (data: { entries: Entry[]; isRotated: boolean }): { placements: PlacedItem[]; overflow: number } => {
+    const binW = usableWidth + gap;
+    const binH = usableHeight + gap;
+    interface FreeRect {
+      x: number;
+      y: number;
+      w: number;
+      h: number;
+    }
+    const freeRects: FreeRect[] = [{ x: 0, y: 0, w: binW, h: binH }];
+    const placements: PlacedItem[] = [];
     let overflow = 0;
 
-    for (const entry of data.entries) {
-      if (cursorX + entry.w > usableWidth) {
-        cursorX = 0;
-        cursorY += shelfH + gap;
-        shelfH = 0;
+    const pruneFreeList = () => {
+      for (let i = 0; i < freeRects.length; i++) {
+        for (let j = i + 1; j < freeRects.length; j++) {
+          const a = freeRects[i];
+          const b = freeRects[j];
+          const ai = containsRect(a, b);
+          const bi = containsRect(b, a);
+          if (ai) {
+            freeRects.splice(j, 1);
+            j--;
+          } else if (bi) {
+            freeRects.splice(i, 1);
+            i--;
+            break;
+          }
+        }
       }
-      if (cursorY + entry.h > usableHeight) {
+    };
+
+    for (const entry of data.entries) {
+      const ew = entry.w + gap;
+      const eh = entry.h + gap;
+      let bestIdx = -1;
+      let bestShort = Infinity;
+
+      for (let i = 0; i < freeRects.length; i++) {
+        const fr = freeRects[i];
+        if (ew <= fr.w && eh <= fr.h) {
+          const leftoverW = fr.w - ew;
+          const leftoverH = fr.h - eh;
+          const shortSide = Math.min(leftoverW, leftoverH);
+          if (shortSide < bestShort) {
+            bestShort = shortSide;
+            bestIdx = i;
+          }
+        }
+      }
+
+      if (bestIdx < 0) {
         overflow++;
         continue;
       }
+
+      const fr = freeRects[bestIdx];
+      const x = fr.x;
+      const y = fr.y;
+      freeRects.splice(bestIdx, 1);
+
       placements.push({
         itemId: entry.itemId,
         instanceIndex: entry.instanceIndex,
-        x: edgePadding + cursorX,
-        y: edgePadding + cursorY,
+        x: edgePadding + x,
+        y: edgePadding + y,
         width: entry.w,
         height: entry.h,
         rotated: data.isRotated,
       });
-      shelfH = Math.max(shelfH, entry.h);
-      cursorX += entry.w + gap;
+
+      if (fr.h - eh > 0) {
+        freeRects.push({ x: fr.x, y: fr.y + eh, w: fr.w, h: fr.h - eh });
+      }
+      if (fr.w - ew > 0) {
+        freeRects.push({ x: fr.x + ew, y: fr.y, w: fr.w - ew, h: eh });
+      }
+
+      pruneFreeList();
     }
+
     return { placements, overflow };
   };
 
-  const normalResult = shelfPack(buildEntries(false));
-  const rotatedResult = shelfPack(buildEntries(true));
+  const packOriented = (data: { entries: Entry[]; isRotated: boolean }) => {
+    const grid = homogeneousGridPack(data);
+    return grid ?? guillotinePack(data);
+  };
+
+  const normalResult = packOriented(buildEntries(false));
+  const rotatedResult = packOriented(buildEntries(true));
 
   const best = rotatedResult.placements.length > normalResult.placements.length
     ? rotatedResult : normalResult;
@@ -157,6 +290,42 @@ export function packGangSheet(
   const utilization = totalArea > 0 ? usedArea / totalArea : 0;
 
   return { placements: best.placements, overflow: best.overflow, utilization };
+}
+
+/** Largest quantity for `itemId` that packs with zero overflow (others keep their current quantities). */
+export function maxQuantityForItem(
+  items: GangSheetItem[],
+  settings: GangSheetSettings,
+  itemId: string,
+  hiCap: number = MAX_GANG_SHEET_USER_QUANTITY
+): number {
+  const { sheetWidth, sheetHeight, gap, edgePadding } = settings;
+  const usableW = sheetWidth - edgePadding * 2;
+  const usableH = sheetHeight - edgePadding * 2;
+  const target = items.find((i) => i.id === itemId);
+  if (!target) return 1;
+  const w0 = target.contourData.widthInches;
+  const h0 = target.contourData.heightInches;
+  const soloGrid = Math.max(
+    gridPlacementUpperBound(usableW, usableH, gap, w0, h0),
+    gridPlacementUpperBound(usableW, usableH, gap, h0, w0)
+  );
+  const sumOtherQty = items
+    .filter((i) => i.id !== itemId)
+    .reduce((s, i) => s + clampGangSheetQuantity(i.quantity), 0);
+  const derivedHi = Math.max(1, soloGrid + sumOtherQty + 64);
+  const mk = (q: number) =>
+    items.map((i) => (i.id === itemId ? { ...i, quantity: q } : i));
+  let lo = 1;
+  let hi = Math.max(1, Math.min(hiCap, derivedHi, MAX_GANG_SHEET_USER_QUANTITY));
+  while (lo < hi) {
+    const mid = Math.ceil((lo + hi) / 2);
+    const pack = packGangSheet(mk(mid), settings);
+    if (pack.overflow === 0) lo = mid;
+    else hi = mid - 1;
+  }
+  while (lo > 1 && packGangSheet(mk(lo), settings).overflow > 0) lo--;
+  return Math.max(1, lo);
 }
 
 // ─── Coordinate transform ───
@@ -193,6 +362,49 @@ function remapPathToSheet(
   });
 }
 
+// Remap a Bezier path the same way `remapPathToSheet` remaps a polyline:
+// transform every anchor and every control point. Anchors and control points
+// share the same coordinate space (item-local PDF inches), so the same affine
+// transform applies. Used by the gang-sheet Zero Hero export so smooth curves
+// survive the placement transform.
+function remapBezierPathToSheet(
+  bp: BezierPath,
+  itemWidthInches: number,
+  itemHeightInches: number,
+  placementX: number,
+  placementY: number,
+  sheetHeightInches: number,
+  rotated: boolean,
+  isShape: boolean
+): BezierPath {
+  const tx = (p: { x: number; y: number }): { x: number; y: number } => {
+    let sx: number, sy: number;
+    if (rotated) {
+      if (isShape) {
+        sx = placementX + p.y;
+        sy = sheetHeightInches - (placementY + (itemWidthInches - p.x));
+      } else {
+        sx = placementX + (itemHeightInches - p.y);
+        sy = sheetHeightInches - (placementY + p.x);
+      }
+    } else {
+      const localY = isShape ? p.y : (itemHeightInches - p.y);
+      sx = placementX + p.x;
+      sy = sheetHeightInches - (placementY + localY);
+    }
+    return { x: sx, y: sy };
+  };
+  return {
+    start: tx(bp.start),
+    segments: bp.segments.map(seg =>
+      seg.type === 'line'
+        ? { type: 'line', to: tx(seg.to) }
+        : { type: 'cubic', cp1: tx(seg.cp1), cp2: tx(seg.cp2), to: tx(seg.to) }
+    ),
+    closed: true,
+  };
+}
+
 // ─── Gang Sheet PDF Export ───
 
 export async function downloadGangSheetPDF(
@@ -222,13 +434,13 @@ export async function downloadGangSheetPDF(
   const bgCanvas = document.createElement('canvas');
   bgCanvas.width = bgClamped.w;
   bgCanvas.height = bgClamped.h;
-  const bgCtx = bgCanvas.getContext('2d');
+  const bgCtx = bgCanvas.getContext('2d', { alpha: true });
   if (!bgCtx) throw new Error('Failed to create background canvas context');
 
   const effectiveBgDPI = bgDPI * bgClamped.scale;
 
-  bgCtx.fillStyle = '#ffffff';
-  bgCtx.fillRect(0, 0, bgCanvas.width, bgCanvas.height);
+  // Transparent sheet; only sticker fills/bleeds are painted (gaps stay clear in the PNG alpha).
+  bgCtx.clearRect(0, 0, bgCanvas.width, bgCanvas.height);
 
   for (const placement of placements) {
     const item = itemMap.get(placement.itemId);
@@ -314,8 +526,9 @@ export async function downloadGangSheetPDF(
   const flippedBg = document.createElement('canvas');
   flippedBg.width = bgCanvas.width;
   flippedBg.height = bgCanvas.height;
-  const flippedCtx = flippedBg.getContext('2d');
+  const flippedCtx = flippedBg.getContext('2d', { alpha: true });
   if (!flippedCtx) throw new Error('Failed to create flipped background canvas context');
+  flippedCtx.clearRect(0, 0, flippedBg.width, flippedBg.height);
   flippedCtx.translate(0, bgCanvas.height);
   flippedCtx.scale(1, -1);
   flippedCtx.drawImage(bgCanvas, 0, 0);
@@ -511,19 +724,41 @@ export async function downloadGangSheetPDF(
     if (!item) continue;
     const { contourData } = item;
     const label = item.cutContourLabel;
-    const paths = contourData.allPathPoints && contourData.allPathPoints.length > 0
-      ? contourData.allPathPoints
-      : [contourData.pathPoints];
-
     const isShapeCut = !!item.shapeSettings?.enabled;
-    for (const path of paths) {
-      const remapped = remapPathToSheet(
-        path, contourData.widthInches, contourData.heightInches,
-        placement.x, placement.y, sheetHeight,
-        !!placement.rotated, isShapeCut
-      );
+    // Zero Hero items have `strokeSettings.width === 0` AND carry the
+    // `allBezierPaths` field produced by the corner-aware Bezier
+    // reconstruction in the worker. When present, we emit those directly
+    // as smooth `c` operators (preview-≡-PDF parity); otherwise fall
+    // back to the polyline emit path.
+    const isZeroHero = item.strokeSettings.width === 0;
+    const useBezier = isZeroHero
+      && contourData.allBezierPaths
+      && contourData.allBezierPaths.length > 0;
 
-      allPathOps += contourPointsToPDFPathOps(remapped, sheetHeight, label);
+    if (useBezier) {
+      for (const bp of contourData.allBezierPaths!) {
+        const remappedBp = remapBezierPathToSheet(
+          bp, contourData.widthInches, contourData.heightInches,
+          placement.x, placement.y, sheetHeight,
+          !!placement.rotated, isShapeCut
+        );
+        allPathOps += bezierPathToPDFPathOps(remappedBp, sheetHeight, label);
+      }
+    } else {
+      const paths = contourData.allPathPoints && contourData.allPathPoints.length > 0
+        ? contourData.allPathPoints
+        : [contourData.pathPoints];
+      for (const path of paths) {
+        const remapped = remapPathToSheet(
+          path, contourData.widthInches, contourData.heightInches,
+          placement.x, placement.y, sheetHeight,
+          !!placement.rotated, isShapeCut
+        );
+        // Zero Hero polyline fallback (no bezier data available): disable
+        // Catmull-Rom spline smoothing so the cut path matches the preview
+        // exactly. Same convention as `downloadContourPDF` in contour-outline.
+        allPathOps += contourPointsToPDFPathOps(remapped, sheetHeight, label, isZeroHero);
+      }
     }
   }
 

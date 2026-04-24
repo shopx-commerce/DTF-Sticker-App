@@ -35,11 +35,41 @@ function downsampleImage(image: HTMLImageElement): { canvas: HTMLCanvasElement; 
 export type DetectedAlgorithm = 'complex' | 'scattered';
 export type ContourMode = 'smooth' | 'scattered';
 
+// ─── Bezier-curve cut-path representation (Zero Hero only) ──────────────────
+// Mirrors the shape declared inside the worker. Kept here because the
+// download/PDF emit path lives in the main thread and consumes this data via
+// `getCachedContourData()`.
+
+export interface BezierLineSegment {
+  type: 'line';
+  to: { x: number; y: number };
+}
+
+export interface BezierCubicSegment {
+  type: 'cubic';
+  cp1: { x: number; y: number };
+  cp2: { x: number; y: number };
+  to: { x: number; y: number };
+}
+
+export type BezierSegment = BezierLineSegment | BezierCubicSegment;
+
+export interface BezierPath {
+  start: { x: number; y: number };
+  segments: BezierSegment[];
+  closed: true;
+}
+
 export interface ContourData {
   pathPoints: Array<{x: number; y: number}>;
   previewPathPoints: Array<{x: number; y: number}>;
   allPathPoints?: Array<Array<{x: number; y: number}>>;
   allPreviewPathPoints?: Array<Array<{x: number; y: number}>>;
+  // Smooth-curve cut-path representation. When present (Zero Hero mode), the
+  // PDF emitter prefers these over the polyline `allPathPoints` so curves
+  // are rendered as cubic Beziers instead of polygonal chords.
+  allBezierPaths?: BezierPath[];
+  allBezierPathsPreview?: BezierPath[];
   widthInches: number;
   heightInches: number;
   imageOffsetX: number;
@@ -166,8 +196,12 @@ class ContourWorkerManager {
     this.isProcessing = false;
     this.pendingRequest = null;
     this.currentRequest = null;
+    // Critical: invalidate the manager-level result cache too. Otherwise the
+    // next process() call would short-circuit and return the previous
+    // worker's result (computed with the old code), defeating the HMR update.
+    this.clearCache();
     this.initWorker();
-    console.log('[ContourWorker] Worker recreated for code update');
+    console.log('[ContourWorker] Worker recreated for code update (cache cleared)');
   }
 
   private handleMessage(e: MessageEvent<WorkerResponse>) {

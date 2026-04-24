@@ -1,7 +1,7 @@
 import type { StrokeSettings, ResizeSettings } from "@/lib/types";
 import { PDFDocument, PDFName, PDFArray, PDFDict } from 'pdf-lib';
 import { removeLoopsWithClipper, ensureClockwise, detectSelfIntersections, gaussianSmoothContour, subsamplePolygon, polygonToSplinePath } from "@/lib/clipper-path";
-import { getContourWorkerManager } from "@/lib/contour-worker-manager";
+import { getContourWorkerManager, type BezierPath } from "@/lib/contour-worker-manager";
 import { addSpotColorVectorsToPDF } from "@/lib/spot-color-vectors";
 
 export function simplifyPathForPDF(points: Array<{x: number; y: number}>, epsilon: number = 1.0): Array<{x: number; y: number}> {
@@ -134,14 +134,44 @@ export function buildSmoothPdfPath(
 export function contourPointsToPDFPathOps(
   pathPointsInches: Array<{x: number; y: number}>,
   pageHeightInches: number,
-  spotColorName: string = 'CutContour'
+  spotColorName: string = 'CutContour',
+  disableSplines: boolean = false
 ): string {
-  console.log(`[PDF ${spotColorName}] Using ${pathPointsInches.length} points`);
+  console.log(`[PDF ${spotColorName}] Using ${pathPointsInches.length} points${disableSplines ? ' (splines disabled)' : ''}`);
   console.log(`[PDF ${spotColorName}] Page height: ${pageHeightInches.toFixed(3)}in`);
 
   if (pathPointsInches.length < 2) {
     console.warn(`[PDF ${spotColorName}] Too few points, skipping`);
     return '';
+  }
+
+  // Defensive sliver guard: drop degenerate paths that would render as a long straight
+  // diagonal cut line (typically an artifact of de-self-intersecting a smoothed ring).
+  if (pathPointsInches.length >= 3) {
+    let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
+    let signedArea2 = 0;
+    const n = pathPointsInches.length;
+    for (let i = 0; i < n; i++) {
+      const p = pathPointsInches[i];
+      const q = pathPointsInches[(i + 1) % n];
+      signedArea2 += p.x * q.y - q.x * p.y;
+      if (p.x < minX) minX = p.x;
+      if (p.x > maxX) maxX = p.x;
+      if (p.y < minY) minY = p.y;
+      if (p.y > maxY) maxY = p.y;
+    }
+    const area = Math.abs(signedArea2) / 2; // square inches
+    const bw = Math.max(1e-4, maxX - minX);
+    const bh = Math.max(1e-4, maxY - minY);
+    const density = area / (bw * bh);
+    // 0.0004 in² ≈ 0.02"x0.02" — anything under this is noise / sliver.
+    // density < 5% means the polygon is essentially a line.
+    if (area < 0.0004 || density < 0.05) {
+      console.warn(
+        `[PDF ${spotColorName}] Skipping sliver path: area=${area.toFixed(5)}in², density=${density.toFixed(3)}, pts=${n}`
+      );
+      return '';
+    }
   }
 
   let pathOps = 'q\n';
@@ -153,7 +183,10 @@ export function contourPointsToPDFPathOps(
   // Geometric shape paths (rectangle=4, square=4) have very few points;
   // spline interpolation would curve their straight edges.
   // Only use splines for paths dense enough to benefit from smoothing.
-  const useSplines = pts.length >= 16;
+  // Zero Hero paths are pixel-locked, sub-pixel-precise, and already smoothed
+  // upstream — splining them re-rounds sharp corners and shifts edges off the
+  // tracing the user sees in the preview, so callers can opt out.
+  const useSplines = !disableSplines && pts.length >= 16;
 
   if (useSplines) {
     const n = pts.length;
@@ -208,6 +241,104 @@ export function contourPointsToPDFPathOps(
   pathOps += 'S\n';
   pathOps += 'Q\n';
 
+  return pathOps;
+}
+
+// Emit PDF content-stream operators for a single closed BezierPath.
+//
+// Coordinate space: input path is in INCHES in the PDF coord system (Y already
+// flipped). We multiply by 72 to convert to points and emit:
+//   m  — moveto
+//   l  — lineto      (for `line` segments)
+//   c  — cubic curve (for `cubic` segments — control points and endpoint)
+//   h  — close
+//   S  — stroke
+//
+// Sliver guard mirrors `contourPointsToPDFPathOps`: we sample the path back
+// to a polyline and apply the same area/density check so a degenerate fit
+// can't sneak through and render as a long diagonal line.
+export function bezierPathToPDFPathOps(
+  path: BezierPath,
+  pageHeightInches: number,
+  spotColorName: string = 'CutContour'
+): string {
+  if (path.segments.length < 2) {
+    console.warn(`[PDF ${spotColorName}] BezierPath too short, skipping`);
+    return '';
+  }
+
+  // Sliver guard — sample the path to a polyline (cheap; cubic = 6 samples)
+  // and apply the same area/density check that `contourPointsToPDFPathOps` uses.
+  {
+    const samples: Array<{ x: number; y: number }> = [];
+    samples.push({ x: path.start.x, y: path.start.y });
+    let cur = path.start;
+    for (const seg of path.segments) {
+      if (seg.type === 'line') {
+        samples.push({ x: seg.to.x, y: seg.to.y });
+        cur = seg.to;
+      } else {
+        for (let i = 1; i <= 6; i++) {
+          const t = i / 6;
+          const u = 1 - t;
+          const uu = u * u, tt = t * t;
+          const uuu = uu * u, ttt = tt * t;
+          samples.push({
+            x: uuu * cur.x + 3 * uu * t * seg.cp1.x + 3 * u * tt * seg.cp2.x + ttt * seg.to.x,
+            y: uuu * cur.y + 3 * uu * t * seg.cp1.y + 3 * u * tt * seg.cp2.y + ttt * seg.to.y,
+          });
+        }
+        cur = seg.to;
+      }
+    }
+    let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
+    let signedArea2 = 0;
+    const n = samples.length;
+    for (let i = 0; i < n; i++) {
+      const p = samples[i];
+      const q = samples[(i + 1) % n];
+      signedArea2 += p.x * q.y - q.x * p.y;
+      if (p.x < minX) minX = p.x; if (p.x > maxX) maxX = p.x;
+      if (p.y < minY) minY = p.y; if (p.y > maxY) maxY = p.y;
+    }
+    const area = Math.abs(signedArea2) / 2;
+    const bw = Math.max(1e-4, maxX - minX);
+    const bh = Math.max(1e-4, maxY - minY);
+    const density = area / (bw * bh);
+    if (area < 0.0004 || density < 0.05) {
+      console.warn(
+        `[PDF ${spotColorName}] Skipping sliver bezier path: area=${area.toFixed(5)}in², density=${density.toFixed(3)}, segs=${path.segments.length}`
+      );
+      return '';
+    }
+  }
+
+  let pathOps = 'q\n';
+  pathOps += `/${spotColorName} CS 1 SCN\n`;
+  pathOps += '0.5 w\n';
+
+  const sx = (v: number) => (v * 72).toFixed(4);
+
+  // Move to start.
+  pathOps += `${sx(path.start.x)} ${sx(path.start.y)} m\n`;
+  let lineCount = 0;
+  let cubicCount = 0;
+  for (const seg of path.segments) {
+    if (seg.type === 'line') {
+      pathOps += `${sx(seg.to.x)} ${sx(seg.to.y)} l\n`;
+      lineCount++;
+    } else {
+      pathOps += `${sx(seg.cp1.x)} ${sx(seg.cp1.y)} ${sx(seg.cp2.x)} ${sx(seg.cp2.y)} ${sx(seg.to.x)} ${sx(seg.to.y)} c\n`;
+      cubicCount++;
+    }
+  }
+  pathOps += 'h\n';
+  pathOps += 'S\n';
+  pathOps += 'Q\n';
+
+  console.log(
+    `[PDF ${spotColorName}] Emitted bezier path: ${path.segments.length} segments (${lineCount} line + ${cubicCount} cubic)`
+  );
   return pathOps;
 }
 
@@ -1810,6 +1941,10 @@ export interface CachedContourData {
   previewPathPoints: Array<{x: number; y: number}>;
   allPathPoints?: Array<Array<{x: number; y: number}>>;
   allPreviewPathPoints?: Array<Array<{x: number; y: number}>>;
+  // Smooth-curve cut path (Zero Hero only). When present, the PDF emit path
+  // prefers these over `allPathPoints` so curves render as cubic Beziers.
+  allBezierPaths?: BezierPath[];
+  allBezierPathsPreview?: BezierPath[];
   widthInches: number;
   heightInches: number;
   imageOffsetX: number;
@@ -1862,6 +1997,7 @@ export async function downloadContourPDF(
     let pathPoints: Array<{x: number; y: number}>;
     let previewPathPoints: Array<{x: number; y: number}>;
     let allPathPoints: Array<Array<{x: number; y: number}>> | undefined;
+    let allBezierPaths: BezierPath[] | undefined;
     let widthInches: number;
     let heightInches: number;
     let imageOffsetX: number;
@@ -1880,6 +2016,7 @@ export async function downloadContourPDF(
         pathPoints = contourData.pathPoints;
         previewPathPoints = contourData.previewPathPoints;
         allPathPoints = contourData.allPathPoints;
+        allBezierPaths = contourData.allBezierPaths;
         widthInches = contourData.widthInches;
         heightInches = contourData.heightInches;
         imageOffsetX = contourData.imageOffsetX;
@@ -2094,13 +2231,35 @@ export async function downloadContourPDF(
       (colorSpaceDict as PDFDict).set(PDFName.of(cutContourLabel), separationRef);
     }
     
-    // Generate CutContour path operations — multiple paths for zero hero mode
-    const pathsToEmit = allPathPoints && allPathPoints.length > 0 ? allPathPoints : [pathPoints];
+    // Generate CutContour path operations — multiple paths for zero hero mode.
+    // For Zero Hero (strokeSettings.width === 0) the contour is already a
+    // sub-pixel-precise, smoothed polyline; bypass the Catmull-Rom spline pass
+    // so the PDF cut path matches what the user sees in the preview.
+    //
+    // PREFERRED Zero Hero emit path: if the worker produced a Bezier
+    // reconstruction (`allBezierPaths`), emit those directly as `c` operators.
+    // This gives true smooth curves on arcs/circles instead of the polygonal
+    // chord look that any polyline emit produces, while still matching the
+    // preview pixel-for-pixel (the preview rasterizes the SAME source
+    // polyline that we fit Beziers to). Falls back to the polyline emit if
+    // bezier data isn't available (older cache, geometric shape, normal mode).
+    const isZeroHeroExport = strokeSettings.width === 0;
     let combinedPathOps = '';
-    for (const singlePath of pathsToEmit) {
-      combinedPathOps += contourPointsToPDFPathOps(singlePath, heightInches, cutContourLabel);
+    let emitMode: 'bezier' | 'polyline' = 'polyline';
+    if (isZeroHeroExport && allBezierPaths && allBezierPaths.length > 0) {
+      emitMode = 'bezier';
+      for (const bp of allBezierPaths) {
+        combinedPathOps += bezierPathToPDFPathOps(bp, heightInches, cutContourLabel);
+      }
+      console.log('[downloadContourPDF] Emitting', allBezierPaths.length, 'CutContour path(s) (Zero Hero, bezier reconstruction)');
+    } else {
+      const pathsToEmit = allPathPoints && allPathPoints.length > 0 ? allPathPoints : [pathPoints];
+      for (const singlePath of pathsToEmit) {
+        combinedPathOps += contourPointsToPDFPathOps(singlePath, heightInches, cutContourLabel, isZeroHeroExport);
+      }
+      console.log('[downloadContourPDF] Emitting', pathsToEmit.length, 'CutContour path(s)', isZeroHeroExport ? '(Zero Hero, polyline fallback)' : '');
     }
-    console.log('[downloadContourPDF] Emitting', pathsToEmit.length, 'CutContour path(s)');
+    void emitMode;
 
     if (combinedPathOps.length > 0) {
       const existingContents = page.node.Contents();
@@ -2289,6 +2448,7 @@ export async function generateContourPDFBase64(
   let pathPoints: Array<{x: number; y: number}>;
   let previewPathPoints: Array<{x: number; y: number}>;
   let allPathPoints: Array<Array<{x: number; y: number}>> | undefined;
+  let allBezierPaths: BezierPath[] | undefined;
   let widthInches: number;
   let heightInches: number;
   let imageOffsetX: number;
@@ -2304,6 +2464,7 @@ export async function generateContourPDFBase64(
     pathPoints = cachedContourData.pathPoints;
     previewPathPoints = cachedContourData.previewPathPoints;
     allPathPoints = cachedContourData.allPathPoints;
+    allBezierPaths = cachedContourData.allBezierPaths;
     widthInches = cachedContourData.widthInches;
     heightInches = cachedContourData.heightInches;
     imageOffsetX = cachedContourData.imageOffsetX;
@@ -2321,6 +2482,7 @@ export async function generateContourPDFBase64(
       pathPoints = contourData.pathPoints;
       previewPathPoints = contourData.previewPathPoints;
       allPathPoints = contourData.allPathPoints;
+      allBezierPaths = contourData.allBezierPaths;
       widthInches = contourData.widthInches;
       heightInches = contourData.heightInches;
       imageOffsetX = contourData.imageOffsetX;
@@ -2525,10 +2687,23 @@ export async function generateContourPDFBase64(
       (colorSpaceDict as PDFDict).set(PDFName.of(cutContourLabel), separationRef);
     }
     
-    const base64PathsToEmit = allPathPoints && allPathPoints.length > 0 ? allPathPoints : [pathPoints];
+    // For Zero Hero (strokeSettings.width === 0) prefer the bezier
+    // reconstruction so curves render as smooth `c` operators in the PDF.
+    // Falls back to polyline emit (no spline smoothing) if bezier isn't
+    // available; `contourPointsToPDFPathOps` itself bypasses Catmull-Rom
+    // when `disableSplines` is set.
+    const isZeroHeroExport = strokeSettings.width === 0;
     let combinedPathOps = '';
-    for (const singlePath of base64PathsToEmit) {
-      combinedPathOps += contourPointsToPDFPathOps(singlePath, heightInches, cutContourLabel);
+    if (isZeroHeroExport && allBezierPaths && allBezierPaths.length > 0) {
+      for (const bp of allBezierPaths) {
+        combinedPathOps += bezierPathToPDFPathOps(bp, heightInches, cutContourLabel);
+      }
+      console.log('[generateContourPDFBase64] Emitting', allBezierPaths.length, 'CutContour path(s) (Zero Hero, bezier reconstruction)');
+    } else {
+      const base64PathsToEmit = allPathPoints && allPathPoints.length > 0 ? allPathPoints : [pathPoints];
+      for (const singlePath of base64PathsToEmit) {
+        combinedPathOps += contourPointsToPDFPathOps(singlePath, heightInches, cutContourLabel, isZeroHeroExport);
+      }
     }
 
     if (combinedPathOps.length > 0) {

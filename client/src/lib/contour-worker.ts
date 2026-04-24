@@ -44,6 +44,13 @@ interface WorkerResponse {
     previewPathPoints: Array<{x: number; y: number}>;
     allPathPoints?: Array<Array<{x: number; y: number}>>;
     allPreviewPathPoints?: Array<Array<{x: number; y: number}>>;
+    // Bezier-curve representation of the cut path (Zero Hero only). When
+    // present, PDF emit uses these directly to produce smooth curves on
+    // arcs/circles instead of polygonal chords. allBezierPathsPreview is
+    // in worker pixel coords (matches allPreviewPathPoints); allBezierPaths
+    // is in inches in the PDF coord system (matches allPathPoints).
+    allBezierPaths?: BezierPath[];
+    allBezierPathsPreview?: BezierPath[];
     widthInches: number;
     heightInches: number;
     imageOffsetX: number;
@@ -166,11 +173,43 @@ self.onmessage = function(e: MessageEvent<WorkerMessage>) {
           });
         }
 
+        // Same dance for the bezier representation: each path's anchors and
+        // control points live in the same scaled-image pixel space as the
+        // polylines, so we apply the identical rescale + image-origin shift +
+        // pixel→inch + Y-flip transform.
+        let rescaledAllBezierPreview: BezierPath[] | undefined;
+        let recomputedAllBezier: BezierPath[] | undefined;
+        if (result.contourData.allBezierPathsPreview && result.contourData.allBezierPathsPreview.length > 0) {
+          rescaledAllBezierPreview = result.contourData.allBezierPathsPreview.map(bp =>
+            bezierPathScale(bp, 1 / scale)
+          );
+          // Shift to image-origin frame (subtract rescaledImg{X,Y}) before
+          // running the standard pixel→inch conversion. We do this in one
+          // fused transform to avoid duplicate work.
+          recomputedAllBezier = rescaledAllBezierPreview.map(bp => {
+            const cvt = (p: { x: number; y: number }) => ({
+              x: (((p.x - rescaledImgX) - spMinX) / effectiveDPI) + bleedInches,
+              y: pageH - ((((p.y - rescaledImgY) - spMinY) / effectiveDPI) + bleedInches),
+            });
+            return {
+              start: cvt(bp.start),
+              segments: bp.segments.map(seg =>
+                seg.type === 'line'
+                  ? { type: 'line', to: cvt(seg.to) }
+                  : { type: 'cubic', cp1: cvt(seg.cp1), cp2: cvt(seg.cp2), to: cvt(seg.to) }
+              ),
+              closed: true as const,
+            };
+          });
+        }
+
         contourData = {
           pathPoints: recomputedPathPoints,
           previewPathPoints: rescaledPreviewPts,
           allPathPoints: recomputedAllPath,
           allPreviewPathPoints: rescaledAllPreview,
+          allBezierPaths: recomputedAllBezier,
+          allBezierPathsPreview: rescaledAllBezierPreview,
           widthInches: pageW,
           heightInches: pageH,
           imageOffsetX: recomputedImgOffX,
@@ -292,6 +331,9 @@ interface ContourResult {
     previewPathPoints: Array<{x: number; y: number}>;
     allPathPoints?: Array<Array<{x: number; y: number}>>;
     allPreviewPathPoints?: Array<Array<{x: number; y: number}>>;
+    // See WorkerResponse.contourData comment.
+    allBezierPaths?: BezierPath[];
+    allBezierPathsPreview?: BezierPath[];
     widthInches: number;
     heightInches: number;
     imageOffsetX: number;
@@ -426,6 +468,10 @@ function processGeometricContour(
   if (previewMode && geoMask) {
     applyMaskToOutput(output, canvasWidth, canvasHeight, geoMask);
   }
+
+  // Re-stroke cut line on top of the design image so the user can see the
+  // actual cut path in the preview (otherwise the image obscures it).
+  strokeCutLineOnTop(output, canvasWidth, canvasHeight, [smoothedPath], strokeSettings.color, offsetX, offsetY, effectiveDPI);
 
   postProgress(90);
 
@@ -582,15 +628,56 @@ function processContour(
   let hiResMask: Uint8Array;
   let faintArtMode = false;
 
+  // Threshold used for Zero Hero. Stored at function scope so the sub-pixel
+  // tracer can use the *same* value the mask was built at — otherwise topology
+  // and edge-crossing positions disagree and you get holes / phantom paths.
+  let zhAlphaThreshold = 24;
+
+  // Zero Hero source field: either the alpha buffer (transparent-bg images,
+  // current behavior) or a color-saliency field (solid-bg images like JPEGs
+  // or flattened PNGs where alpha is uniformly 255). Same threshold semantics
+  // either way (0 = pure background, 255 = unambiguously design).
+  let zhField: Uint8Array = smoothedAlpha;
+  let zhMode: 'alpha' | 'color-bg' = 'alpha';
+  let zhBgColor: { r: number; g: number; b: number } | null = null;
+
   if (isZeroHero) {
-    // Zero hero: sharp single threshold — no hysteresis, no RGB rescue
-    // Uses alphaThreshold directly (default 128) for a crisp binary mask
-    const threshold = Math.max(strokeSettings.alphaThreshold, 128);
-    hiResMask = new Uint8Array(hiResWidth * hiResHeight);
-    for (let i = 0; i < smoothedAlpha.length; i++) {
-      if (smoothedAlpha[i] >= threshold) hiResMask[i] = 1;
+    // Detect whether the input has meaningful transparency. If virtually
+    // every pixel is opaque, the design boundary is defined by COLOR, not
+    // alpha — switch to color-saliency tracing.
+    let translucentPx = 0;
+    const totalPx = width * height;
+    for (let i = 0; i < totalPx; i++) {
+      if (data[i * 4 + 3] < 250) translucentPx++;
     }
-    console.log('[Worker] Zero hero: sharp threshold at', threshold, '(no hysteresis)');
+    const translucentRatio = translucentPx / totalPx;
+
+    if (translucentRatio < 0.02) {
+      console.log('[Worker] Zero hero: image is ' + ((1 - translucentRatio) * 100).toFixed(1) +
+        '% opaque — checking for solid background color...');
+      const bg = detectBorderBackgroundColor(data, width, height);
+      if (bg) {
+        zhBgColor = bg;
+        zhField = buildSaliencyFieldHiRes(data, width, height, SUPER_SAMPLE, bg);
+        zhMode = 'color-bg';
+      }
+    } else {
+      console.log('[Worker] Zero hero: image has ' + (translucentRatio * 100).toFixed(1) +
+        '% translucent pixels — using alpha-based tracing');
+    }
+
+    // Adaptive low threshold — catches the outermost AA pixel of the design
+    // (including bright/white solid outlines), instead of slicing through the
+    // middle of the AA band like the old `>= 128` did. Same threshold logic
+    // works for both alpha and color-saliency fields since both are 0..255.
+    zhAlphaThreshold = chooseZeroHeroAlphaThreshold(zhField, strokeSettings.alphaThreshold);
+    hiResMask = new Uint8Array(hiResWidth * hiResHeight);
+    for (let i = 0; i < zhField.length; i++) {
+      if (zhField[i] >= zhAlphaThreshold) hiResMask[i] = 1;
+    }
+    console.log('[Worker] Zero hero: mode=' + zhMode +
+      (zhBgColor ? ' (bg=rgb(' + zhBgColor.r + ',' + zhBgColor.g + ',' + zhBgColor.b + '))' : '') +
+      ', threshold=' + zhAlphaThreshold);
   } else {
     const loThreshold = 20;
     let hiThreshold = Math.max(strokeSettings.alphaThreshold, 128);
@@ -722,15 +809,106 @@ function processContour(
 
     postProgress(50);
 
-    // Trace each component's boundary independently using Marching Squares
-    // for sub-pixel accuracy (no vectorWeld, no Chaikin — MS output is already smooth)
+    // Trace each component's boundary independently using *sub-pixel* Marching
+    // Squares (interpolates against the continuous alpha buffer at the same
+    // threshold the mask was built with). Then run analytical shape snapping
+    // for known primitives, falling back to straight-line snapping for
+    // freeform polygons. No Chaikin — MS-subpixel is already smooth and
+    // Chaikin reintroduces self-intersections.
     const allZeroPaths: Point[][] = [];
     for (const comp of zeroComps) {
       const compMask = new Uint8Array(hiResWidth * hiResHeight);
       for (const idx of comp.pixels) compMask[idx] = 1;
 
-      const boundary = traceBoundaryMarchingSquares(compMask, hiResWidth, hiResHeight);
+      let boundary = traceBoundaryMarchingSquaresSubPixel(
+        compMask,
+        zhField,
+        zhAlphaThreshold,
+        hiResWidth,
+        hiResHeight
+      );
       if (boundary.length < 3) continue;
+
+      // Closure validation + bulletproof Moore-neighbor fallback.
+      //
+      // A clean MS trace closes back to its start cell with a gap ≤ √2 hires-px.
+      // Larger gaps mean MS terminated mid-trace (saddle / topology issue) and
+      // the path is OPEN — which then renders as a straight diagonal closing
+      // line drawn by ctx.closePath. This was the source of the persistent
+      // "diagonal cutting through the design" bug.
+      //
+      // Strategy:
+      //   1) If MS returned a closed trace, use it (sub-pixel precision).
+      //   2) Otherwise retry MS once at a higher threshold (simpler topology).
+      //   3) If THAT also fails, fall back to Moore-neighbor pixel-tracing.
+      //      Moore-neighbor walks pixel-by-pixel along the boundary like a
+      //      person following a wall — it is mathematically guaranteed to
+      //      return to the start pixel, so the path is ALWAYS closed.
+      //      Trade-off: pixel-locked vertices (no sub-pixel), but RDP +
+      //      straightening + analytical-shape snapping clean it up downstream.
+      const measureClosureGap = (pts: Point[]): number => {
+        if (pts.length < 2) return Infinity;
+        const dx = pts[0].x - pts[pts.length - 1].x;
+        const dy = pts[0].y - pts[pts.length - 1].y;
+        return Math.sqrt(dx * dx + dy * dy);
+      };
+
+      const CLOSURE_GAP_LIMIT = SUPER_SAMPLE * 3;
+      let initialGap = measureClosureGap(boundary);
+
+      if (initialGap > CLOSURE_GAP_LIMIT) {
+        // Retry threshold: 4x current (or 96 floor / 200 ceiling) for both
+        // alpha and color-saliency fields. Higher threshold collapses thin
+        // saddle bridges that confuse the MS topology.
+        const retryThreshold = Math.min(200, Math.max(96, zhAlphaThreshold * 4));
+        console.warn('[Worker] Zero hero: MS open at threshold=' + zhAlphaThreshold +
+          ' (gap=' + initialGap.toFixed(2) + ' hires-px). Retrying at threshold=' + retryThreshold + '.');
+        const fallbackMask = new Uint8Array(hiResWidth * hiResHeight);
+        for (const idx of comp.pixels) {
+          if (zhField[idx] >= retryThreshold) fallbackMask[idx] = 1;
+        }
+        const filledFallback = fillSilhouette(fallbackMask, hiResWidth, hiResHeight);
+        const retry = traceBoundaryMarchingSquaresSubPixel(
+          filledFallback,
+          zhField,
+          retryThreshold,
+          hiResWidth,
+          hiResHeight
+        );
+        const retryGap = measureClosureGap(retry);
+
+        if (retry.length >= 3 && retryGap <= CLOSURE_GAP_LIMIT) {
+          console.log('[Worker] Zero hero: retry MS closed cleanly (gap=' + retryGap.toFixed(2) +
+            ', ' + retry.length + ' pts)');
+          boundary = retry;
+        } else {
+          // Both MS attempts left the path open. Switch to Moore-neighbor
+          // pixel-tracing on the original component mask. Find any boundary
+          // pixel as start (the topmost-leftmost foreground pixel works).
+          let startX = -1, startY = -1;
+          for (let py = 0; py < hiResHeight && startX === -1; py++) {
+            const rowOff = py * hiResWidth;
+            for (let px = 0; px < hiResWidth; px++) {
+              if (compMask[rowOff + px] === 1) { startX = px; startY = py; break; }
+            }
+          }
+          if (startX !== -1) {
+            const moore = traceBoundaryForComponent(compMask, hiResWidth, hiResHeight, startX, startY);
+            if (moore.length >= 3) {
+              console.warn('[Worker] Zero hero: both MS attempts left path open — falling back to Moore-neighbor (guaranteed closed). Got ' +
+                moore.length + ' pixel-locked vertices.');
+              boundary = moore;
+            } else {
+              console.error('[Worker] Zero hero: Moore-neighbor also failed (got ' + moore.length +
+                ' pts) — dropping component (area=' + comp.area + ').');
+              continue;
+            }
+          } else {
+            console.error('[Worker] Zero hero: could not find Moore start pixel — dropping component.');
+            continue;
+          }
+        }
+      }
 
       // Downscale from hi-res to original resolution (no dilation offset)
       let scaled = boundary.map(p => ({
@@ -738,14 +916,84 @@ function processContour(
         y: p.y / SUPER_SAMPLE
       }));
 
-      // Simplify, deduplicate, then smooth curves while preserving sharp corners
-      scaled = approxPolyDP(scaled, 0.002);
+      // Light simplification: keep enough points for shape detection to work,
+      // but drop the dense sub-pixel runs along straight stretches.
+      //
+      // RDP epsilon factor: 0.0003 (was 0.0015) — keeps roughly 5x more
+      // vertices, preserving the sub-pixel curvature data that the Bezier
+      // fitter needs to construct curves with non-trivial control-point
+      // displacement. With the previous 0.0015, anchors landed 5+ px apart
+      // and Schneider's LS solver had nothing to fit, falling back to its
+      // chord/3 heuristic and emitting near-linear cubics. The polyline
+      // output is visually identical (more `lineTo` calls, but each is
+      // sub-pixel), the mask/preview pipeline handles dense input fine,
+      // and Clipper / straightenNoisyLines downstream are robust.
+      scaled = approxPolyDP(scaled, 0.0003);
       scaled = removeNearDuplicatePoints(scaled, 0.01);
-      scaled = smoothPolyChaikin(scaled, 1, 45);
 
-      if (scaled.length >= 3) {
-        allZeroPaths.push(scaled);
-        console.log('[Worker] Zero hero component:', scaled.length, 'pts, area:', comp.area);
+      if (scaled.length < 3) continue;
+
+      // Try analytical primitives first — these output mathematically perfect
+      // paths (no wobble) and don't need sliver/self-intersection cleanup.
+      let parts: Point[][];
+      const snappedRR = detectAndSnapRoundedRect(scaled);
+      if (snappedRR) {
+        parts = [snappedRR];
+      } else {
+        // Freeform: snap straight stretches to perfect lines (kills 1px wobble
+        // on rectangle/polygon edges) before splitting any self-intersections.
+        const straightened = straightenNoisyLines(scaled, 25, 0.6);
+        parts = simplifyClosedPathToSimpleParts(straightened);
+      }
+
+      // Per-component bounding box (in original coords) for the spans-the-design
+      // diagonal-slash guard.
+      const compW = (comp.bounds.maxX - comp.bounds.minX) / SUPER_SAMPLE;
+      const compH = (comp.bounds.maxY - comp.bounds.minY) / SUPER_SAMPLE;
+
+      for (const part of parts) {
+        if (part.length < 3) continue;
+        const partArea = Math.abs(polygonArea(part));
+        if (partArea < Math.max(8, comp.area * 0.005 / (SUPER_SAMPLE * SUPER_SAMPLE))) {
+          console.log('[Worker] Zero hero: dropping sliver part, area=', partArea.toFixed(2));
+          continue;
+        }
+
+        // Diagonal-slash guard (defense in depth): a bow-tie split remnant
+        // that escaped the upstream guard is recognizable by its bbox spanning
+        // most of the parent component while being super thin perpendicularly.
+        let pMinX = Infinity, pMinY = Infinity, pMaxX = -Infinity, pMaxY = -Infinity;
+        for (const p of part) {
+          if (p.x < pMinX) pMinX = p.x;
+          if (p.x > pMaxX) pMaxX = p.x;
+          if (p.y < pMinY) pMinY = p.y;
+          if (p.y > pMaxY) pMaxY = p.y;
+        }
+        const partW = pMaxX - pMinX;
+        const partH = pMaxY - pMinY;
+        const partLong = Math.max(partW, partH);
+        const partShort = Math.max(0.5, Math.min(partW, partH));
+        const elongation = partLong / partShort;
+        const spansComp = Math.max(partW / Math.max(1, compW), partH / Math.max(1, compH));
+        // Skip the largest part (which IS the cut path); only flag the splits.
+        const isProbablyMain = parts.length === 1 ||
+          partArea >= 0.5 * parts.reduce((m, q) => Math.max(m, Math.abs(polygonArea(q))), 0);
+        if (!isProbablyMain && elongation > 8 && spansComp > 0.4) {
+          console.log('[Worker] Zero hero: dropping diagonal-slash part — elongation=' +
+            elongation.toFixed(1) + ', spansComp=' + spansComp.toFixed(2) +
+            ', area=' + partArea.toFixed(0));
+          continue;
+        }
+
+        allZeroPaths.push(part);
+        console.log(
+          '[Worker] Zero hero component:',
+          part.length,
+          'pts',
+          snappedRR ? '[rounded-rect snap]' : (parts.length > 1 ? ' (' + parts.length + ' polys after de-self-intersect)' : ''),
+          ', area:',
+          comp.area
+        );
       }
     }
 
@@ -754,20 +1002,64 @@ function processContour(
     // Trace hole boundaries for zero-hero when includeHoles is enabled
     if (includeHoles && holeMasks.length > 0) {
       for (const holeMask of holeMasks) {
-        const boundary = traceBoundaryMarchingSquares(holeMask, hiResWidth, hiResHeight);
+        // Holes use the same source field and threshold so the cut sits on
+        // the design-side edge of the hole.
+        const boundary = traceBoundaryMarchingSquaresSubPixel(
+          holeMask,
+          zhField,
+          zhAlphaThreshold,
+          hiResWidth,
+          hiResHeight
+        );
         if (boundary.length < 3) continue;
 
         let scaled = boundary.map(p => ({
           x: p.x / SUPER_SAMPLE,
           y: p.y / SUPER_SAMPLE
         }));
-        scaled = approxPolyDP(scaled, 0.002);
+        // Same denser RDP epsilon as outer-component branch above — keeps
+        // curvature data for the Bezier fit.
+        scaled = approxPolyDP(scaled, 0.0003);
         scaled = removeNearDuplicatePoints(scaled, 0.01);
-        scaled = smoothPolyChaikin(scaled, 1, 45);
 
-        if (scaled.length >= 3) {
-          allZeroPaths.push(scaled);
-          console.log('[Worker] Zero hero hole contour:', scaled.length, 'pts');
+        if (scaled.length < 3) continue;
+
+        let parts: Point[][];
+        const snappedRR = detectAndSnapRoundedRect(scaled);
+        if (snappedRR) {
+          parts = [snappedRR];
+        } else {
+          const straightened = straightenNoisyLines(scaled, 25, 0.6);
+          parts = simplifyClosedPathToSimpleParts(straightened);
+        }
+
+        const largestHoleArea = parts.reduce(
+          (m, q) => Math.max(m, Math.abs(polygonArea(q))), 0
+        );
+        for (const part of parts) {
+          if (part.length < 3) continue;
+          const partArea = Math.abs(polygonArea(part));
+          if (partArea < 8) continue;
+
+          // Same diagonal-slash guard for hole contours.
+          let pMinX = Infinity, pMinY = Infinity, pMaxX = -Infinity, pMaxY = -Infinity;
+          for (const p of part) {
+            if (p.x < pMinX) pMinX = p.x;
+            if (p.x > pMaxX) pMaxX = p.x;
+            if (p.y < pMinY) pMinY = p.y;
+            if (p.y > pMaxY) pMaxY = p.y;
+          }
+          const partW = pMaxX - pMinX;
+          const partH = pMaxY - pMinY;
+          const elongation = Math.max(partW, partH) / Math.max(0.5, Math.min(partW, partH));
+          const isProbablyMain = parts.length === 1 || partArea >= 0.5 * largestHoleArea;
+          if (!isProbablyMain && elongation > 8) {
+            console.log('[Worker] Zero hero hole: dropping diagonal-slash part — elongation=' + elongation.toFixed(1));
+            continue;
+          }
+
+          allZeroPaths.push(part);
+          console.log('[Worker] Zero hero hole contour:', part.length, 'pts', snappedRR ? '[rounded-rect snap]' : '');
         }
       }
     }
@@ -831,12 +1123,33 @@ function processContour(
 
     const imageCanvasX = 0 + offsetX;
     const imageCanvasY = 0 + offsetY;
-    const zhMask = previewMode ? buildContourMask(canvasWidth, canvasHeight, allZeroPaths, offsetX, offsetY, bleedPixels) : undefined;
+    // Preview wipe mask: raster from silhouette (vector mask self-intersects after Chaikin → diagonal clips).
+    const zhMask = previewMode
+      ? includeHoles && holeMasks.length > 0
+        ? buildContourMask(canvasWidth, canvasHeight, allZeroPaths, offsetX, offsetY, bleedPixels)
+        : buildZeroHeroPreviewMaskFromFilledSilhouette(
+            filledMainMask,
+            hiResWidth,
+            hiResHeight,
+            SUPER_SAMPLE,
+            width,
+            height,
+            canvasWidth,
+            canvasHeight,
+            offsetX,
+            offsetY,
+            bleedPixels
+          )
+      : undefined;
     drawImageToData(output, canvasWidth, canvasHeight, imageData, Math.round(imageCanvasX), Math.round(imageCanvasY), zhMask);
 
     if (previewMode && zhMask) {
       applyMaskToOutput(output, canvasWidth, canvasHeight, zhMask);
     }
+
+    // (Cut line is restroked AFTER bezier reconstruction below, so the
+    // preview can render the SAME bezier curves the PDF will emit — true
+    // preview-≡-PDF parity. See the strokeCutLineOnTop call further down.)
 
     postProgress(80);
 
@@ -861,8 +1174,82 @@ function processContour(
     const imageOffsetXCalc = ((0 - minPathX) / effectiveDPI) + bleedInches;
     const imageOffsetYCalc = ((0 - minPathY) / effectiveDPI) + bleedInches;
 
+    // ─── Bezier reconstruction (Zero Hero only) ────────────────────────────
+    // Convert each closed polyline into a corner-aware Bezier path so the PDF
+    // emits smooth `c` curves on arcs/circles instead of polygonal `l` chords.
+    // Tolerance is in *original-image pixel* coords (the polylines have been
+    // downscaled by SUPER_SAMPLE already). At 300 DPI: 1.0 px ≈ 0.0033",
+    // which is well below the visible threshold for cut-path smoothness on
+    // a DTF transfer. We deliberately use a LOOSER tolerance than the
+    // original 0.4 px to give the LS solver enough room to fit meaningful
+    // curves over LONG arcs — too tight (like 0.4) forces the recursion to
+    // split every smooth arc into dozens of micro-cubics whose chord is so
+    // short the LS solver collapses to the chord/3 fallback (i.e., a near-
+    // linear cubic that visually looks like a chord). 1.0 px lets a single
+    // cubic cover ~20-50 px of arc, which is what produces visibly smooth
+    // curves.
+    const bezierTolerancePx = 1.0;
+    const bezierStraightTolPx = 0.7;
+    const allBezierPathsPreview: BezierPath[] = [];
+    const allBezierPaths: BezierPath[] = [];
+    let totalBezierSegs = 0;
+    let totalBezierLines = 0;
+    let totalBezierCubics = 0;
+    for (const path of allZeroPaths) {
+      const bp = polylineToBezierPath(path, bezierTolerancePx, bezierStraightTolPx);
+      // Preview-coord version (matches allPreviewPathPoints).
+      const bpPreview: BezierPath = {
+        start: { x: bp.start.x + offsetX, y: bp.start.y + offsetY },
+        segments: bp.segments.map(seg =>
+          seg.type === 'line'
+            ? { type: 'line', to: { x: seg.to.x + offsetX, y: seg.to.y + offsetY } }
+            : {
+                type: 'cubic',
+                cp1: { x: seg.cp1.x + offsetX, y: seg.cp1.y + offsetY },
+                cp2: { x: seg.cp2.x + offsetX, y: seg.cp2.y + offsetY },
+                to: { x: seg.to.x + offsetX, y: seg.to.y + offsetY },
+              }
+        ),
+        closed: true,
+      };
+      allBezierPathsPreview.push(bpPreview);
+
+      // PDF inches version (matches allPathPoints).
+      allBezierPaths.push(
+        bezierPathPxToInches(bp, minPathX, minPathY, effectiveDPI, bleedInches, pageHeightInches)
+      );
+
+      totalBezierSegs += bp.segments.length;
+      for (const s of bp.segments) {
+        if (s.type === 'line') totalBezierLines++;
+        else totalBezierCubics++;
+      }
+    }
+    console.log(
+      '[Worker] Zero hero bezier reconstruction:', allBezierPaths.length, 'path(s),',
+      totalBezierSegs, 'segments (', totalBezierLines, 'line +', totalBezierCubics, 'cubic) — was',
+      allZeroPaths.reduce((s, p) => s + p.length, 0), 'polyline vertices'
+    );
+
     console.log('[Worker] Zero hero page size (inches):', pageWidthInches.toFixed(4), 'x', pageHeightInches.toFixed(4));
     console.log('[Worker] Zero hero paths:', allZeroPaths.length, ', primary:', smoothedPath.length, 'pts');
+
+    // Re-stroke the cut line(s) ON TOP of the design image, using the
+    // BEZIER preview paths so the on-screen cut line is the same curve
+    // geometry that the PDF emits (preview ≡ PDF). Polylines are passed
+    // as a fallback only — `strokeCutLineOnTop` prefers bezier when
+    // present.
+    strokeCutLineOnTop(
+      output,
+      canvasWidth,
+      canvasHeight,
+      allZeroPaths,
+      strokeSettings.color,
+      offsetX,
+      offsetY,
+      effectiveDPI,
+      allBezierPathsPreview
+    );
 
     postProgress(90);
 
@@ -877,6 +1264,8 @@ function processContour(
         allPreviewPathPoints: allZeroPaths.map(path =>
           path.map(p => ({ x: p.x + offsetX, y: p.y + offsetY }))
         ),
+        allBezierPaths,
+        allBezierPathsPreview,
         widthInches: pageWidthInches,
         heightInches: pageHeightInches,
         imageOffsetX: imageOffsetXCalc,
@@ -1061,7 +1450,11 @@ function processContour(
   if (previewMode && ctrMask) {
     applyMaskToOutput(output, canvasWidth, canvasHeight, ctrMask);
   }
-  
+
+  // Re-stroke cut line on top of the design image so the user can see the
+  // actual cut path in the preview (otherwise the image obscures it).
+  strokeCutLineOnTop(output, canvasWidth, canvasHeight, [smoothedPath], strokeSettings.color, offsetX, offsetY, effectiveDPI);
+
   // Calculate contour data for PDF export
   // Store raw pixel coordinates and let PDF export handle the conversion
   // This ensures preview and PDF use the exact same path data
@@ -1182,6 +1575,11 @@ function processContour(
       }
 
       drawImageToData(output, canvasWidth, canvasHeight, imageData, Math.round(imageCanvasX), Math.round(imageCanvasY), ctrMask);
+
+      // Re-stroke ALL cut lines (outer + holes) on top of the design image so
+      // they remain visible in the preview after the image is drawn over.
+      const allNormalPaths: Point[][] = [smoothedPath, ...holePaths];
+      strokeCutLineOnTop(output, canvasWidth, canvasHeight, allNormalPaths, strokeSettings.color, offsetX, offsetY, effectiveDPI);
 
       console.log('[Worker] Include holes: total paths =', allPathsInInches.length, '(1 outer +', holePaths.length, 'holes)');
     }
@@ -2316,6 +2714,534 @@ function getEdgeMidpoint(cx: number, cy: number, edge: number): Point {
     case 3: return { x: cx, y: cy + 0.5 };       // left edge midpoint
     default: return { x: cx + 0.5, y: cy + 0.5 }; // center fallback
   }
+}
+
+/**
+ * Sub-pixel edge crossing using bilinear interpolation along a cell edge.
+ * Instead of the pixel midpoint, we find the exact `t` along the edge where
+ * the alpha value equals `threshold`. This makes straight edges actually
+ * straight (no 1px stairsteps) and gives smooth curves for rounded shapes.
+ */
+function getSubPixelEdgeCrossing(
+  alpha: Uint8Array,
+  width: number,
+  cx: number,
+  cy: number,
+  edge: number,
+  threshold: number
+): Point {
+  let a1: number, a2: number;
+  let p1x: number, p1y: number, p2x: number, p2y: number;
+
+  switch (edge) {
+    case 0: // top: TL → TR
+      a1 = alpha[cy * width + cx];
+      a2 = alpha[cy * width + (cx + 1)];
+      p1x = cx; p1y = cy;
+      p2x = cx + 1; p2y = cy;
+      break;
+    case 1: // right: TR → BR
+      a1 = alpha[cy * width + (cx + 1)];
+      a2 = alpha[(cy + 1) * width + (cx + 1)];
+      p1x = cx + 1; p1y = cy;
+      p2x = cx + 1; p2y = cy + 1;
+      break;
+    case 2: // bottom: BL → BR
+      a1 = alpha[(cy + 1) * width + cx];
+      a2 = alpha[(cy + 1) * width + (cx + 1)];
+      p1x = cx; p1y = cy + 1;
+      p2x = cx + 1; p2y = cy + 1;
+      break;
+    case 3: // left: TL → BL
+      a1 = alpha[cy * width + cx];
+      a2 = alpha[(cy + 1) * width + cx];
+      p1x = cx; p1y = cy;
+      p2x = cx; p2y = cy + 1;
+      break;
+    default:
+      return { x: cx + 0.5, y: cy + 0.5 };
+  }
+
+  let t = 0.5;
+  const denom = a2 - a1;
+  if (Math.abs(denom) > 0.5) {
+    t = (threshold - a1) / denom;
+    if (t < 0) t = 0;
+    if (t > 1) t = 1;
+  }
+
+  return {
+    x: p1x + t * (p2x - p1x),
+    y: p1y + t * (p2y - p1y),
+  };
+}
+
+/**
+ * Sub-pixel marching squares.
+ * Topology comes from the binary `mask` (so we get exactly one closed loop per
+ * component, same as the standard tracer). Vertex positions come from
+ * interpolating the continuous `alpha` buffer against `threshold`. This is
+ * what gives Zero Hero perfectly straight rectangle edges and smooth arcs on
+ * rounded corners — features that get destroyed by pixel-snapped midpoints.
+ */
+function traceBoundaryMarchingSquaresSubPixel(
+  mask: Uint8Array,
+  alpha: Uint8Array,
+  threshold: number,
+  width: number,
+  height: number
+): Point[] {
+  let startCellX = -1, startCellY = -1;
+  let startEdge = -1;
+
+  outer: for (let cy = 0; cy < height - 1; cy++) {
+    for (let cx = 0; cx < width - 1; cx++) {
+      const code = getCellCode(mask, width, height, cx, cy);
+      if (code > 0 && code < 15) {
+        startCellX = cx;
+        startCellY = cy;
+        startEdge = getStartEdge(code);
+        break outer;
+      }
+    }
+  }
+
+  if (startCellX === -1) {
+    return traceBoundarySimple(mask, width, height);
+  }
+
+  const path: Point[] = [];
+  const visited = new Set<string>();
+
+  let cx = startCellX;
+  let cy = startCellY;
+  let entryEdge = startEdge;
+
+  const maxSteps = width * height * 2;
+  let steps = 0;
+
+  do {
+    const key = cx + ',' + cy + ',' + entryEdge;
+    if (visited.has(key)) break;
+    visited.add(key);
+
+    const code = getCellCode(mask, width, height, cx, cy);
+    if (code === 0 || code === 15) break;
+
+    const exitEdge = getExitEdge(code, entryEdge);
+    if (exitEdge === -1) break;
+
+    const point = getSubPixelEdgeCrossing(alpha, width, cx, cy, exitEdge, threshold);
+
+    if (path.length === 0 ||
+        Math.abs(path[path.length - 1].x - point.x) > 0.001 ||
+        Math.abs(path[path.length - 1].y - point.y) > 0.001) {
+      path.push(point);
+    }
+
+    switch (exitEdge) {
+      case 0: cy--; entryEdge = 2; break;
+      case 1: cx++; entryEdge = 3; break;
+      case 2: cy++; entryEdge = 0; break;
+      case 3: cx--; entryEdge = 1; break;
+    }
+
+    if (cx < 0 || cx >= width - 1 || cy < 0 || cy >= height - 1) break;
+    steps++;
+  } while ((cx !== startCellX || cy !== startCellY || entryEdge !== startEdge) && steps < maxSteps);
+
+  if (path.length < 3) return traceBoundarySimple(mask, width, height);
+  console.log('[MarchingSquares-SubPixel] Traced', path.length, 'points (threshold=' + threshold + ')');
+  return path;
+}
+
+/**
+ * Adaptive alpha threshold for Zero Hero.
+ *
+ * The old behavior (threshold = max(setting, 128)) cut through the middle of
+ * anti-aliased edges, slicing white solid outlines and pulling cuts inside the
+ * visible design. We default to a much lower value so the trace follows the
+ * outermost AA pixel — i.e. the real visible edge of the design, including
+ * any bright rim/outline.
+ *
+ * If the alpha histogram shows a heavy faint tail (alpha 1..23 dominant over
+ * the AA band), it's a soft glow / drop shadow — bump up to 64 so the cut
+ * doesn't follow the halo.
+ *
+ * If the user explicitly set a non-default threshold (≠ 128), respect it.
+ */
+function chooseZeroHeroAlphaThreshold(alpha: Uint8Array, userOverride?: number): number {
+  if (typeof userOverride === 'number' && userOverride !== 128 && userOverride > 0) {
+    return Math.max(2, Math.min(254, userOverride));
+  }
+
+  let lowCount = 0;   // 1..23 (faint halo / shadow band)
+  let midCount = 0;   // 24..199 (real AA band)
+  for (let i = 0; i < alpha.length; i++) {
+    const a = alpha[i];
+    if (a >= 1 && a < 24) lowCount++;
+    else if (a >= 24 && a < 200) midCount++;
+  }
+
+  if (lowCount > midCount * 4 && lowCount > 200) {
+    console.log('[Worker] Zero hero adaptive threshold: faint halo detected (low=' + lowCount + ', mid=' + midCount + ') → 64');
+    return 64;
+  }
+
+  return 24;
+}
+
+/**
+ * Detect a uniform background color by sampling the image's border ring.
+ *
+ * Why: Zero Hero traditionally only worked for designs on a TRANSPARENT
+ * background (it relied on the alpha channel). For designs on a solid-color
+ * background — JPEGs, flattened PNGs, scanned art — alpha is uniformly 255 and
+ * there's no transparency boundary to trace. The boundary is defined by COLOR
+ * difference from the background instead.
+ *
+ * Strategy:
+ *   - Sample a 2-pixel ring around the image edge
+ *   - Skip mostly-transparent samples (those mean it's not a solid-bg image)
+ *   - Compute the average opaque border color
+ *   - Verify ≥75% of border samples agree (Chebyshev distance ≤ 16) to rule
+ *     out gradient backgrounds, photo-style content, or designs that touch the
+ *     border (where the "border" includes design pixels)
+ *
+ * Returns the detected background color, or null if the image isn't a clear
+ * solid-bg image (in which case the caller should fall back to alpha-based
+ * tracing).
+ */
+function detectBorderBackgroundColor(
+  data: Uint8ClampedArray,
+  width: number,
+  height: number
+): { r: number; g: number; b: number } | null {
+  const ringThickness = Math.max(2, Math.floor(Math.min(width, height) * 0.01));
+  const sampleStride = Math.max(1, Math.floor(Math.min(width, height) / 200));
+
+  type Sample = { r: number; g: number; b: number };
+  const samples: Sample[] = [];
+
+  const collect = (x: number, y: number): void => {
+    if (x < 0 || x >= width || y < 0 || y >= height) return;
+    const idx = (y * width + x) * 4;
+    if (data[idx + 3] < 200) return; // skip mostly-transparent pixels
+    samples.push({ r: data[idx], g: data[idx + 1], b: data[idx + 2] });
+  };
+
+  for (let r = 0; r < ringThickness; r++) {
+    for (let x = 0; x < width; x += sampleStride) {
+      collect(x, r);
+      collect(x, height - 1 - r);
+    }
+    for (let y = 0; y < height; y += sampleStride) {
+      collect(r, y);
+      collect(width - 1 - r, y);
+    }
+  }
+
+  if (samples.length < 40) {
+    console.log('[Worker] detectBorderBackgroundColor: too few opaque border samples (' +
+      samples.length + ') — assuming transparent/alpha-keyed image');
+    return null;
+  }
+
+  let sumR = 0, sumG = 0, sumB = 0;
+  for (const s of samples) { sumR += s.r; sumG += s.g; sumB += s.b; }
+  const avgR = sumR / samples.length;
+  const avgG = sumG / samples.length;
+  const avgB = sumB / samples.length;
+
+  let agree = 0;
+  for (const s of samples) {
+    const d = Math.max(
+      Math.abs(s.r - avgR),
+      Math.abs(s.g - avgG),
+      Math.abs(s.b - avgB)
+    );
+    if (d <= 16) agree++;
+  }
+
+  const agreeRatio = agree / samples.length;
+  if (agreeRatio < 0.75) {
+    console.log('[Worker] detectBorderBackgroundColor: border not uniform enough (agree=' +
+      (agreeRatio * 100).toFixed(0) + '%) — falling back to alpha-based tracing');
+    return null;
+  }
+
+  const bg = { r: Math.round(avgR), g: Math.round(avgG), b: Math.round(avgB) };
+  console.log('[Worker] detectBorderBackgroundColor: solid bg detected rgb(' +
+    bg.r + ',' + bg.g + ',' + bg.b + ') with ' + (agreeRatio * 100).toFixed(0) +
+    '% agreement across ' + samples.length + ' border samples');
+  return bg;
+}
+
+/**
+ * Build a 0..255 "saliency" field from RGBA + a known background color, at
+ * the super-sampled resolution. This field replaces the alpha buffer for
+ * marching-squares purposes when the input is a solid-background image.
+ *
+ *   saliency = Chebyshev color distance from bg (clamped 0..255)
+ *
+ * Translucent pixels are first composited over the background — so a 50%
+ * alpha black pixel on a white bg shows as gray (distance 128), exactly as it
+ * looks visually. This means transparency and color difference cooperate
+ * smoothly: a fully transparent pixel reports 0 saliency (= pure background).
+ *
+ * The result is a continuous field that crosses any chosen threshold along
+ * the design's visible boundary, which is exactly what sub-pixel marching
+ * squares needs to produce a clean cut path. We use bilinear upscale on RGB
+ * (separately from alpha compositing) so anti-aliased edges still produce
+ * smooth sub-pixel transitions in the saliency value.
+ */
+function buildSaliencyFieldHiRes(
+  data: Uint8ClampedArray,
+  width: number,
+  height: number,
+  scale: number,
+  bg: { r: number; g: number; b: number }
+): Uint8Array {
+  const hiW = width * scale;
+  const hiH = height * scale;
+  const out = new Uint8Array(hiW * hiH);
+
+  for (let y = 0; y < hiH; y++) {
+    const srcY = y / scale;
+    const y0 = Math.floor(srcY);
+    const y1 = Math.min(y0 + 1, height - 1);
+    const wy = srcY - y0;
+
+    for (let x = 0; x < hiW; x++) {
+      const srcX = x / scale;
+      const x0 = Math.floor(srcX);
+      const x1 = Math.min(x0 + 1, width - 1);
+      const wx = srcX - x0;
+
+      const i00 = (y0 * width + x0) * 4;
+      const i10 = (y0 * width + x1) * 4;
+      const i01 = (y1 * width + x0) * 4;
+      const i11 = (y1 * width + x1) * 4;
+
+      const lerp = (a: number, b: number, t: number) => a * (1 - t) + b * t;
+      const r = lerp(lerp(data[i00],     data[i10],     wx), lerp(data[i01],     data[i11],     wx), wy);
+      const g = lerp(lerp(data[i00 + 1], data[i10 + 1], wx), lerp(data[i01 + 1], data[i11 + 1], wx), wy);
+      const b = lerp(lerp(data[i00 + 2], data[i10 + 2], wx), lerp(data[i01 + 2], data[i11 + 2], wx), wy);
+      const a = lerp(lerp(data[i00 + 3], data[i10 + 3], wx), lerp(data[i01 + 3], data[i11 + 3], wx), wy);
+
+      // Composite onto bg by alpha: visible color = source over bg.
+      const aN = a / 255;
+      const visR = r * aN + bg.r * (1 - aN);
+      const visG = g * aN + bg.g * (1 - aN);
+      const visB = b * aN + bg.b * (1 - aN);
+
+      // Chebyshev distance is fast and gives 0..255 without weighting.
+      const d = Math.max(
+        Math.abs(visR - bg.r),
+        Math.abs(visG - bg.g),
+        Math.abs(visB - bg.b)
+      );
+
+      out[y * hiW + x] = Math.min(255, Math.round(d));
+    }
+  }
+
+  return out;
+}
+
+/**
+ * Rounded-rectangle detector & analytical snap.
+ *
+ * Why: a hand-traced rounded rect has 1px wobble on its straight edges and a
+ * dozen+ bumpy points around each corner. For a cut path, the user expects
+ * mathematically perfect straight sides and smooth quarter-arcs. We detect
+ * the canonical pattern and replace the trace with an analytical polygon
+ * (4 sides + 4 quarter-arcs sampled densely).
+ *
+ * The detector is conservative — if any side isn't axis-aligned, any corner
+ * isn't a circular arc, or the four corner radii don't agree, we return null
+ * and the caller falls back to the cleaned freeform polygon.
+ */
+function detectAndSnapRoundedRect(path: Point[]): Point[] | null {
+  if (path.length < 24) return null;
+
+  let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
+  for (const p of path) {
+    if (p.x < minX) minX = p.x;
+    if (p.x > maxX) maxX = p.x;
+    if (p.y < minY) minY = p.y;
+    if (p.y > maxY) maxY = p.y;
+  }
+  const W = maxX - minX;
+  const H = maxY - minY;
+  if (W < 8 || H < 8) return null;
+
+  const minDim = Math.min(W, H);
+  // Edge tolerance: 2% of the shorter side, min 0.5px. This is how close to
+  // the bbox edge a point must be to count as "on the edge".
+  const edgeTol = Math.max(0.5, minDim * 0.025);
+
+  const topPts: Point[] = [];
+  const bottomPts: Point[] = [];
+  const leftPts: Point[] = [];
+  const rightPts: Point[] = [];
+  const tlPts: Point[] = [];
+  const trPts: Point[] = [];
+  const brPts: Point[] = [];
+  const blPts: Point[] = [];
+
+  for (const p of path) {
+    const onTop = p.y - minY <= edgeTol;
+    const onBottom = maxY - p.y <= edgeTol;
+    const onLeft = p.x - minX <= edgeTol;
+    const onRight = maxX - p.x <= edgeTol;
+
+    if (onTop && !onLeft && !onRight) topPts.push(p);
+    else if (onBottom && !onLeft && !onRight) bottomPts.push(p);
+    else if (onLeft && !onTop && !onBottom) leftPts.push(p);
+    else if (onRight && !onTop && !onBottom) rightPts.push(p);
+    else {
+      const dTL = (p.x - minX) ** 2 + (p.y - minY) ** 2;
+      const dTR = (p.x - maxX) ** 2 + (p.y - minY) ** 2;
+      const dBR = (p.x - maxX) ** 2 + (p.y - maxY) ** 2;
+      const dBL = (p.x - minX) ** 2 + (p.y - maxY) ** 2;
+      const m = Math.min(dTL, dTR, dBR, dBL);
+      if (m === dTL) tlPts.push(p);
+      else if (m === dTR) trPts.push(p);
+      else if (m === dBR) brPts.push(p);
+      else blPts.push(p);
+    }
+  }
+
+  // Need real edges (not just corners) and all 4 corners populated.
+  const minEdge = Math.max(2, Math.floor(path.length * 0.04));
+  if (topPts.length < minEdge || bottomPts.length < minEdge ||
+      leftPts.length < minEdge || rightPts.length < minEdge) {
+    return null;
+  }
+  if (tlPts.length < 2 || trPts.length < 2 || brPts.length < 2 || blPts.length < 2) {
+    return null;
+  }
+
+  // Each axis-aligned edge must be flat in the perpendicular direction.
+  const checkAxisFlatness = (pts: Point[], axis: 'x' | 'y'): boolean => {
+    let sum = 0;
+    for (const p of pts) sum += p[axis];
+    const mean = sum / pts.length;
+    let maxDev = 0;
+    for (const p of pts) {
+      const d = Math.abs(p[axis] - mean);
+      if (d > maxDev) maxDev = d;
+    }
+    return maxDev <= edgeTol * 1.2;
+  };
+  if (!checkAxisFlatness(topPts, 'y')) return null;
+  if (!checkAxisFlatness(bottomPts, 'y')) return null;
+  if (!checkAxisFlatness(leftPts, 'x')) return null;
+  if (!checkAxisFlatness(rightPts, 'x')) return null;
+
+  // Fit each corner to a quarter-circle constrained to the bbox corner.
+  // Corner at (cx, cy) with inward signs (sx, sy) → arc center is at
+  // (cx + r*sx, cy + r*sy). We solve for the r that minimizes the radial
+  // residual sum, with bisection + ternary search.
+  type Corner = { cx: number; cy: number; sx: number; sy: number; pts: Point[] };
+  const cornersList: Corner[] = [
+    { cx: minX, cy: minY, sx: 1, sy: 1, pts: tlPts },
+    { cx: maxX, cy: minY, sx: -1, sy: 1, pts: trPts },
+    { cx: maxX, cy: maxY, sx: -1, sy: -1, pts: brPts },
+    { cx: minX, cy: maxY, sx: 1, sy: -1, pts: blPts },
+  ];
+
+  const radii: number[] = [];
+  for (const c of cornersList) {
+    let maxInset = 0;
+    for (const p of c.pts) {
+      const ix = (p.x - c.cx) * c.sx;
+      const iy = (p.y - c.cy) * c.sy;
+      if (ix > maxInset) maxInset = ix;
+      if (iy > maxInset) maxInset = iy;
+    }
+    if (maxInset <= 0) return null;
+
+    const evalLoss = (r: number): number => {
+      const acx = c.cx + r * c.sx;
+      const acy = c.cy + r * c.sy;
+      let loss = 0;
+      for (const p of c.pts) {
+        const d = Math.sqrt((p.x - acx) ** 2 + (p.y - acy) ** 2);
+        loss += (d - r) * (d - r);
+      }
+      return loss;
+    };
+
+    let rLo = maxInset;
+    let rHi = Math.max(maxInset * 2, minDim / 2);
+    for (let iter = 0; iter < 50; iter++) {
+      const r1 = rLo + (rHi - rLo) / 3;
+      const r2 = rHi - (rHi - rLo) / 3;
+      if (evalLoss(r1) < evalLoss(r2)) rHi = r2;
+      else rLo = r1;
+    }
+    const r = (rLo + rHi) / 2;
+
+    const acx = c.cx + r * c.sx;
+    const acy = c.cy + r * c.sy;
+    let rmse = 0;
+    let maxResidual = 0;
+    for (const p of c.pts) {
+      const d = Math.sqrt((p.x - acx) ** 2 + (p.y - acy) ** 2);
+      rmse += (d - r) ** 2;
+      const ar = Math.abs(d - r);
+      if (ar > maxResidual) maxResidual = ar;
+    }
+    rmse = Math.sqrt(rmse / c.pts.length);
+
+    const rmseThresh = Math.max(0.5, r * 0.06);
+    const maxResidualThresh = Math.max(1.5, r * 0.15);
+    if (rmse > rmseThresh || maxResidual > maxResidualThresh) {
+      console.log('[RoundedRect] Corner reject: rmse=' + rmse.toFixed(2) + '/' + rmseThresh.toFixed(2) +
+        ', maxRes=' + maxResidual.toFixed(2) + '/' + maxResidualThresh.toFixed(2) + ', r=' + r.toFixed(2));
+      return null;
+    }
+    radii.push(r);
+  }
+
+  const rAvg = (radii[0] + radii[1] + radii[2] + radii[3]) / 4;
+  for (const r of radii) {
+    if (Math.abs(r - rAvg) > Math.max(1.0, rAvg * 0.18)) {
+      console.log('[RoundedRect] Radii not uniform: ' + radii.map(rr => rr.toFixed(2)).join(', '));
+      return null;
+    }
+  }
+
+  if (rAvg < 1 || rAvg > minDim / 2 + 1) return null;
+  const r = Math.min(rAvg, minDim / 2);
+
+  // Build analytical polygon (12 segments per arc → ~1° resolution; smooth on
+  // any reasonable canvas / PDF, no aliasing artifacts).
+  const ARC_POINTS = 12;
+  const result: Point[] = [];
+  const addArc = (acx: number, acy: number, startAngle: number, endAngle: number) => {
+    for (let i = 0; i <= ARC_POINTS; i++) {
+      const t = i / ARC_POINTS;
+      const a = startAngle + (endAngle - startAngle) * t;
+      result.push({ x: acx + r * Math.cos(a), y: acy + r * Math.sin(a) });
+    }
+  };
+
+  // y is down in image/canvas coords:
+  //   TL center (minX+r, minY+r): 180° → 270°
+  //   TR center (maxX-r, minY+r): 270° → 360°
+  //   BR center (maxX-r, maxY-r): 0°   → 90°
+  //   BL center (minX+r, maxY-r): 90°  → 180°
+  const PI = Math.PI;
+  addArc(minX + r, minY + r, PI, 1.5 * PI);
+  addArc(maxX - r, minY + r, 1.5 * PI, 2 * PI);
+  addArc(maxX - r, maxY - r, 0, 0.5 * PI);
+  addArc(minX + r, maxY - r, 0.5 * PI, PI);
+
+  console.log('[RoundedRect] SNAPPED: bbox=' + W.toFixed(2) + 'x' + H.toFixed(2) + ', r=' + r.toFixed(2));
+  return result;
 }
 
 /**
@@ -4195,6 +5121,937 @@ function approxPolyDP(points: Point[], epsilonFactor: number = 0.001): Point[] {
   return rdpSimplifyPolygon(points, epsilon);
 }
 
+// ──────────────────────────────────────────────────────────────────────────
+// Bezier curve reconstruction (Schneider 1990, Graphics Gems I)
+//
+// Goal: turn a dense, sub-pixel-precise polyline into a small set of cubic
+// Bezier segments + line segments that visually reproduces it within
+// `tolerancePx`. This eliminates the polygonal-chord look on smooth arcs
+// (e.g. circles, curves on logos) without softening real corners.
+//
+// Pipeline per closed loop:
+//   1. detectCornersByCurvature → boolean[] over the vertices.
+//      Real corners are preserved as ANCHORS; everything between two corners
+//      is a single segment.
+//   2. For each corner-to-corner segment:
+//      - If sub-polyline is straight (chord residual < strightTol) → 1 line.
+//      - Else → fitBeziersRecursive (Schneider) returns 1+ cubics whose
+//        max residual to the source polyline is below tolerancePx.
+//   3. Concatenate into a BezierPath { start, segments[], closed:true }.
+//
+// Closed-loop with NO real corners (e.g. ellipse, blob): we synthesize 4
+// "soft corners" at the bbox extremes (top/right/bottom/left) so the loop
+// can be expressed as 4 separate Bezier segments. This mirrors how circles
+// are conventionally represented in vector formats (4 quarter-arc Beziers)
+// and gives the fitter manageable arcs instead of trying to fit a full loop.
+// ──────────────────────────────────────────────────────────────────────────
+
+interface BezierLineSegment {
+  type: 'line';
+  to: { x: number; y: number };
+}
+
+interface BezierCubicSegment {
+  type: 'cubic';
+  cp1: { x: number; y: number };
+  cp2: { x: number; y: number };
+  to: { x: number; y: number };
+}
+
+type BezierSegment = BezierLineSegment | BezierCubicSegment;
+
+interface BezierPath {
+  start: { x: number; y: number };
+  segments: BezierSegment[];
+  closed: true;
+}
+
+// Vector helpers (kept local; existing helpers don't follow the same convention).
+function _vSub(a: Point, b: Point): Point { return { x: a.x - b.x, y: a.y - b.y }; }
+function _vAdd(a: Point, b: Point): Point { return { x: a.x + b.x, y: a.y + b.y }; }
+function _vMul(a: Point, s: number): Point { return { x: a.x * s, y: a.y * s }; }
+function _vLen(a: Point): number { return Math.sqrt(a.x * a.x + a.y * a.y); }
+function _vDot(a: Point, b: Point): number { return a.x * b.x + a.y * b.y; }
+function _vNorm(a: Point): Point {
+  const l = _vLen(a);
+  if (l < 1e-12) return { x: 0, y: 0 };
+  return { x: a.x / l, y: a.y / l };
+}
+
+function _evalBezier(p0: Point, p1: Point, p2: Point, p3: Point, t: number): Point {
+  const u = 1 - t;
+  const uu = u * u;
+  const tt = t * t;
+  const uuu = uu * u;
+  const ttt = tt * t;
+  return {
+    x: uuu * p0.x + 3 * uu * t * p1.x + 3 * u * tt * p2.x + ttt * p3.x,
+    y: uuu * p0.y + 3 * uu * t * p1.y + 3 * u * tt * p2.y + ttt * p3.y,
+  };
+}
+
+function _evalBezierD1(p0: Point, p1: Point, p2: Point, p3: Point, t: number): Point {
+  const u = 1 - t;
+  return {
+    x: 3 * u * u * (p1.x - p0.x) + 6 * u * t * (p2.x - p1.x) + 3 * t * t * (p3.x - p2.x),
+    y: 3 * u * u * (p1.y - p0.y) + 6 * u * t * (p2.y - p1.y) + 3 * t * t * (p3.y - p2.y),
+  };
+}
+
+function _evalBezierD2(p0: Point, p1: Point, p2: Point, p3: Point, t: number): Point {
+  const u = 1 - t;
+  return {
+    x: 6 * u * (p2.x - 2 * p1.x + p0.x) + 6 * t * (p3.x - 2 * p2.x + p1.x),
+    y: 6 * u * (p2.y - 2 * p1.y + p0.y) + 6 * t * (p3.y - 2 * p2.y + p1.y),
+  };
+}
+
+// Initial parameter assignment via chord-length parameterization.
+function _chordLengthParameterize(points: Point[]): number[] {
+  const n = points.length;
+  const u: number[] = new Array(n);
+  u[0] = 0;
+  for (let i = 1; i < n; i++) {
+    u[i] = u[i - 1] + _vLen(_vSub(points[i], points[i - 1]));
+  }
+  const total = u[n - 1];
+  if (total < 1e-12) {
+    for (let i = 0; i < n; i++) u[i] = i / Math.max(1, n - 1);
+  } else {
+    for (let i = 0; i < n; i++) u[i] /= total;
+  }
+  return u;
+}
+
+// Solve the 2×2 normal-equation least-squares problem for the two control-
+// point distances (α1 along leftTangent at P0, α2 along rightTangent at P3).
+// Returns the four cubic Bezier control points [P0, P1, P2, P3].
+function _generateBezier(
+  points: Point[],
+  params: number[],
+  leftTangent: Point,
+  rightTangent: Point
+): [Point, Point, Point, Point] {
+  const n = points.length;
+  const p0 = points[0];
+  const p3 = points[n - 1];
+
+  let C00 = 0, C01 = 0, C11 = 0;
+  let X0 = 0, X1 = 0;
+
+  for (let i = 0; i < n; i++) {
+    const t = params[i];
+    const u = 1 - t;
+    // A0 = 3u²t · L,  A1 = 3ut² · R
+    const a0s = 3 * u * u * t;
+    const a1s = 3 * u * t * t;
+    const A0x = a0s * leftTangent.x;
+    const A0y = a0s * leftTangent.y;
+    const A1x = a1s * rightTangent.x;
+    const A1y = a1s * rightTangent.y;
+
+    C00 += A0x * A0x + A0y * A0y;
+    C01 += A0x * A1x + A0y * A1y;
+    C11 += A1x * A1x + A1y * A1y;
+
+    // S(t) = (u³ + 3u²t)·P0 + (t³ + 3ut²)·P3 (the part with no α dependency)
+    const b03 = u * u * u + 3 * u * u * t;
+    const b30 = t * t * t + 3 * u * t * t;
+    const tmpX = points[i].x - (b03 * p0.x + b30 * p3.x);
+    const tmpY = points[i].y - (b03 * p0.y + b30 * p3.y);
+
+    X0 += A0x * tmpX + A0y * tmpY;
+    X1 += A1x * tmpX + A1y * tmpY;
+  }
+
+  const det = C00 * C11 - C01 * C01;
+  let alpha1: number;
+  let alpha2: number;
+
+  if (Math.abs(det) < 1e-12) {
+    // Degenerate — fall back to Schneider's heuristic (chord/3 along each tangent).
+    const chord = _vLen(_vSub(p3, p0)) / 3;
+    alpha1 = chord;
+    alpha2 = chord;
+  } else {
+    alpha1 = (C11 * X0 - C01 * X1) / det;
+    alpha2 = (C00 * X1 - C01 * X0) / det;
+  }
+
+  // Reject negative or absurdly large tangent magnitudes (signals over-fit /
+  // tangent direction wrong). Fall back to the chord/3 heuristic.
+  //
+  // Tightened from 4x to 1.5x chord because the previous loose cap allowed
+  // control points to overshoot far beyond the source polyline, producing
+  // cubics that visually "shortcut" through the design interior in the
+  // PDF (the polyline preview hides this because it just rasterizes the
+  // input directly).
+  const chordLen = _vLen(_vSub(p3, p0));
+  const segLenEst = Math.max(chordLen, 1e-6);
+  if (alpha1 < segLenEst * 1e-6 || alpha2 < segLenEst * 1e-6 ||
+      alpha1 > segLenEst * 1.5 || alpha2 > segLenEst * 1.5) {
+    alpha1 = chordLen / 3;
+    alpha2 = chordLen / 3;
+  }
+
+  const p1 = _vAdd(p0, _vMul(leftTangent, alpha1));
+  const p2 = _vAdd(p3, _vMul(rightTangent, alpha2));
+  return [p0, p1, p2, p3];
+}
+
+// Newton-Raphson refinement of the parameter assignment, one point at a time.
+// Returns the new parameter vector.
+function _reparameterize(
+  points: Point[],
+  params: number[],
+  bezier: [Point, Point, Point, Point]
+): number[] {
+  const out = params.slice();
+  for (let i = 0; i < points.length; i++) {
+    let t = params[i];
+    if (t <= 0 || t >= 1) continue;
+    const Q = _evalBezier(bezier[0], bezier[1], bezier[2], bezier[3], t);
+    const Q1 = _evalBezierD1(bezier[0], bezier[1], bezier[2], bezier[3], t);
+    const Q2 = _evalBezierD2(bezier[0], bezier[1], bezier[2], bezier[3], t);
+    const diff = _vSub(Q, points[i]);
+    const num = _vDot(diff, Q1);
+    const den = _vDot(Q1, Q1) + _vDot(diff, Q2);
+    if (Math.abs(den) < 1e-12) continue;
+    const tNew = t - num / den;
+    if (tNew > 0 && tNew < 1) out[i] = tNew;
+  }
+  return out;
+}
+
+// Find the parameter (and index) of the polyline point with maximum squared
+// residual to the fitted curve. Used both as the split point if the fit is
+// not good enough, and as the reported max error.
+function _findMaxError(
+  points: Point[],
+  params: number[],
+  bezier: [Point, Point, Point, Point]
+): { maxErrorSq: number; splitIndex: number } {
+  let maxErrSq = 0;
+  let splitIndex = Math.floor(points.length / 2);
+  for (let i = 1; i < points.length - 1; i++) {
+    const Q = _evalBezier(bezier[0], bezier[1], bezier[2], bezier[3], params[i]);
+    const dx = Q.x - points[i].x;
+    const dy = Q.y - points[i].y;
+    const errSq = dx * dx + dy * dy;
+    if (errSq > maxErrSq) {
+      maxErrSq = errSq;
+      splitIndex = i;
+    }
+  }
+  return { maxErrorSq: maxErrSq, splitIndex };
+}
+
+// Tangent estimation using a small finite-difference window. Returns a unit
+// vector pointing INTO the curve (i.e. from the endpoint toward the next
+// interior sample). At true corners this is a reasonable estimate; at smooth
+// joins we'll inherit tangent continuity by construction.
+function _estimateTangent(points: Point[], atIndex: number, dir: 'forward' | 'backward'): Point {
+  const n = points.length;
+  if (n < 2) return { x: 1, y: 0 };
+  // Average over up to 3 neighbors for stability against single-pixel jitter.
+  const window = Math.min(3, n - 1);
+  let acc = { x: 0, y: 0 };
+  for (let k = 1; k <= window; k++) {
+    const j = dir === 'forward' ? Math.min(n - 1, atIndex + k) : Math.max(0, atIndex - k);
+    const v = _vSub(points[j], points[atIndex]);
+    acc = _vAdd(acc, v);
+  }
+  return _vNorm(acc);
+}
+
+// Emit the input polyline as a chain of `line` segments. Used as a safe
+// fallback whenever the cubic fit fails: the PDF cut path then matches the
+// preview-rasterized polyline exactly (since the preview just draws these
+// same vertices with `lineTo`).
+function _polylineAsLineSegments(points: Point[]): BezierSegment[] {
+  const out: BezierSegment[] = [];
+  for (let i = 1; i < points.length; i++) {
+    out.push({ type: 'line', to: { x: points[i].x, y: points[i].y } });
+  }
+  return out;
+}
+
+// Schneider's recursive fitter. Given an open polyline + endpoint tangents,
+// produces an array of Bezier segments (cubics OR lines) whose union is
+// within tol of the input.
+//
+// IMPORTANT: returns BezierSegment[] (not just cubics) because at the
+// recursion depth cap we now fall back to line segments instead of a
+// potentially-degenerate cubic — see the user-reported "stray lines in PDF"
+// failure where a wild cubic shortcut across the design interior.
+function _fitBeziersRecursive(
+  points: Point[],
+  leftTangent: Point,
+  rightTangent: Point,
+  tolerancePx: number,
+  depth: number = 0
+): BezierSegment[] {
+  if (points.length < 2) return [];
+  if (points.length === 2) {
+    const p0 = points[0];
+    const p3 = points[1];
+    const chord = _vLen(_vSub(p3, p0));
+    const cp1 = _vAdd(p0, _vMul(leftTangent, chord / 3));
+    const cp2 = _vAdd(p3, _vMul(rightTangent, chord / 3));
+    return [{ type: 'cubic', cp1, cp2, to: p3 }];
+  }
+
+  let params = _chordLengthParameterize(points);
+  let bezier = _generateBezier(points, params, leftTangent, rightTangent);
+  const tolSq = tolerancePx * tolerancePx;
+
+  let result = _findMaxError(points, params, bezier);
+  if (result.maxErrorSq < tolSq) {
+    return [{ type: 'cubic', cp1: bezier[1], cp2: bezier[2], to: bezier[3] }];
+  }
+
+  // Try a few reparameterization passes if the error is "close".
+  const ITERS = 4;
+  if (result.maxErrorSq < tolSq * 16) {
+    for (let i = 0; i < ITERS; i++) {
+      params = _reparameterize(points, params, bezier);
+      bezier = _generateBezier(points, params, leftTangent, rightTangent);
+      result = _findMaxError(points, params, bezier);
+      if (result.maxErrorSq < tolSq) {
+        return [{ type: 'cubic', cp1: bezier[1], cp2: bezier[2], to: bezier[3] }];
+      }
+    }
+  }
+
+  // Recursion-depth cap: rather than emit a degenerate cubic that may
+  // overshoot wildly, fall back to line segments connecting consecutive
+  // input points. Polyline emit is always faithful to the preview.
+  if (depth > 10) {
+    return _polylineAsLineSegments(points);
+  }
+
+  const splitIndex = Math.max(1, Math.min(points.length - 2, result.splitIndex));
+  const leftPts = points.slice(0, splitIndex + 1);
+  const rightPts = points.slice(splitIndex);
+  const splitTangentForward = _estimateTangent(points, splitIndex, 'forward');
+  const splitTangentBackward = _estimateTangent(points, splitIndex, 'backward');
+
+  const leftFits = _fitBeziersRecursive(leftPts, leftTangent, splitTangentBackward, tolerancePx, depth + 1);
+  const rightFits = _fitBeziersRecursive(rightPts, splitTangentForward, rightTangent, tolerancePx, depth + 1);
+  return leftFits.concat(rightFits);
+}
+
+// Distance from point `p` to the line segment `a..b`.
+function _distPointToSegment(p: Point, a: Point, b: Point): number {
+  const dx = b.x - a.x;
+  const dy = b.y - a.y;
+  const segLenSq = dx * dx + dy * dy;
+  if (segLenSq < 1e-12) {
+    const ex = p.x - a.x;
+    const ey = p.y - a.y;
+    return Math.sqrt(ex * ex + ey * ey);
+  }
+  let t = ((p.x - a.x) * dx + (p.y - a.y) * dy) / segLenSq;
+  if (t < 0) t = 0;
+  else if (t > 1) t = 1;
+  const cx = a.x + t * dx;
+  const cy = a.y + t * dy;
+  const ex = p.x - cx;
+  const ey = p.y - cy;
+  return Math.sqrt(ex * ex + ey * ey);
+}
+
+// Validate fitted segments against the source sub-polyline. We sample each
+// cubic densely and check that every sample is within `validationTolPx` of
+// the source polyline. We also reject cubics whose control points lie
+// wildly outside the source polyline's bounding box (sentinel for
+// "Schneider produced a fit that overshoots").
+//
+// Returns true if all segments are within tolerance.
+function _validateBezierSegments(
+  source: Point[],
+  segments: BezierSegment[],
+  startPt: Point,
+  validationTolPx: number
+): boolean {
+  if (segments.length === 0) return false;
+
+  // Source bbox + slack for control-point envelope check.
+  let sMinX = Infinity, sMinY = Infinity, sMaxX = -Infinity, sMaxY = -Infinity;
+  for (const p of source) {
+    if (p.x < sMinX) sMinX = p.x;
+    if (p.x > sMaxX) sMaxX = p.x;
+    if (p.y < sMinY) sMinY = p.y;
+    if (p.y > sMaxY) sMaxY = p.y;
+  }
+  const bw = Math.max(1, sMaxX - sMinX);
+  const bh = Math.max(1, sMaxY - sMinY);
+  // Allow control points to extend up to 50% of bbox size beyond the bbox
+  // (cubics legitimately put control points outside the polyline envelope).
+  const envSlack = Math.max(bw, bh) * 0.5;
+  const eMinX = sMinX - envSlack;
+  const eMinY = sMinY - envSlack;
+  const eMaxX = sMaxX + envSlack;
+  const eMaxY = sMaxY + envSlack;
+
+  let cur: Point = startPt;
+  const SAMPLES_PER_CUBIC = 12;
+  for (const seg of segments) {
+    if (seg.type === 'line') {
+      // Lines are always faithful — they're segments connecting source vertices.
+      cur = seg.to;
+      continue;
+    }
+    // Control-point envelope check: if either control point is outside the
+    // generous envelope, the cubic will overshoot dramatically.
+    if (
+      seg.cp1.x < eMinX || seg.cp1.x > eMaxX || seg.cp1.y < eMinY || seg.cp1.y > eMaxY ||
+      seg.cp2.x < eMinX || seg.cp2.x > eMaxX || seg.cp2.y < eMinY || seg.cp2.y > eMaxY
+    ) {
+      return false;
+    }
+    // Sample the cubic and check distance to nearest source segment.
+    for (let s = 1; s <= SAMPLES_PER_CUBIC; s++) {
+      const t = s / SAMPLES_PER_CUBIC;
+      const samplePt = _evalBezier(cur, seg.cp1, seg.cp2, seg.to, t);
+      let minDist = Infinity;
+      for (let i = 0; i < source.length - 1; i++) {
+        const d = _distPointToSegment(samplePt, source[i], source[i + 1]);
+        if (d < minDist) {
+          minDist = d;
+          if (minDist <= validationTolPx) break;
+        }
+      }
+      if (minDist > validationTolPx) return false;
+    }
+    cur = seg.to;
+  }
+  return true;
+}
+
+// ──────────────────────────────────────────────────────────────────────────
+// Ellipse detection + analytical 4-arc Bezier emission
+// (Step 6 of the corner-aware Bezier reconstruction plan.)
+//
+// For closed polylines that visually represent an ellipse (or circle), we
+// fit an algebraic ellipse via PCA on the boundary points, then refine the
+// semi-axes via 1D bisection-search to minimize the radial residual. If the
+// residual is below `acceptanceRadialFraction` of the minor semi-axis, we
+// emit the ellipse as 4 perfect cubic-Bezier quarter-arcs using the standard
+// circle-cubic-approximation constant κ = 4(√2-1)/3 ≈ 0.5523.
+//
+// Why PCA-based fit instead of full Fitzgibbon DLS: Fitzgibbon's algorithm
+// requires solving a 6×6 generalized eigenvalue problem with matrix
+// inversion + eigendecomposition — heavyweight for the worker. PCA on the
+// boundary points gives the correct centroid and orientation directly; the
+// only remaining degree of freedom is the two semi-axis lengths, which we
+// solve via a quick 1D refinement. For our use case (clean, closed
+// silhouettes from sub-pixel marching squares) this converges to the same
+// answer as Fitzgibbon to well within tracer-noise tolerance.
+//
+// NOTE: this is invoked AFTER detectAndSnapRoundedRect, so rectangles with
+// rounded corners are handled before ellipse detection runs (otherwise a
+// rectangle whose aspect ratio is close to its corner radius could
+// false-positive as an ellipse).
+// ──────────────────────────────────────────────────────────────────────────
+
+interface EllipseFit {
+  cx: number;
+  cy: number;
+  rx: number;     // major semi-axis
+  ry: number;     // minor semi-axis
+  theta: number;  // rotation angle (radians) of the major axis from +X
+  rmsResidualPx: number;
+  maxResidualPx: number;
+}
+
+// Distance from `p` to the ellipse boundary (axis-aligned, centered at origin).
+// Uses the standard parametric-angle approximation: project p to a parametric
+// angle, evaluate the ellipse at that angle, take Euclidean distance. This is
+// not the true closest-point distance for highly elongated ellipses but is
+// accurate to better than 0.1% for aspect ratios <= 5:1, which covers
+// essentially all realistic logo/design ellipses.
+function _ellipseRadialDist(px: number, py: number, rx: number, ry: number): number {
+  if (rx < 1e-9 || ry < 1e-9) {
+    return Math.sqrt(px * px + py * py);
+  }
+  const angle = Math.atan2(py / ry, px / rx);
+  const ex = rx * Math.cos(angle);
+  const ey = ry * Math.sin(angle);
+  const dx = px - ex;
+  const dy = py - ey;
+  return Math.sqrt(dx * dx + dy * dy);
+}
+
+// Compute residual statistics (rms, max) for a candidate ellipse against a
+// closed polyline. Operates on points already transformed into ellipse-local
+// (axis-aligned, centered) coords.
+function _ellipseResiduals(
+  localPts: Point[],
+  rx: number,
+  ry: number
+): { rms: number; max: number } {
+  let sumSq = 0;
+  let maxD = 0;
+  for (const p of localPts) {
+    const d = _ellipseRadialDist(p.x, p.y, rx, ry);
+    sumSq += d * d;
+    if (d > maxD) maxD = d;
+  }
+  return { rms: Math.sqrt(sumSq / localPts.length), max: maxD };
+}
+
+function detectAndSnapEllipse(
+  polyline: Point[],
+  acceptanceRadialFraction: number = 0.04
+): EllipseFit | null {
+  const n = polyline.length;
+  if (n < 12) return null;
+
+  // 1) Centroid (arithmetic mean of vertices). For uniformly-sampled boundary
+  //    points this is the ellipse center. The sub-pixel marching squares output
+  //    is approximately uniform in arc length so this holds well.
+  let cx = 0, cy = 0;
+  for (const p of polyline) { cx += p.x; cy += p.y; }
+  cx /= n; cy /= n;
+
+  // 2) Centered covariance matrix → eigenvalues/vectors give principal axes.
+  let sxx = 0, sxy = 0, syy = 0;
+  for (const p of polyline) {
+    const dx = p.x - cx;
+    const dy = p.y - cy;
+    sxx += dx * dx;
+    sxy += dx * dy;
+    syy += dy * dy;
+  }
+  sxx /= n; sxy /= n; syy /= n;
+
+  // 2×2 closed-form eigendecomposition.
+  const tr = sxx + syy;
+  const det = sxx * syy - sxy * sxy;
+  const disc = Math.sqrt(Math.max(0, (tr * tr) / 4 - det));
+  const lambda1 = tr / 2 + disc;  // larger eigenvalue → major axis
+  const lambda2 = tr / 2 - disc;  // smaller eigenvalue → minor axis
+  if (lambda1 <= 0 || lambda2 <= 0) return null;
+
+  // Eigenvector for lambda1 (major-axis direction).
+  let evx: number, evy: number;
+  if (Math.abs(sxy) > 1e-9) {
+    evx = lambda1 - syy;
+    evy = sxy;
+    const len = Math.sqrt(evx * evx + evy * evy);
+    if (len < 1e-9) { evx = 1; evy = 0; }
+    else { evx /= len; evy /= len; }
+  } else {
+    if (sxx >= syy) { evx = 1; evy = 0; }
+    else { evx = 0; evy = 1; }
+  }
+  const theta = Math.atan2(evy, evx);
+
+  // 3) Initial semi-axes: for a uniformly-sampled ellipse boundary the
+  //    covariance eigenvalue ≈ semi-axis² / 2 (exact for circles; close
+  //    enough for moderate aspect ratios). We then refine.
+  let rxInit = Math.sqrt(2 * lambda1);
+  let ryInit = Math.sqrt(2 * lambda2);
+  if (rxInit < 3 || ryInit < 3) return null;
+  if (rxInit / ryInit > 8) return null; // implausibly elongated → skip ellipse fit
+
+  // 4) Transform polyline into ellipse-local coords (centered, axis-aligned).
+  const cosT = Math.cos(-theta);
+  const sinT = Math.sin(-theta);
+  const localPts: Point[] = polyline.map(p => {
+    const dx = p.x - cx;
+    const dy = p.y - cy;
+    return {
+      x: dx * cosT - dy * sinT,
+      y: dx * sinT + dy * cosT,
+    };
+  });
+
+  // 5) Refine rx, ry via coordinate-descent bisection. Each iteration
+  //    minimizes the sum of squared radial residuals over rx (with ry fixed)
+  //    then over ry (with rx fixed). 4-6 iterations converges in practice.
+  let rx = rxInit;
+  let ry = ryInit;
+  const refineAxis = (current: number, isRx: boolean): number => {
+    const lo = current * 0.7;
+    const hi = current * 1.4;
+    let best = current;
+    let bestSqSum = Infinity;
+    const STEPS = 12;
+    for (let s = 0; s <= STEPS; s++) {
+      const t = lo + (hi - lo) * (s / STEPS);
+      const tryRx = isRx ? t : rx;
+      const tryRy = isRx ? ry : t;
+      let sqSum = 0;
+      for (const p of localPts) {
+        const d = _ellipseRadialDist(p.x, p.y, tryRx, tryRy);
+        sqSum += d * d;
+        if (sqSum > bestSqSum) break;
+      }
+      if (sqSum < bestSqSum) { bestSqSum = sqSum; best = t; }
+    }
+    return best;
+  };
+  for (let it = 0; it < 5; it++) {
+    const newRx = refineAxis(rx, true);
+    const newRy = refineAxis(ry, false);
+    const delta = Math.abs(newRx - rx) + Math.abs(newRy - ry);
+    rx = newRx;
+    ry = newRy;
+    if (delta < 0.01) break;
+  }
+
+  // 6) Final residuals and acceptance check.
+  const { rms, max } = _ellipseResiduals(localPts, rx, ry);
+  const minorAxis = Math.min(rx, ry);
+  // Both RMS and max gates: RMS measures average fit, max guards against a
+  // few way-off vertices that would visibly deviate from the smooth ellipse.
+  const rmsOk = rms <= minorAxis * acceptanceRadialFraction;
+  const maxOk = max <= minorAxis * (acceptanceRadialFraction * 2.5);
+  if (!rmsOk || !maxOk) return null;
+
+  return { cx, cy, rx, ry, theta, rmsResidualPx: rms, maxResidualPx: max };
+}
+
+// Build a closed BezierPath of 4 cubic-Bezier quarter-arcs that exactly
+// approximates the ellipse to ~0.027% error (the standard κ approximation).
+function ellipseToBezierPath(e: EllipseFit): BezierPath {
+  const KAPPA = 0.5522847498307933; // 4 * (sqrt(2) - 1) / 3
+  const cosT = Math.cos(e.theta);
+  const sinT = Math.sin(e.theta);
+  const xform = (lx: number, ly: number): Point => ({
+    x: e.cx + lx * cosT - ly * sinT,
+    y: e.cy + lx * sinT + ly * cosT,
+  });
+  const rx = e.rx;
+  const ry = e.ry;
+  const k_rx = KAPPA * rx;
+  const k_ry = KAPPA * ry;
+
+  const start = xform(rx, 0);
+  const segments: BezierSegment[] = [
+    // Q1: (rx, 0) → (0, ry)
+    { type: 'cubic', cp1: xform(rx,  k_ry), cp2: xform(k_rx,  ry),  to: xform(0,  ry) },
+    // Q2: (0, ry) → (-rx, 0)
+    { type: 'cubic', cp1: xform(-k_rx, ry), cp2: xform(-rx,  k_ry), to: xform(-rx, 0) },
+    // Q3: (-rx, 0) → (0, -ry)
+    { type: 'cubic', cp1: xform(-rx, -k_ry), cp2: xform(-k_rx, -ry), to: xform(0, -ry) },
+    // Q4: (0, -ry) → (rx, 0)
+    { type: 'cubic', cp1: xform(k_rx, -ry), cp2: xform(rx,  -k_ry), to: xform(rx,  0) },
+  ];
+  return { start, segments, closed: true };
+}
+
+// Curvature-based corner detection.
+//
+// A "corner" is a vertex where the CUMULATIVE turning angle inside a small
+// window crosses `cornerThresholdDeg` AND that vertex is the LOCAL MAX of
+// turning within an arc-length-sized neighborhood. The combination of:
+//   1. windowed turn (groups multiple sub-pixel turns at a real corner so
+//      they're counted together — handles dense polylines from sub-pixel
+//      marching squares where a 90° corner can be spread over 3-5 vertices),
+//   2. arc-length-sized non-maximum suppression (forces detected corners to
+//      be at least `nmsArcPx` apart so smooth-curve segments aren't
+//      fragmented into hundreds of tiny micro-arcs each producing a
+//      degenerate cubic),
+//   3. a strict threshold,
+// gives a corner set that matches what the eye perceives as "real corners"
+// — sharp tips, fingertips, text serifs — and ignores the gentle curvature
+// changes that should remain part of a smooth fitted curve.
+//
+// Returns a boolean[] aligned with `points`; closed-loop semantics.
+function detectCornersByCurvature(
+  points: Point[],
+  windowArcPx: number = 3,
+  cornerThresholdDeg: number = 70,
+  nmsArcPx: number = 12
+): boolean[] {
+  const n = points.length;
+  const isCorner = new Array(n).fill(false);
+  if (n < 5) return isCorner;
+
+  // Compute perimeter and average vertex spacing for arc-length scaling.
+  let perim = 0;
+  for (let i = 0; i < n; i++) {
+    const a = points[i];
+    const b = points[(i + 1) % n];
+    perim += Math.sqrt((b.x - a.x) ** 2 + (b.y - a.y) ** 2);
+  }
+  const avgSpacing = Math.max(0.05, perim / n);
+  const windowK = Math.max(2, Math.min(Math.floor(n / 4), Math.round(windowArcPx / avgSpacing)));
+  const nmsHalf = Math.max(windowK + 1, Math.min(Math.floor(n / 4), Math.round(nmsArcPx / avgSpacing)));
+  const thresh = cornerThresholdDeg * Math.PI / 180;
+
+  // Per-vertex windowed turning angle. This is the "corner score" — a real
+  // corner has a high score because the small window concentrates its turn;
+  // a smooth arc has a low score because the same total turn is spread over
+  // many vertices.
+  const score = new Array(n).fill(0);
+  for (let i = 0; i < n; i++) {
+    let totalTurn = 0;
+    for (let off = -windowK + 1; off <= windowK - 1; off++) {
+      const ia = (i + off - 1 + n) % n;
+      const ib = (i + off + n) % n;
+      const ic = (i + off + 1 + n) % n;
+      const v1x = points[ib].x - points[ia].x;
+      const v1y = points[ib].y - points[ia].y;
+      const v2x = points[ic].x - points[ib].x;
+      const v2y = points[ic].y - points[ib].y;
+      const l1 = Math.sqrt(v1x * v1x + v1y * v1y);
+      const l2 = Math.sqrt(v2x * v2x + v2y * v2y);
+      if (l1 < 1e-9 || l2 < 1e-9) continue;
+      const cross = v1x * v2y - v1y * v2x;
+      const dot = v1x * v2x + v1y * v2y;
+      totalTurn += Math.abs(Math.atan2(cross, dot));
+    }
+    score[i] = totalTurn;
+  }
+
+  // Mark above-threshold vertices, then run NMS on the score field — only
+  // the strongest vertex within ±nmsHalf survives. This is what guarantees
+  // adjacent "soft" features don't all become corners.
+  for (let i = 0; i < n; i++) {
+    if (score[i] <= thresh) continue;
+    let isMax = true;
+    for (let off = -nmsHalf; off <= nmsHalf; off++) {
+      if (off === 0) continue;
+      const j = (i + off + n) % n;
+      if (score[j] > score[i]) { isMax = false; break; }
+    }
+    if (isMax) isCorner[i] = true;
+  }
+
+  return isCorner;
+}
+
+// Maximum perpendicular distance from any interior point to the chord
+// (start..end). Used to decide if a sub-polyline is "straight enough" to
+// emit as a single line segment instead of running the curve fitter.
+function _maxChordDeviation(points: Point[]): number {
+  if (points.length < 3) return 0;
+  const a = points[0];
+  const b = points[points.length - 1];
+  const dx = b.x - a.x;
+  const dy = b.y - a.y;
+  const len = Math.sqrt(dx * dx + dy * dy);
+  if (len < 1e-9) return 0;
+  let maxDev = 0;
+  for (let i = 1; i < points.length - 1; i++) {
+    const px = points[i].x - a.x;
+    const py = points[i].y - a.y;
+    // perp dist = |cross(d, p)| / |d|
+    const dev = Math.abs(dx * py - dy * px) / len;
+    if (dev > maxDev) maxDev = dev;
+  }
+  return maxDev;
+}
+
+// Top-level: convert a closed polyline into a BezierPath.
+//
+// `tolerancePx` controls fit tightness — at the SUPER_SAMPLE-downscaled coord
+// space we operate in, 0.4 px ≈ 0.001" at 300 DPI which is well below
+// visible threshold. `straightTolPx` controls when a sub-segment qualifies
+// as a single straight line.
+function polylineToBezierPath(
+  closedPolyline: Point[],
+  tolerancePx: number = 1.0,
+  straightTolPx: number = 0.7
+): BezierPath {
+  const n = closedPolyline.length;
+  if (n < 3) {
+    return {
+      start: closedPolyline[0] || { x: 0, y: 0 },
+      segments: [],
+      closed: true,
+    };
+  }
+
+  // 0) Analytical ellipse snap. Before any corner detection / Schneider
+  //    fitting, check whether this whole closed polyline IS an ellipse
+  //    (or circle). If so, emit 4 perfect cubic-Bezier quarter-arcs —
+  //    mathematically exact, ~16 anchor+control points instead of dozens
+  //    of fitted micro-cubics. Acceptance is gated on a tight radial
+  //    residual so this only triggers on actually-elliptical shapes.
+  const ellipse = detectAndSnapEllipse(closedPolyline, 0.04);
+  if (ellipse) {
+    console.log(
+      '[Worker] Ellipse snap accepted: cx=' + ellipse.cx.toFixed(2) +
+      ', cy=' + ellipse.cy.toFixed(2) +
+      ', rx=' + ellipse.rx.toFixed(2) +
+      ', ry=' + ellipse.ry.toFixed(2) +
+      ', theta=' + (ellipse.theta * 180 / Math.PI).toFixed(1) + '°' +
+      ', rms=' + ellipse.rmsResidualPx.toFixed(3) + 'px' +
+      ', max=' + ellipse.maxResidualPx.toFixed(3) + 'px' +
+      ' → emitting 4 quarter-arc cubics'
+    );
+    return ellipseToBezierPath(ellipse);
+  }
+
+  // 1) Detect real corners. Strict threshold (70°), narrow detection window
+  //    (~3 px of arc), wide NMS (~12 px of arc) — this combination is what
+  //    distinguishes "actual corner that needs a tangent break" from "soft
+  //    bend in a smooth arc". Without strict NMS the dense-polyline (post
+  //    light-RDP) input fragments into hundreds of micro-corners → micro-
+  //    sub-segments → degenerate near-linear cubics → rough-looking PDF.
+  let corners = detectCornersByCurvature(closedPolyline, 3, 70, 12);
+
+  // 2) If no real corners exist (e.g. ellipse/blob), synthesize 4 soft
+  //    corners at the bbox extremes (top, right, bottom, left). This breaks
+  //    the loop into 4 manageable arcs.
+  let cornerIndices: number[] = [];
+  for (let i = 0; i < n; i++) if (corners[i]) cornerIndices.push(i);
+  if (cornerIndices.length < 2) {
+    let topI = 0, rightI = 0, bottomI = 0, leftI = 0;
+    let topY = closedPolyline[0].y, bottomY = closedPolyline[0].y;
+    let rightX = closedPolyline[0].x, leftX = closedPolyline[0].x;
+    for (let i = 1; i < n; i++) {
+      const p = closedPolyline[i];
+      if (p.y < topY) { topY = p.y; topI = i; }
+      if (p.y > bottomY) { bottomY = p.y; bottomI = i; }
+      if (p.x > rightX) { rightX = p.x; rightI = i; }
+      if (p.x < leftX) { leftX = p.x; leftI = i; }
+    }
+    cornerIndices = Array.from(new Set([topI, rightI, bottomI, leftI])).sort((a, b) => a - b);
+    corners = new Array(n).fill(false);
+    for (const i of cornerIndices) corners[i] = true;
+  }
+
+  // 3) Walk corner-to-corner segments around the closed loop and fit each.
+  const start = closedPolyline[cornerIndices[0]];
+  const segments: BezierSegment[] = [];
+
+  for (let ci = 0; ci < cornerIndices.length; ci++) {
+    const startIdx = cornerIndices[ci];
+    const endIdx = cornerIndices[(ci + 1) % cornerIndices.length];
+
+    // Extract sub-polyline [startIdx ... endIdx] (cyclic).
+    const sub: Point[] = [];
+    if (endIdx > startIdx) {
+      for (let i = startIdx; i <= endIdx; i++) sub.push(closedPolyline[i]);
+    } else {
+      for (let i = startIdx; i < n; i++) sub.push(closedPolyline[i]);
+      for (let i = 0; i <= endIdx; i++) sub.push(closedPolyline[i]);
+    }
+
+    if (sub.length < 2) continue;
+
+    // Straight-segment shortcut: if every interior point is within
+    // straightTolPx of the chord, emit a line.
+    if (sub.length === 2 || _maxChordDeviation(sub) <= straightTolPx) {
+      segments.push({ type: 'line', to: sub[sub.length - 1] });
+      continue;
+    }
+
+    // Curved segment — estimate tangents and fit cubics.
+    const leftTangent = _estimateTangent(sub, 0, 'forward');
+    const rightTangent = _estimateTangent(sub, sub.length - 1, 'backward');
+    const fittedSegs = _fitBeziersRecursive(sub, leftTangent, rightTangent, tolerancePx, 0);
+
+    // VALIDATION GATE — the critical correctness check that prevents the
+    // "stray pink lines in PDF" failure mode. The Schneider fit can produce
+    // cubics whose control points overshoot enough to make the curve
+    // shortcut through the design interior, even though the fit residual at
+    // the polyline vertices is "OK". The preview hides this because it
+    // rasterizes the source polyline directly. Here we sample the fitted
+    // cubics back and confirm every sample stays within `validationTolPx`
+    // of the source sub-polyline; if not, fall back to line segments
+    // (which are guaranteed to match the preview pixel-for-pixel).
+    //
+    // validationTolPx is intentionally LOOSER than tolerancePx (1.5 px vs.
+    // 0.4 px) — the recursion target is tight, but we only reject fits that
+    // visibly diverge.
+    const validationTolPx = Math.max(1.5, tolerancePx * 2.5);
+    const valid = _validateBezierSegments(sub, fittedSegs, sub[0], validationTolPx);
+    if (valid) {
+      for (const c of fittedSegs) segments.push(c);
+    } else {
+      // Fallback: do NOT emit every dense polyline vertex as a separate line
+      // (that produces dozens of tiny `l` operators per failed sub-segment,
+      // which is the exact "rough chains of micro-segments" pattern the user
+      // reported). Instead RDP-simplify the sub-polyline to a coarser
+      // resolution before emitting lines — the result is still pixel-faithful
+      // (RDP epsilon ≤ validationTolPx) but visually as smooth as the
+      // simplified polygon allows.
+      const fallbackEps = Math.max(0.8, tolerancePx);
+      const subPerim = Math.max(1, calculatePerimeter(sub));
+      const simplifiedSub = approxPolyDP(sub, fallbackEps / subPerim);
+      const useSub = simplifiedSub.length >= 2 ? simplifiedSub : sub;
+      console.warn(
+        '[Worker] Bezier fit failed validation for sub-polyline (n=' + sub.length + ', segs=' +
+        fittedSegs.length + ') — falling back to ' + (useSub.length - 1) + ' line segments (RDP-simplified)'
+      );
+      for (const lineSeg of _polylineAsLineSegments(useSub)) segments.push(lineSeg);
+    }
+  }
+
+  return { start, segments, closed: true };
+}
+
+// Sample a BezierPath back into a dense polyline (for raster preview
+// rendering, sliver guards, area calculations, etc.). Lines emit 2 pts;
+// cubics are sampled at `samplesPerCubic` intermediate parameters.
+function sampleBezierPathToPolyline(path: BezierPath, samplesPerCubic: number = 16): Point[] {
+  const out: Point[] = [];
+  if (path.segments.length === 0) return out;
+  out.push({ x: path.start.x, y: path.start.y });
+  let cur: Point = path.start;
+  for (const seg of path.segments) {
+    if (seg.type === 'line') {
+      out.push({ x: seg.to.x, y: seg.to.y });
+      cur = seg.to;
+    } else {
+      for (let i = 1; i <= samplesPerCubic; i++) {
+        const t = i / samplesPerCubic;
+        out.push(_evalBezier(cur, seg.cp1, seg.cp2, seg.to, t));
+      }
+      cur = seg.to;
+    }
+  }
+  return out;
+}
+
+// Convert a BezierPath in pixel coordinates → BezierPath in inches in the
+// PDF coordinate system (Y-flipped, offset by minPath / bleed).
+function bezierPathPxToInches(
+  path: BezierPath,
+  minPathX: number,
+  minPathY: number,
+  effectiveDPI: number,
+  bleedInches: number,
+  pageHeightInches: number
+): BezierPath {
+  const cvt = (p: { x: number; y: number }) => ({
+    x: ((p.x - minPathX) / effectiveDPI) + bleedInches,
+    y: pageHeightInches - (((p.y - minPathY) / effectiveDPI) + bleedInches),
+  });
+  return {
+    start: cvt(path.start),
+    segments: path.segments.map(seg =>
+      seg.type === 'line'
+        ? { type: 'line', to: cvt(seg.to) }
+        : { type: 'cubic', cp1: cvt(seg.cp1), cp2: cvt(seg.cp2), to: cvt(seg.to) }
+    ),
+    closed: true,
+  };
+}
+
+// Multiply every point in a BezierPath by `scale`. Used by the worker
+// dispatcher's downscale-rescale path so bezier paths produced at scaled DPI
+// can be remapped to original-image pixel coordinates.
+function bezierPathScale(path: BezierPath, scale: number): BezierPath {
+  const sm = (p: { x: number; y: number }) => ({ x: p.x * scale, y: p.y * scale });
+  return {
+    start: sm(path.start),
+    segments: path.segments.map(seg =>
+      seg.type === 'line'
+        ? { type: 'line', to: sm(seg.to) }
+        : { type: 'cubic', cp1: sm(seg.cp1), cp2: sm(seg.cp2), to: sm(seg.to) }
+    ),
+    closed: true,
+  };
+}
+
 // Ramer-Douglas-Peucker algorithm for path simplification
 // "Pulls the line tight" instead of creating waves like moving average
 function douglasPeucker(points: Point[], epsilon: number): Point[] {
@@ -4396,6 +6253,117 @@ function sanitizePolygonForOffset(points: Point[]): Point[] {
   return result;
 }
 
+/**
+ * Zero Hero / preview: Chaikin + approxPolyDP can produce self-intersecting rings.
+ * Canvas nonzero fill then "cancels" regions and clips the design along arbitrary diagonals.
+ * Clipper SimplifyPolygon splits bow-ties into simple polygons.
+ *
+ * We also drop sliver / degenerate parts — when a bow-tie is split, RDP produces tiny near-collinear
+ * "sticks" that, if emitted as cut paths, render as a long straight diagonal line in the PDF.
+ * Sliver criteria:
+ *   - absolute area < `MIN_AREA_PX2`
+ *   - density (area / bbox area) very low (line-like)
+ *   - relative area < 0.5% of the largest part (likely an artifact of the de-self-intersect on a ring)
+ */
+function simplifyClosedPathToSimpleParts(points: Point[]): Point[][] {
+  if (points.length < 3) return [];
+  const clipperPath = points.map((p) => ({
+    X: Math.round(p.x * CLIPPER_SCALE),
+    Y: Math.round(p.y * CLIPPER_SCALE),
+  }));
+  const simplified = ClipperLib.Clipper.SimplifyPolygon(
+    clipperPath,
+    ClipperLib.PolyFillType.pftNonZero
+  );
+  if (!simplified || simplified.length === 0) return [points];
+
+  type Candidate = { pts: Point[]; area: number; density: number };
+  const candidates: Candidate[] = [];
+  for (const poly of simplified) {
+    if (!poly || poly.length < 3) continue;
+    ClipperLib.Clipper.CleanPolygon(poly, CLIPPER_SCALE * 0.107);
+    if (poly.length < 3) continue;
+    const pts = poly.map((p) => ({ x: p.X / CLIPPER_SCALE, y: p.Y / CLIPPER_SCALE }));
+    const area = Math.abs(polygonArea(pts));
+    let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
+    for (const p of pts) {
+      if (p.x < minX) minX = p.x;
+      if (p.x > maxX) maxX = p.x;
+      if (p.y < minY) minY = p.y;
+      if (p.y > maxY) maxY = p.y;
+    }
+    const bw = Math.max(1e-3, maxX - minX);
+    const bh = Math.max(1e-3, maxY - minY);
+    const density = area / (bw * bh);
+    candidates.push({ pts, area, density });
+  }
+  if (candidates.length === 0) return [points];
+
+  const MIN_AREA_PX2 = 4; // anything tinier is rounding noise
+  const MIN_DENSITY = 0.02; // < 2% area-to-bbox is a sliver/line
+  const REL_TO_LARGEST = 0.005; // <0.5% of the largest part is bow-tie shrapnel
+  const MAX_ASPECT_VS_LARGEST = 8; // long thin polygons whose long axis spans the largest part
+
+  // Largest by area + its bbox dimensions (used as the parent reference frame
+  // for detecting "spans-the-whole-design" diagonal slashes).
+  const largest = candidates.reduce((best, c) => (c.area > best.area ? c : best), candidates[0]);
+  const largestArea = largest.area;
+  let lMinX = Infinity, lMinY = Infinity, lMaxX = -Infinity, lMaxY = -Infinity;
+  for (const p of largest.pts) {
+    if (p.x < lMinX) lMinX = p.x;
+    if (p.x > lMaxX) lMaxX = p.x;
+    if (p.y < lMinY) lMinY = p.y;
+    if (p.y > lMaxY) lMaxY = p.y;
+  }
+  const lW = Math.max(1, lMaxX - lMinX);
+  const lH = Math.max(1, lMaxY - lMinY);
+
+  const filtered = candidates.filter((c) => {
+    if (c.area < MIN_AREA_PX2) return false;
+    if (c.density < MIN_DENSITY) return false;
+    if (largestArea > 0 && c.area / largestArea < REL_TO_LARGEST) return false;
+
+    // Skip the largest itself for the aspect/spans check (it IS the cut path).
+    if (c === largest) return true;
+
+    // Diagonal-slash guard: bow-tie split remnants are extremely elongated AND
+    // their long axis covers most of the parent bbox in one dimension. Real
+    // detail (eyes, small islands, etc.) is locally compact — they don't span.
+    let pMinX = Infinity, pMinY = Infinity, pMaxX = -Infinity, pMaxY = -Infinity;
+    for (const p of c.pts) {
+      if (p.x < pMinX) pMinX = p.x;
+      if (p.x > pMaxX) pMaxX = p.x;
+      if (p.y < pMinY) pMinY = p.y;
+      if (p.y > pMaxY) pMaxY = p.y;
+    }
+    const pW = pMaxX - pMinX;
+    const pH = pMaxY - pMinY;
+    const pLong = Math.max(pW, pH);
+    const pShort = Math.max(0.5, Math.min(pW, pH));
+    const elongation = pLong / pShort;
+    const spansLargest = Math.max(pW / lW, pH / lH);
+    if (elongation > MAX_ASPECT_VS_LARGEST && spansLargest > 0.4) {
+      console.log(
+        '[Worker] simplifyClosedPathToSimpleParts: dropping diagonal-slash sliver — elongation=' +
+          elongation.toFixed(1) + ', spans=' + spansLargest.toFixed(2) + ', area=' + c.area.toFixed(1)
+      );
+      return false;
+    }
+    return true;
+  });
+
+  const kept = filtered.length > 0 ? filtered : [largest];
+  if (kept.length !== candidates.length) {
+    console.log(
+      '[Worker] simplifyClosedPathToSimpleParts: dropped',
+      candidates.length - kept.length,
+      'sliver/degenerate part(s); kept',
+      kept.length
+    );
+  }
+  return kept.map((c) => c.pts);
+}
+
 // Chaikin's corner-cutting algorithm to smooth pixel-step jaggies
 // Replaces each shallow-angle corner with two points: Q (75% toward next) and R (25% toward next)
 // Sharp corners (>sharpAngleThreshold) are preserved to maintain diamond tips
@@ -4465,6 +6433,38 @@ function straightenNoisyLines(points: Point[], cornerAngleThreshold: number = 25
   if (points.length < 4) return points;
   
   const n = points.length;
+
+  // Cap how far a single straight segment can extend, so the algorithm cannot
+  // collapse a long curved stretch into a chord that "shortcuts" across the
+  // polygon (a known cause of bow-tie self-intersections downstream).
+  //
+  // The cap is anchored to the polygon's *short bounding-box dimension*, not
+  // its perimeter. Perimeter scales with boundary detail (a fluffy cloud has
+  // a huge perimeter relative to its bbox) which would let the cap balloon to
+  // the point of being useless. Bbox short side is the right anchor: it's the
+  // largest a *legitimate* edge could ever be (e.g. a short side of a
+  // rectangle), so any chord exceeding ~25% of it is suspiciously a shortcut.
+  let bbMinX = Infinity, bbMinY = Infinity, bbMaxX = -Infinity, bbMaxY = -Infinity;
+  for (let i = 0; i < n; i++) {
+    const p = points[i];
+    if (p.x < bbMinX) bbMinX = p.x;
+    if (p.x > bbMaxX) bbMaxX = p.x;
+    if (p.y < bbMinY) bbMinY = p.y;
+    if (p.y > bbMaxY) bbMaxY = p.y;
+  }
+  const bbShort = Math.max(1, Math.min(bbMaxX - bbMinX, bbMaxY - bbMinY));
+  const bbLong = Math.max(1, Math.max(bbMaxX - bbMinX, bbMaxY - bbMinY));
+  // Allow legitimate long edges (rectangle sides) up to ~bbShort, but cap
+  // chords at 1.0 × bbShort. This still permits one straight side of a
+  // square/rect (whose long side can be at most bbShort for a square, and
+  // exactly bbShort along the short axis for a tall rectangle). For tall
+  // rectangles, the LONG side is along bbLong but it gets traced as a
+  // sequence of sub-segments — that's fine, we just lose the "fewer points"
+  // optimization, not correctness.
+  const maxChordLen = Math.max(8, bbShort);
+  // For very elongated bboxes, also clamp at a fraction of the long side
+  // (defense-in-depth against weird geometries).
+  const maxChordLenFinal = Math.min(maxChordLen, bbLong * 0.5);
   
   // First, identify corner points that must be preserved
   const isCorner: boolean[] = new Array(n).fill(false);
@@ -4533,6 +6533,14 @@ function straightenNoisyLines(points: Point[], cornerAngleThreshold: number = 25
       if (lineLen < 0.0001) {
         segmentEnd++;
         continue;
+      }
+
+      // Hard cap on chord length: prevents the greedy extension from creating
+      // a long shortcut that crosses other parts of a closed polygon — the
+      // root cause of bow-tie self-intersections that downstream code then
+      // splits into a "diagonal slash" sliver.
+      if (lineLen > maxChordLenFinal) {
+        break;
       }
       
       // Check if segment is near-axis-aligned (stair-step prone)
@@ -5053,7 +7061,7 @@ function drawContourToData(
       }
       ctx.closePath();
       ctx.stroke();
-      ctx.fill();
+      ctx.fill('evenodd');
     }
     
     // Draw cut line (magenta) - make it visible at any DPI
@@ -5144,7 +7152,7 @@ function drawHoleCutout(
     ctx.lineTo(path[i].x + offsetX, path[i].y + offsetY);
   }
   ctx.closePath();
-  ctx.fill();
+  ctx.fill('evenodd');
 
   // Draw cut line on top
   ctx.globalCompositeOperation = 'source-over';
@@ -5162,6 +7170,83 @@ function drawHoleCutout(
   ctx.stroke();
 
   // Copy back to output
+  const result = ctx.getImageData(0, 0, width, height);
+  output.set(result.data);
+}
+
+/**
+ * Stroke ONLY the cut line(s) on top of an already-rendered output buffer
+ * (which has the design image painted over the contour). Used so the magenta
+ * cut path is visible above the design image in the preview, instead of being
+ * obscured by it.
+ */
+function strokeCutLineOnTop(
+  output: Uint8ClampedArray,
+  width: number,
+  height: number,
+  paths: Point[][],
+  strokeColorHex: string,
+  offsetX: number,
+  offsetY: number,
+  effectiveDPI: number,
+  // Optional Bezier representation (Step 8 of the corner-aware Bezier
+  // reconstruction plan). When provided AND non-empty, the preview is
+  // stroked using `bezierCurveTo` so the on-screen cut line is the SAME
+  // curve geometry that the PDF emits — preview ≡ download. The polyline
+  // `paths` are then used only as a fallback when the Bezier list is
+  // missing or empty (e.g. non-ZeroHero modes).
+  bezierPaths?: BezierPath[]
+): void {
+  const useBezier = !!(bezierPaths && bezierPaths.length > 0);
+  if (!useBezier && paths.length === 0) return;
+
+  const offscreen = new OffscreenCanvas(width, height);
+  const ctx = offscreen.getContext('2d');
+  if (!ctx) return;
+
+  // Start with the existing pixels so we can composite back without losing
+  // the alpha-correct image content underneath.
+  const existingData = new ImageData(new Uint8ClampedArray(output), width, height);
+  ctx.putImageData(existingData, 0, 0);
+
+  const cutLineWidth = Math.max(2, Math.round(0.01 * effectiveDPI));
+  ctx.strokeStyle = strokeColorHex;
+  ctx.lineWidth = cutLineWidth;
+  ctx.lineJoin = 'round';
+  ctx.lineCap = 'round';
+  ctx.globalCompositeOperation = 'source-over';
+
+  if (useBezier) {
+    // Preview-coord Bezier paths already include offsetX/offsetY (the worker
+    // builds `allBezierPathsPreview` with the same shift applied as
+    // `allPreviewPathPoints`), so we do NOT add offset here.
+    for (const bp of bezierPaths!) {
+      if (bp.segments.length === 0) continue;
+      ctx.beginPath();
+      ctx.moveTo(bp.start.x, bp.start.y);
+      for (const seg of bp.segments) {
+        if (seg.type === 'line') {
+          ctx.lineTo(seg.to.x, seg.to.y);
+        } else {
+          ctx.bezierCurveTo(seg.cp1.x, seg.cp1.y, seg.cp2.x, seg.cp2.y, seg.to.x, seg.to.y);
+        }
+      }
+      if (bp.closed) ctx.closePath();
+      ctx.stroke();
+    }
+  } else {
+    for (const path of paths) {
+      if (path.length < 2) continue;
+      ctx.beginPath();
+      ctx.moveTo(path[0].x + offsetX, path[0].y + offsetY);
+      for (let i = 1; i < path.length; i++) {
+        ctx.lineTo(path[i].x + offsetX, path[i].y + offsetY);
+      }
+      ctx.closePath();
+      ctx.stroke();
+    }
+  }
+
   const result = ctx.getImageData(0, 0, width, height);
   output.set(result.data);
 }
@@ -5204,7 +7289,7 @@ function drawContourToDataWithExtendedEdge(
       ctx.strokeStyle = 'white';
       ctx.stroke();
       ctx.fillStyle = 'white';
-      ctx.fill();
+      ctx.fill('evenodd');
     }
     
     // Use composite to draw extended image only where we stroked/filled
@@ -5652,6 +7737,106 @@ function createEdgeExtendedImage(
   return new ImageData(newData, newWidth, newHeight);
 }
 
+/** Hi-res binary mask → original image resolution (any hi pixel set in block → 1). */
+function downsampleHiResBinaryMaskToOriginal(
+  hi: Uint8Array,
+  hiW: number,
+  hiH: number,
+  superSample: number,
+  w: number,
+  h: number
+): Uint8Array {
+  const out = new Uint8Array(w * h);
+  for (let y = 0; y < h; y++) {
+    for (let x = 0; x < w; x++) {
+      let v = 0;
+      for (let sy = 0; sy < superSample && !v; sy++) {
+        const hy = y * superSample + sy;
+        if (hy >= hiH) continue;
+        const row = hy * hiW;
+        for (let sx = 0; sx < superSample; sx++) {
+          const hx = x * superSample + sx;
+          if (hx < hiW && hi[row + hx]) {
+            v = 1;
+            break;
+          }
+        }
+      }
+      out[y * w + x] = v;
+    }
+  }
+  return out;
+}
+
+function dilateBinaryMaskRect(mask: Uint8Array, w: number, h: number, radius: number): Uint8Array {
+  if (radius <= 0) return mask;
+  const R = Math.ceil(radius);
+  const out = new Uint8Array(mask.length);
+  for (let y = 0; y < h; y++) {
+    for (let x = 0; x < w; x++) {
+      let v = 0;
+      for (let dy = -R; dy <= R && !v; dy++) {
+        const yy = y + dy;
+        if (yy < 0 || yy >= h) continue;
+        const row = yy * w;
+        for (let dx = -R; dx <= R; dx++) {
+          const xx = x + dx;
+          if (xx < 0 || xx >= w) continue;
+          if (mask[row + xx]) {
+            v = 1;
+            break;
+          }
+        }
+      }
+      out[y * w + x] = v;
+    }
+  }
+  return out;
+}
+
+/**
+ * Zero Hero preview: never trust canvas fills for the alpha wipe mask — smoothed
+ * vectors can self-intersect and nonzero winding deletes arbitrary wedges (diagonal "cuts").
+ * This mask is built from the same filled silhouette raster used for tracing, plus dilation
+ * to cover preview bleed (~vector stroke+fill extent).
+ */
+function buildZeroHeroPreviewMaskFromFilledSilhouette(
+  filledMainMask: Uint8Array,
+  hiResWidth: number,
+  hiResHeight: number,
+  superSample: number,
+  origWidth: number,
+  origHeight: number,
+  canvasWidth: number,
+  canvasHeight: number,
+  offsetX: number,
+  offsetY: number,
+  bleedPixels: number
+): Uint8Array {
+  const inner = downsampleHiResBinaryMaskToOriginal(
+    filledMainMask,
+    hiResWidth,
+    hiResHeight,
+    superSample,
+    origWidth,
+    origHeight
+  );
+  const dilR = Math.max(1, Math.ceil(bleedPixels * 2));
+  const dil = dilateBinaryMaskRect(inner, origWidth, origHeight, dilR);
+  const mask = new Uint8Array(canvasWidth * canvasHeight);
+  for (let y = 0; y < origHeight; y++) {
+    for (let x = 0; x < origWidth; x++) {
+      if (!dil[y * origWidth + x]) continue;
+      const cx = Math.round(offsetX + x);
+      const cy = Math.round(offsetY + y);
+      if (cx >= 0 && cx < canvasWidth && cy >= 0 && cy < canvasHeight) {
+        mask[cy * canvasWidth + cx] = 1;
+      }
+    }
+  }
+  return mask;
+}
+
 function buildContourMask(
   width: number,
   height: number,
@@ -5678,7 +7863,8 @@ function buildContourMask(
     }
     ctx.closePath();
     ctx.stroke();
-    ctx.fill();
+    // evenodd: safe if a contour is still self-intersecting (avoids nonzero "wedge" wipes)
+    ctx.fill('evenodd');
   }
   const id = ctx.getImageData(0, 0, width, height);
   for (let i = 0; i < mask.length; i++) {

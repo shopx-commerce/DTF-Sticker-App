@@ -8,7 +8,7 @@ import { cropImageToContent } from "@/lib/image-crop";
 import { createVectorStroke, downloadVectorStroke, createVectorPaths, type VectorFormat } from "@/lib/vector-stroke";
 import { checkCadCutBounds, type CadCutBounds } from "@/lib/cadcut-bounds";
 import { downloadContourPDF, downloadDesignOnlyPDF, type CachedContourData, type SpotColorInput } from "@/lib/contour-outline";
-import { getContourWorkerManager, type DetectedAlgorithm, type DetectedShapeInfo } from "@/lib/contour-worker-manager";
+import { getContourWorkerManager, processContourInWorker, type DetectedAlgorithm, type DetectedShapeInfo } from "@/lib/contour-worker-manager";
 import { downloadShapePDF, calculateShapeDimensions, generateShapePathPointsInches } from "@/lib/shape-outline";
 import { useDebouncedValue } from "@/hooks/use-debounce";
 import { removeBackgroundFromImage } from "@/lib/background-removal";
@@ -17,7 +17,7 @@ import { detectShape, mapDetectedShapeToType } from "@/lib/shape-detection";
 import { useToast } from "@/hooks/use-toast";
 import EnhanceWorker from "@/lib/enhance-worker?worker";
 import type { GangSheetItem, GangSheetSettings } from "@/lib/gang-sheet";
-import { DEFAULT_GANG_SHEET_SETTINGS } from "@/lib/gang-sheet";
+import { DEFAULT_GANG_SHEET_SETTINGS, clampGangSheetQuantity } from "@/lib/gang-sheet";
 import GangSheetPanel from "./gang-sheet-panel";
 
 export type { ImageInfo, StrokeSettings, StrokeMode, ResizeSettings, ShapeSettings, StickerSize, LockedContour, SegmentLayer, SegmentationData } from "@/lib/types";
@@ -339,10 +339,32 @@ export default function ImageEditor({ onDesignUploaded }: { onDesignUploaded?: (
     setShowApplyAddDropdown(false);
   }, [cutContourLabel, toast, imageInfo, shapeSettings, resizeSettings]);
 
-  const handleAddToGangSheet = useCallback(() => {
+  const handleAddToGangSheet = useCallback(async () => {
     if (!imageInfo) {
       toast({ title: "No design loaded", description: "Upload a design first.", variant: "destructive" });
       return;
+    }
+
+    // Contour cache can lag behind resize (debounced preview). Regenerate for current inches before snapshotting.
+    if (!shapeSettings.enabled) {
+      try {
+        await processContourInWorker(
+          imageInfo.image,
+          strokeSettings,
+          resizeSettings,
+          undefined,
+          detectedShapeType ?? undefined,
+          detectedShapeInfo
+        );
+      } catch (err) {
+        console.error("[GangSheet] contour refresh failed:", err);
+        toast({
+          title: "Contour not ready",
+          description: "Could not refresh the outline for the current size. Wait for the preview to finish, then try again.",
+          variant: "destructive",
+        });
+        return;
+      }
     }
 
     let contourSnapshot: CachedContourData | null = null;
@@ -413,7 +435,7 @@ export default function ImageEditor({ onDesignUploaded }: { onDesignUploaded?: (
     setGangSheetItems(prev => [...prev, newItem]);
     setGangSheetOpen(true);
     toast({ title: "Added to gang sheet", description: `Sticker added. Upload a new design or adjust quantities, then download.` });
-  }, [imageInfo, resizeSettings, strokeSettings, shapeSettings, cutContourLabel, toast]);
+  }, [imageInfo, resizeSettings, strokeSettings, shapeSettings, cutContourLabel, toast, detectedShapeType, detectedShapeInfo]);
 
   const canvasToImage = useCallback((canvas: HTMLCanvasElement): Promise<HTMLImageElement> => {
     return new Promise((resolve, reject) => {
@@ -773,16 +795,8 @@ export default function ImageEditor({ onDesignUploaded }: { onDesignUploaded?: (
         originalWidth: newWidth,
         originalHeight: newHeight,
       };
-      
-      // Recalculate resize settings based on cropped image dimensions
-      const dpi = imageInfo.dpi || 300;
-      const { widthInches, heightInches } = calculateImageDimensions(newWidth, newHeight, dpi);
-      
-      setResizeSettings(prev => ({
-        ...prev,
-        widthInches,
-        heightInches,
-      }));
+
+      // Keep the user's width/height inches — only pixels changed after crop; do not reset to "natural" size at dpi.
       
       // Clear contour cache to force recomputation with new image
       const workerManager = getContourWorkerManager();
@@ -811,7 +825,7 @@ export default function ImageEditor({ onDesignUploaded }: { onDesignUploaded?: (
     } finally {
       setIsRemovingBackground(false);
     }
-  }, [imageInfo, stickerSize]);
+  }, [imageInfo, toast]);
 
   const handleStrokeChange = useCallback((newSettings: Partial<StrokeSettings>) => {
     const updated = { ...strokeSettings, ...newSettings };
@@ -1451,7 +1465,7 @@ export default function ImageEditor({ onDesignUploaded }: { onDesignUploaded?: (
                     <svg className="w-3.5 h-3.5 text-emerald-600" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><rect x="3" y="3" width="7" height="7"/><rect x="14" y="3" width="7" height="7"/><rect x="3" y="14" width="7" height="7"/><rect x="14" y="14" width="7" height="7"/></svg>
                     View Gang Sheet
                     <span className="min-w-[18px] h-[18px] flex items-center justify-center bg-emerald-600 text-white text-[9px] font-bold rounded-full px-1">{gangSheetItems.length}</span>
-                    <span className="text-[10px] text-emerald-500">{gangSheetItems.reduce((s, i) => s + i.quantity, 0)} total</span>
+                    <span className="text-[10px] text-emerald-500">{gangSheetItems.reduce((s, i) => s + clampGangSheetQuantity(i.quantity), 0)} total</span>
                   </button>
                 </>
               )}
