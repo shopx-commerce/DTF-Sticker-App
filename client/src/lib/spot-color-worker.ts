@@ -37,6 +37,9 @@ interface WorkerMessage {
   dpi: number;
   whiteInclusionMask?: ArrayBuffer;
   glossInclusionMask?: ArrayBuffer;
+  fullAlphaMask?: ArrayBuffer;
+  allTaggedWhite?: boolean;
+  allTaggedGloss?: boolean;
 }
 
 interface WorkerResponse {
@@ -366,7 +369,10 @@ function processSpotColors(
   spotColors: SpotColorInputWorker[],
   dpi: number,
   whiteInclusionMask?: Uint8Array,
-  glossInclusionMask?: Uint8Array
+  glossInclusionMask?: Uint8Array,
+  fullAlphaMask?: Uint8Array,
+  allTaggedWhite?: boolean,
+  allTaggedGloss?: boolean
 ): SpotColorRegionWorker[] {
   const whiteColors = spotColors.filter(c => c.spotWhite);
   const glossColors = spotColors.filter(c => c.spotGloss);
@@ -382,25 +388,29 @@ function processSpotColors(
   // because closing only fills holes ≤ 2*radius wide.
   const closingRadius = Math.max(2, Math.round(dpi / 75));
 
-  // "All tagged" shortcut: if EVERY extracted spot color carries this
-  // separation's flag, the user is asking for full design coverage. Skip
-  // the per-color closest-color matching (which inevitably has anti-alias
-  // misses at color boundaries) and just use the alpha silhouette of the
-  // input image. Guarantees one solid region with zero pinholes.
-  const allTaggedWhite = spotColors.length > 0 && spotColors.every(c => c.spotWhite);
-  const allTaggedGloss = spotColors.length > 0 && spotColors.every(c => c.spotGloss);
+  // The "all tagged" decision is owned by the main thread (which has full
+  // region-level data). We only trust the explicit allTaggedWhite/Gloss
+  // flags + the pre-built fullAlphaMask it ships. Do NOT infer from
+  // color.spotWhite/spotGloss here: those are set to `anyWhite/anyGloss`
+  // when partial regions are tagged, so they would falsely export
+  // untagged regions as full silhouette.
+  const useFullAlphaForWhite = !!(allTaggedWhite && fullAlphaMask);
+  const useFullAlphaForGloss = !!(allTaggedGloss && fullAlphaMask);
 
   if (whiteColors.length > 0) {
-    let mask = allTaggedWhite
-      ? buildAlphaSilhouetteMask(pixelData, width, height, 1)
-      : createClosestColorMask(pixelData, width, height, whiteColors, spotColors, 60, 240);
-    if (whiteInclusionMask) {
+    let mask: Uint8Array;
+    if (useFullAlphaForWhite) {
+      mask = fullAlphaMask!;
+    } else {
+      mask = createClosestColorMask(pixelData, width, height, whiteColors, spotColors, 60, 240);
+    }
+    if (whiteInclusionMask && !useFullAlphaForWhite) {
       for (let i = 0; i < mask.length; i++) {
         if (!whiteInclusionMask[i]) mask[i] = 0;
       }
     }
-    // Skip closing for the alpha silhouette path — it's already gap-free.
-    const closed = allTaggedWhite ? mask : morphologicalClose(mask, width, height, closingRadius);
+    // Skip closing when we already have a clean silhouette mask.
+    const closed = useFullAlphaForWhite ? mask : morphologicalClose(mask, width, height, closingRadius);
     const paths = traceMaskToInchPaths(closed, width, height, dpi);
     if (paths.length > 0) {
       regions.push({ name: whiteName, paths, tintCMYK: [0, 1, 0, 0] });
@@ -408,15 +418,19 @@ function processSpotColors(
   }
 
   if (glossColors.length > 0) {
-    let mask = allTaggedGloss
-      ? buildAlphaSilhouetteMask(pixelData, width, height, 1)
-      : createClosestColorMask(pixelData, width, height, glossColors, spotColors, 60, 240);
-    if (glossInclusionMask) {
+    let mask: Uint8Array;
+    if (useFullAlphaForGloss) {
+      // Reusing fullAlphaMask is safe — we never mutate it on this path.
+      mask = fullAlphaMask!;
+    } else {
+      mask = createClosestColorMask(pixelData, width, height, glossColors, spotColors, 60, 240);
+    }
+    if (glossInclusionMask && !useFullAlphaForGloss) {
       for (let i = 0; i < mask.length; i++) {
         if (!glossInclusionMask[i]) mask[i] = 0;
       }
     }
-    const closed = allTaggedGloss ? mask : morphologicalClose(mask, width, height, closingRadius);
+    const closed = useFullAlphaForGloss ? mask : morphologicalClose(mask, width, height, closingRadius);
     const paths = traceMaskToInchPaths(closed, width, height, dpi);
     if (paths.length > 0) {
       regions.push({ name: glossName, paths, tintCMYK: [0, 1, 0, 0] });
@@ -449,11 +463,12 @@ function processSpotColors(
 self.onmessage = function(e: MessageEvent<WorkerMessage>) {
   try {
     if (e.data.type === 'trace') {
-      const { imageBuffer, imageWidth, imageHeight, spotColors, dpi, whiteInclusionMask, glossInclusionMask } = e.data;
+      const { imageBuffer, imageWidth, imageHeight, spotColors, dpi, whiteInclusionMask, glossInclusionMask, fullAlphaMask, allTaggedWhite, allTaggedGloss } = e.data;
       const pixelData = new Uint8ClampedArray(imageBuffer);
       const whiteMask = whiteInclusionMask ? new Uint8Array(whiteInclusionMask) : undefined;
       const glossMask = glossInclusionMask ? new Uint8Array(glossInclusionMask) : undefined;
-      const regions = processSpotColors(pixelData, imageWidth, imageHeight, spotColors, dpi, whiteMask, glossMask);
+      const alphaMask = fullAlphaMask ? new Uint8Array(fullAlphaMask) : undefined;
+      const regions = processSpotColors(pixelData, imageWidth, imageHeight, spotColors, dpi, whiteMask, glossMask, alphaMask, allTaggedWhite, allTaggedGloss);
       const response: WorkerResponse = { type: 'result', regions };
       self.postMessage(response);
     }

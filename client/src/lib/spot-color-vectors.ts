@@ -96,6 +96,44 @@ function traceColorRegionsAsync(
     let imageData: ImageData;
     let inclusionMasks: { whiteMask: Uint8Array; glossMask: Uint8Array } | null = null;
 
+    // "All tagged" detection: every extracted color (and every region within
+    // each color, when regions exist) carries the separation flag. Only then
+    // does the user expect full design coverage as one solid silhouette.
+    //
+    // IMPORTANT: color.spotWhite is set to `anyWhite` by toggleRegionSpot
+    // (truthy if even ONE region is tagged), so checking `color.spotWhite`
+    // alone would falsely fire for partial per-region selections and export
+    // untagged regions. We must check region-level flags directly.
+    const isColorAllWhite = (c: SpotColorInput) =>
+      c.regions && c.regions.length > 0 ? c.regions.every(r => r.spotWhite) : !!c.spotWhite;
+    const isColorAllGloss = (c: SpotColorInput) =>
+      c.regions && c.regions.length > 0 ? c.regions.every(r => r.spotGloss) : !!c.spotGloss;
+    const allTaggedWhite = spotColors.length > 0 && spotColors.every(isColorAllWhite);
+    const allTaggedGloss = spotColors.length > 0 && spotColors.every(isColorAllGloss);
+    let fullAlphaMask: Uint8Array | null = null;
+    if (allTaggedWhite || allTaggedGloss) {
+      // Render the actual image at the trace canvas size and read its true
+      // alpha channel. This is the design's complete silhouette — same
+      // exact coverage the user sees, with zero closest-color gaps.
+      const aCanvas = document.createElement('canvas');
+      aCanvas.width = cW;
+      aCanvas.height = cH;
+      const aCtx = aCanvas.getContext('2d');
+      if (aCtx) {
+        aCtx.drawImage(image, 0, 0, cW, cH);
+        const aImg = aCtx.getImageData(0, 0, cW, cH).data;
+        fullAlphaMask = new Uint8Array(cW * cH);
+        // Threshold of 1 (any visible pixel) — we don't want to miss soft
+        // edges. The PDF spot color is binary so partial alpha still becomes
+        // 100% spot coverage at that pixel, matching how a press would lay
+        // down white/gloss ink under the design.
+        for (let i = 0, p = 0; i < fullAlphaMask.length; i++, p += 4) {
+          if (aImg[p + 3] >= 1) fullAlphaMask[i] = 1;
+        }
+        console.log(`[SpotColor] Built full-alpha mask for all-tagged separation (${cW}x${cH})`);
+      }
+    }
+
     if (spotPixelMap && spotPixelMap.pixelMap.length > 0) {
       // Build the export imageData directly from pixelMap + regionMap + per-region selection
       // flags — the same data the preview uses to draw the orange overlay. This guarantees
@@ -243,6 +281,13 @@ function traceColorRegionsAsync(
       msg.whiteInclusionMask = inclusionMasks.whiteMask.buffer;
       msg.glossInclusionMask = inclusionMasks.glossMask.buffer;
       transferables.push(inclusionMasks.whiteMask.buffer, inclusionMasks.glossMask.buffer);
+    }
+
+    if (fullAlphaMask) {
+      msg.fullAlphaMask = fullAlphaMask.buffer;
+      msg.allTaggedWhite = allTaggedWhite;
+      msg.allTaggedGloss = allTaggedGloss;
+      transferables.push(fullAlphaMask.buffer);
     }
 
     worker.postMessage(msg, transferables);
