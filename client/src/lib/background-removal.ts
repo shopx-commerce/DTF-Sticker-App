@@ -400,8 +400,9 @@ export async function removeColorAtPoint(
     };
 
     const onMessage = (e: MessageEvent) => {
+      if (e.data && e.data.type === 'log') return; // worker init/debug logs — not our result
       cleanup();
-      if (e.data.type === 'error') return reject(new Error(e.data.error));
+      if (e.data?.type === 'error') return reject(new Error(e.data.error));
 
       const resultData = new ImageData(
         new Uint8ClampedArray(e.data.imageData),
@@ -519,8 +520,9 @@ export async function removeSpecificColorFromImage(
     };
 
     const onMessage = (e: MessageEvent) => {
+      if (e.data && e.data.type === 'log') return;
       cleanup();
-      if (e.data.type === 'error') return reject(new Error(e.data.error));
+      if (e.data?.type === 'error') return reject(new Error(e.data.error));
 
       const resultData = new ImageData(
         new Uint8ClampedArray(e.data.imageData),
@@ -623,8 +625,9 @@ export async function removeEdgeBackgroundFromImage(
     };
 
     const onMessage = (e: MessageEvent) => {
+      if (e.data && e.data.type === 'log') return;
       cleanup();
-      if (e.data.type === 'error') return reject(new Error(e.data.error));
+      if (e.data?.type === 'error') return reject(new Error(e.data.error));
 
       const resultData = new ImageData(
         new Uint8ClampedArray(e.data.imageData),
