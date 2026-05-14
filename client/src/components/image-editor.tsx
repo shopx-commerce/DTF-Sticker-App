@@ -502,7 +502,7 @@ export default function ImageEditor({ onDesignUploaded }: { onDesignUploaded?: (
     setGangSheetItems(prev => [...prev, newItem]);
     setGangSheetOpen(true);
     toast({ title: "Added to gang sheet", description: `Sticker added. Upload a new design or adjust quantities, then download.` });
-  }, [imageInfo, resizeSettings, strokeSettings, shapeSettings, cutContourLabel, toast, detectedShapeType, detectedShapeInfo]);
+  }, [imageInfo, resizeSettings, strokeSettings, shapeSettings, cutContourLabel, toast, detectedShapeType, detectedShapeInfo, spotPreviewData]);
 
   const canvasToImage = useCallback((canvas: HTMLCanvasElement): Promise<HTMLImageElement> => {
     return new Promise((resolve, reject) => {
