@@ -1147,6 +1147,51 @@ const PreviewSection = forwardRef<HTMLCanvasElement, PreviewSectionProps>(
       const overlayData = overlayCtx.createImageData(w, h);
       const out = overlayData.data;
 
+      // "All tagged" shortcut — mirrors the PDF export behavior. When every
+      // color (and every region within it) is tagged for white and/or gloss,
+      // the user expects the entire design silhouette to be covered as one
+      // solid shape. Skip per-pixel/per-region matching and just paint the
+      // overlay using the source image's alpha channel directly. This makes
+      // the on-screen preview match the exported PDF exactly: no swiss-
+      // cheese mosaic, just a solid silhouette.
+      const isColorAllWhite = (c: typeof colors[0]) =>
+        c.regions && c.regions.length > 0 ? c.regions.every(r => r.spotWhite) : !!c.spotWhite;
+      const isColorAllGloss = (c: typeof colors[0]) =>
+        c.regions && c.regions.length > 0 ? c.regions.every(r => r.spotGloss) : !!c.spotGloss;
+      const allTaggedWhite = colors.length > 0 && colors.every(isColorAllWhite);
+      const allTaggedGloss = colors.length > 0 && colors.every(isColorAllGloss);
+
+      if (allTaggedWhite || allTaggedGloss) {
+        // Pick the overlay color the same way per-pixel logic does:
+        // both → yellow, white-only → orange, gloss-only → teal.
+        let oR = 0, oG = 0, oB = 0;
+        if (allTaggedWhite && allTaggedGloss) { oR = 234; oG = 179; oB = 8; }
+        else if (allTaggedWhite) { oR = 249; oG = 115; oB = 22; }
+        else { oR = 20; oG = 184; oB = 166; }
+
+        const srcImg = source || imageInfo.image;
+        const srcCanvas = document.createElement('canvas');
+        srcCanvas.width = w;
+        srcCanvas.height = h;
+        const srcCtx = srcCanvas.getContext('2d');
+        if (srcCtx) {
+          srcCtx.drawImage(srcImg, 0, 0, w, h);
+          const srcPixels = srcCtx.getImageData(0, 0, w, h).data;
+          for (let i = 0, p = 0; i < w * h; i++, p += 4) {
+            if (srcPixels[p + 3] >= 1) {
+              out[p]     = oR;
+              out[p + 1] = oG;
+              out[p + 2] = oB;
+              out[p + 3] = 255;
+            }
+          }
+          overlayCtx.putImageData(overlayData, 0, 0);
+          spotOverlayCacheRef.current = { key: cacheKey, canvas: overlayCanvas };
+          return overlayCanvas;
+        }
+        // If srcCtx failed, fall through to the existing per-pixel paths.
+      }
+
       // Build per-color overlay info with per-region spot support
       const colorOverlay: Array<{
         colorR: number; colorG: number; colorB: number;
