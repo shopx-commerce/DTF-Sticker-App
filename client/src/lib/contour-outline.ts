@@ -1,8 +1,288 @@
 import type { StrokeSettings, ResizeSettings } from "@/lib/types";
-import { PDFDocument, PDFName, PDFArray, PDFDict } from 'pdf-lib';
+import { PDFDocument, PDFName, PDFArray, PDFDict, PDFPage, rgb, degrees } from 'pdf-lib';
 import { removeLoopsWithClipper, ensureClockwise, detectSelfIntersections, gaussianSmoothContour, subsamplePolygon, polygonToSplinePath } from "@/lib/clipper-path";
 import { getContourWorkerManager, type BezierPath } from "@/lib/contour-worker-manager";
 import { addSpotColorVectorsToPDF } from "@/lib/spot-color-vectors";
+import { planVectorQROverlays, detectQRAppearance, type DetectedQR, type QRAppearance } from "@/lib/qr";
+
+// ─── Vector QR overlay (source-aware) ────────────────────────────────────
+// Paints each detected QR as crisp PDF vector geometry. Modules are forced
+// to pure-black squares (max scanner contrast, 100% module fill) and the
+// centred-logo region is carved out of the wipe so the user's source logo
+// art passes through unchanged at full raster quality. This is the
+// highest-quality QR pipeline we have: vectors are crisp at any DPI /
+// zoom regardless of how the viewer or printer rasterises the page.
+//
+// Per-module rendering rules:
+//   - In the logo bbox       → skip the module (source raster passes
+//                                through, including the logo)
+//   - "1" (dark) module      → solid black square inscribed in module bbox
+//   - "0" (light) module     → covered by the white pre-wipe; nothing more
+//
+// Coordinate model:
+//   - `imageRect` is the on-page rectangle (PDF points, origin
+//     bottom-left) where the design raster was drawn via `page.drawImage`.
+//   - `srcImagePixelWidth/Height` are the source-image dimensions whose
+//     pixel coords the QR bboxes are in. We scale into the on-page rect.
+//   - PDF Y axis points up; QR grid `j` index points down — flip on emit.
+function drawVectorQRsOnPage(
+  page: PDFPage,
+  qrCodes: DetectedQR[] | undefined,
+  imageRect: { x: number; y: number; width: number; height: number },
+  srcImagePixelWidth: number,
+  srcImagePixelHeight: number,
+  sourceImage: HTMLImageElement | HTMLCanvasElement | undefined,
+  options: {
+    errorCorrectionLevel?: 'L' | 'M' | 'Q' | 'H';
+    /**
+     * Quiet-zone halo around the QR, expressed in module widths. Default 1.
+     * Spec calls for 4; most modern scanners decode reliably at 1. Lower
+     * values reduce visible white border around the rendered QR. Set to 0
+     * to disable the halo entirely (risky for scanability).
+     */
+    quietZoneModules?: number;
+    /**
+     * Lower bound on the halo expressed as a fraction of the QR bbox.
+     * The actual halo is `max(quietZoneModules*moduleSize, quietZoneFraction*bbox)`.
+     * Default 0.02 (2%). Was 0.08 before the visible-border fix.
+     */
+    quietZoneFraction?: number;
+  } = {}
+): { drawn: number; skipped: number; appearances: Array<{ shape: string; logo: boolean }> } {
+  if (!qrCodes || qrCodes.length === 0) return { drawn: 0, skipped: 0, appearances: [] };
+  const plans = planVectorQROverlays(qrCodes, options.errorCorrectionLevel ?? 'H');
+  if (plans.length === 0) return { drawn: 0, skipped: qrCodes.length, appearances: [] };
+
+  const sx = imageRect.width / srcImagePixelWidth;
+  const sy = imageRect.height / srcImagePixelHeight;
+  const appearances: Array<{ shape: string; logo: boolean }> = [];
+
+  for (const plan of plans) {
+    const { grid, bbox, rotation } = plan;
+    const destW = bbox.width * sx;
+    const destH = bbox.height * sy;
+    const destX = imageRect.x + bbox.x * sx;
+    const destY = imageRect.y + (imageRect.height - bbox.y * sy - destH);
+
+    const rotDeg = (rotation * 180) / Math.PI;
+    const useRotation = Math.abs(rotDeg) > 0.5;
+
+    // Read the source image for module shape / colour / logo region.
+    // If we don't have the source (defensive), fall back to plain
+    // square/black/white with no logo preservation.
+    const appearance: QRAppearance = sourceImage
+      ? detectQRAppearance(sourceImage, bbox, grid)
+      : { shape: 'square', dark: { r: 0, g: 0, b: 0 }, light: { r: 255, g: 255, b: 255 }, logoBox: null };
+    // We always render squares now (forced for scanner reliability), but
+    // log the *detected* shape for diagnostics so we can tell whether the
+    // source happens to be circles/squares.
+    appearances.push({ shape: `square[detected:${appearance.shape}]`, logo: appearance.logoBox !== null });
+
+    // Force pure-black-on-white modules — every QR scanner is calibrated
+    // for max contrast B/W. Sampled colours are kept around for
+    // diagnostics but not used for the actual paint.
+    const darkColor = rgb(0, 0, 0);
+    const lightColor = rgb(1, 1, 1);
+    void appearance.dark; void appearance.light;
+
+    const logoOnPage = appearance.logoBox ? {
+      x: imageRect.x + appearance.logoBox.x * sx,
+      y: imageRect.y + (imageRect.height - appearance.logoBox.y * sy - appearance.logoBox.height * sy),
+      width: appearance.logoBox.width * sx,
+      height: appearance.logoBox.height * sy,
+    } : null;
+
+    const moduleW = destW / grid.size;
+    const moduleH = destH / grid.size;
+
+    // SQUARE modules — 100% module fill and best-possible scanner
+    // contrast. The non-rotated path below merges horizontal runs into
+    // single rectangles (per user request: "thicker lines instead of
+    // multiple thin ones — better for printing"). The rotated path
+    // emits per-module rectangles since merging across a rotation
+    // would require building a rotated polygon.
+
+    const moduleCentreInLogo = (pxLeft: number, pyBottom: number): boolean => {
+      if (!logoOnPage) return false;
+      const cx = pxLeft + moduleW / 2;
+      const cy = pyBottom + moduleH / 2;
+      return cx >= logoOnPage.x && cx <= logoOnPage.x + logoOnPage.width &&
+             cy >= logoOnPage.y && cy <= logoOnPage.y + logoOnPage.height;
+    };
+
+    // ── Pre-wipe pass ─────────────────────────────────────────────────
+    // Wipe the QR bbox + halo to white, but CARVE OUT the centred-logo
+    // region so the user's source logo art passes through unchanged.
+    // Per user request: "we don't need to vectorize the logo... we want
+    // to leave the logo they have in the middle there".
+    //
+    // Skipped in the rotated case — the rotated module loop below uses
+    // overlapping rectangles that already cover the bbox. Doing a
+    // straight-rect wipe under a rotated QR would leak out the corners.
+    if (!useRotation) {
+      // Halo size = max(quietZoneModules * moduleSize, quietZoneFraction * bbox).
+      // Defaults are tighter than QR spec (4 modules) — most scanners decode
+      // fine at 1 module of quiet zone, and a smaller halo keeps the QR from
+      // bleeding visible white into the surrounding design.
+      const quietZoneModules = options.quietZoneModules ?? 1;
+      const quietZoneFraction = options.quietZoneFraction ?? 0.02;
+      const haloPad = Math.max(
+        quietZoneModules * Math.min(moduleW, moduleH),
+        quietZoneFraction * Math.min(destW, destH),
+      );
+      const wipeX = destX - haloPad;
+      const wipeY = destY - haloPad; // PDF Y-up: bottom edge of wipe
+      const wipeW = destW + 2 * haloPad;
+      const wipeH = destH + 2 * haloPad;
+      if (logoOnPage) {
+        const lx = Math.max(wipeX, logoOnPage.x);
+        const lyBottom = Math.max(wipeY, logoOnPage.y);
+        const lr = Math.min(wipeX + wipeW, logoOnPage.x + logoOnPage.width);
+        const lyTop = Math.min(wipeY + wipeH, logoOnPage.y + logoOnPage.height);
+        if (lr > lx && lyTop > lyBottom) {
+          // Top frame (above logo, in PDF Y-up coords)
+          if (lyTop < wipeY + wipeH) {
+            page.drawRectangle({
+              x: wipeX, y: lyTop, width: wipeW, height: (wipeY + wipeH) - lyTop,
+              color: lightColor, borderWidth: 0,
+            });
+          }
+          // Bottom frame (below logo)
+          if (lyBottom > wipeY) {
+            page.drawRectangle({
+              x: wipeX, y: wipeY, width: wipeW, height: lyBottom - wipeY,
+              color: lightColor, borderWidth: 0,
+            });
+          }
+          // Left frame
+          if (lx > wipeX) {
+            page.drawRectangle({
+              x: wipeX, y: lyBottom, width: lx - wipeX, height: lyTop - lyBottom,
+              color: lightColor, borderWidth: 0,
+            });
+          }
+          // Right frame
+          if (lr < wipeX + wipeW) {
+            page.drawRectangle({
+              x: lr, y: lyBottom, width: (wipeX + wipeW) - lr, height: lyTop - lyBottom,
+              color: lightColor, borderWidth: 0,
+            });
+          }
+        } else {
+          page.drawRectangle({
+            x: wipeX, y: wipeY, width: wipeW, height: wipeH,
+            color: lightColor, borderWidth: 0,
+          });
+        }
+      } else {
+        page.drawRectangle({
+          x: wipeX, y: wipeY, width: wipeW, height: wipeH,
+          color: lightColor, borderWidth: 0,
+        });
+      }
+    }
+
+    if (useRotation) {
+      // pdf-lib doesn't expose ctx-style transforms; for the small
+      // rotation window we allow (≤8°) we approximate by rotating each
+      // module around the QR centre.
+      const cx = destX + destW / 2;
+      const cy = destY + destH / 2;
+      const cos = Math.cos(rotation);
+      const sin = Math.sin(rotation);
+      for (let j = 0; j < grid.size; j++) {
+        for (let i = 0; i < grid.size; i++) {
+          const isDark = grid.modules[j * grid.size + i] === 1;
+          const localCx = (i + 0.5) * moduleW - destW / 2;
+          const localCy = -((j + 0.5) * moduleH - destH / 2);
+          const px = cx + cos * localCx - sin * localCy - moduleW / 2;
+          const py = cy + sin * localCx + cos * localCy - moduleH / 2;
+          if (moduleCentreInLogo(px, py)) continue;
+          // Rotated module: emit as oriented rectangle. We don't draw
+          // rotated circles here — if the user has a circle-style QR
+          // that's also rotated (rare), we fall back to squares for the
+          // rotated case rather than wrestle with rotated circle math.
+          page.drawRectangle({
+            x: px, y: py, width: moduleW, height: moduleH,
+            color: isDark ? darkColor : lightColor,
+            borderWidth: 0,
+            rotate: degrees(rotDeg),
+          });
+        }
+      }
+    } else {
+      // ── Horizontal run-merge ──────────────────────────────────────
+      // Per user request: "thicker lines instead of multiple thin
+      // ones — better for printing". Walk each row and merge
+      // consecutive dark modules into a single wider rectangle.
+      // Print/cut benefits:
+      //   - No seam between adjacent dark modules (no ink-bleed gap)
+      //   - Cut machines cope better with longer continuous shapes
+      //   - PDF size drops (one rect per run vs one per module)
+      // Decoder behaviour is unchanged: a run of N dark modules is
+      // geometrically identical whether painted as N squares or 1
+      // rectangle — same bit pattern, same coverage.
+      //
+      // A logo-skip in the middle of a run breaks it into two runs,
+      // so the carve-out still passes source pixels through.
+      let drawnRunsTotal = 0;
+      let drawnModulesTotal = 0;
+      let skippedDarkTotal = 0;
+      for (let j = 0; j < grid.size; j++) {
+        // PDF Y-up: row j (top-down in grid) is at y-coord (size-1-j)*moduleH
+        const py = destY + (grid.size - 1 - j) * moduleH;
+        let runStart = -1;
+        for (let i = 0; i < grid.size; i++) {
+          const isDark = grid.modules[j * grid.size + i] === 1;
+          let skipForLogo = false;
+          if (isDark) {
+            const px = destX + i * moduleW;
+            if (moduleCentreInLogo(px, py)) {
+              skipForLogo = true;
+              skippedDarkTotal++;
+            }
+          }
+          if (isDark && !skipForLogo) {
+            if (runStart === -1) runStart = i;
+          } else if (runStart !== -1) {
+            const px = destX + runStart * moduleW;
+            const runWidth = (i - runStart) * moduleW;
+            page.drawRectangle({
+              x: px, y: py, width: runWidth, height: moduleH,
+              color: darkColor, borderWidth: 0,
+            });
+            drawnRunsTotal++;
+            drawnModulesTotal += i - runStart;
+            runStart = -1;
+          }
+        }
+        if (runStart !== -1) {
+          const px = destX + runStart * moduleW;
+          const runWidth = (grid.size - runStart) * moduleW;
+          page.drawRectangle({
+            x: px, y: py, width: runWidth, height: moduleH,
+            color: darkColor, borderWidth: 0,
+          });
+          drawnRunsTotal++;
+          drawnModulesTotal += grid.size - runStart;
+        }
+      }
+      // eslint-disable-next-line no-console
+      console.log(
+        `[QR] Render (PDF): ${grid.size}×${grid.size} grid, ` +
+        `drew ${drawnModulesTotal} dark modules in ${drawnRunsTotal} runs ` +
+        `(${(drawnModulesTotal / Math.max(drawnRunsTotal, 1)).toFixed(1)} mods/run, ` +
+        `skipped ${skippedDarkTotal} for logo)`
+      );
+    }
+
+    // No vector logo pass — per user request, the centred logo is left
+    // alone via the carve-out in the pre-wipe above. The user's source
+    // logo art passes through unchanged at full raster quality.
+  }
+
+  return { drawn: plans.length, skipped: qrCodes.length - plans.length, appearances };
+}
 
 export function simplifyPathForPDF(points: Array<{x: number; y: number}>, epsilon: number = 1.0): Array<{x: number; y: number}> {
   if (points.length <= 2) return points;
@@ -1976,6 +2256,17 @@ export interface SpotColorInput {
   regionMap?: Int32Array;
 }
 
+export interface QRExportOptions {
+  qrCodes?: import('./qr').DetectedQR[];
+  /**
+   * Opt-IN flag for the crisp QR re-render pass. Default false (= leave
+   * the source QR pixels as-is). The user enables this from the QR
+   * badge in the image editor when they want crisp vector modules in
+   * the exported PDF.
+   */
+  enabled?: boolean;
+}
+
 export async function downloadContourPDF(
   image: HTMLImageElement,
   strokeSettings: StrokeSettings,
@@ -1985,7 +2276,8 @@ export async function downloadContourPDF(
   spotColors?: SpotColorInput[],
   singleArtboard: boolean = false,
   cutContourLabel: string = 'CutContour',
-  lockedContour?: { label: string; pathPoints: Array<{x: number; y: number}>; allPathPoints?: Array<Array<{x: number; y: number}>>; widthInches: number; heightInches: number } | null
+  lockedContour?: { label: string; pathPoints: Array<{x: number; y: number}>; allPathPoints?: Array<Array<{x: number; y: number}>>; widthInches: number; heightInches: number } | null,
+  qrOptions?: QRExportOptions
 ): Promise<void> {
   try {
     console.log('[downloadContourPDF] Starting, cached:', !!cachedContourData);
@@ -2126,21 +2418,35 @@ export async function downloadContourPDF(
       });
     };
     
-    // Create design canvas
-    const createDesignBlob = (): Promise<Blob> => {
-      return new Promise((resolve, reject) => {
-        const tempCanvas = document.createElement('canvas');
-        const tempCtx = tempCanvas.getContext('2d');
-        if (!tempCtx) {
-          reject(new Error('Failed to get design canvas context'));
-          return;
-        }
-        
-        tempCanvas.width = image.width;
-        tempCanvas.height = image.height;
+    // Create design canvas. The PDF reader/printer rasterises this PNG to
+    // the page's physical pixel size, so it acts as input to their resampler.
+    //
+    // For QR regions, we no longer mask the raster — the vector overlay
+    // (`drawVectorQRsOnPage` after `page.drawImage`) draws each module
+    // (light or dark) as a filled shape that overdraws the underlying
+    // pixels module-by-module. Modules in a detected logo region are
+    // skipped, which is the whole point of *not* pre-masking — the
+    // source's logo art passes through to the output instead of getting
+    // wiped to white.
+    //
+    // QR re-render is opt-in. When disabled we just embed the source as
+    // a plain raster — no QR processing of any kind, the user's
+    // original QR pixels print exactly as they look in the design.
+    const useQRFix = qrOptions?.enabled === true && qrOptions?.qrCodes && qrOptions.qrCodes.length > 0;
+    const createDesignBlob = async (): Promise<Blob> => {
+      let canvas: HTMLCanvasElement;
+      {
+        // Default path: embed the design as-is. The vector QR overlay
+        // module-overdraws each cell (or skips for logo modules).
+        canvas = document.createElement('canvas');
+        canvas.width = image.width;
+        canvas.height = image.height;
+        const tempCtx = canvas.getContext('2d');
+        if (!tempCtx) throw new Error('Failed to get design canvas context');
         tempCtx.drawImage(image, 0, 0);
-        
-        tempCanvas.toBlob((b) => {
+      }
+      return await new Promise<Blob>((resolve, reject) => {
+        canvas.toBlob((b) => {
           if (b) resolve(b);
           else reject(new Error('Failed to create blob from design canvas'));
         }, 'image/png');
@@ -2199,6 +2505,30 @@ export async function downloadContourPDF(
     width: imageWidthPts,
     height: imageHeightPts,
   });
+
+  // Paint vector QR modules on top of the embedded design raster.
+  // The raster has the QR area wiped to white (see `createDesignBlob`),
+  // so the vectors land on a clean canvas with no aliasing fight. Modules
+  // are real PDF geometry → crisp at any DPI / zoom / print size, which
+  // is what makes them reliably scannable from small stickers.
+  if (useQRFix) {
+    const result = drawVectorQRsOnPage(
+      page,
+      qrOptions!.qrCodes,
+      { x: imageXPts, y: imageYPts, width: imageWidthPts, height: imageHeightPts },
+      image.naturalWidth || image.width,
+      image.naturalHeight || image.height,
+      image,
+      { errorCorrectionLevel: 'H' }
+    );
+    const styleSummary = result.appearances
+      .map((a) => `${a.shape}${a.logo ? '+logo-preserved' : ''}`)
+      .join(', ');
+    console.log(
+      `[downloadContourPDF] Vector QR overlay: drew ${result.drawn} crisp QR(s) [${styleSummary}]` +
+        (result.skipped > 0 ? `, skipped ${result.skipped} (rotation/aspect/encoding)` : '')
+    );
+  }
 
   const context = pdfDoc.context;
   
@@ -2371,7 +2701,8 @@ export async function downloadDesignOnlyPDF(
   resizeSettings: ResizeSettings,
   filename: string,
   spotColors?: SpotColorInput[],
-  singleArtboard: boolean = false
+  singleArtboard: boolean = false,
+  qrOptions?: QRExportOptions
 ): Promise<void> {
   try {
     console.log('[downloadDesignOnlyPDF] Starting design-only PDF (no cut lines)');
@@ -2385,14 +2716,23 @@ export async function downloadDesignOnlyPDF(
     const pdfDoc = await PDFDocument.create();
     const page = pdfDoc.addPage([widthPts, heightPts]);
 
+    const useQRFix = qrOptions?.enabled === true && qrOptions?.qrCodes && qrOptions.qrCodes.length > 0;
+    // QR re-render is opt-in. When NOT enabled, we just embed the source
+    // as a plain raster (no QR processing). When enabled, the source is
+    // still embedded as-is and the vector QR overdraw
+    // (`drawVectorQRsOnPage` after embedding) handles crispness and the
+    // logo carve-out.
+    const designCanvas: HTMLCanvasElement = (() => {
+      const c = document.createElement('canvas');
+      c.width = image.width;
+      c.height = image.height;
+      const cx = c.getContext('2d');
+      if (!cx) throw new Error('Failed to get canvas context');
+      cx.drawImage(image, 0, 0);
+      return c;
+    })();
     const designBlob: Blob = await new Promise((resolve, reject) => {
-      const tempCanvas = document.createElement('canvas');
-      const tempCtx = tempCanvas.getContext('2d');
-      if (!tempCtx) { reject(new Error('Failed to get canvas context')); return; }
-      tempCanvas.width = image.width;
-      tempCanvas.height = image.height;
-      tempCtx.drawImage(image, 0, 0);
-      tempCanvas.toBlob((b) => {
+      designCanvas.toBlob((b) => {
         if (b) resolve(b);
         else reject(new Error('Failed to create blob'));
       }, 'image/png');
@@ -2407,6 +2747,25 @@ export async function downloadDesignOnlyPDF(
       width: widthPts,
       height: heightPts,
     });
+
+    if (useQRFix) {
+      const result = drawVectorQRsOnPage(
+        page,
+        qrOptions!.qrCodes,
+        { x: 0, y: 0, width: widthPts, height: heightPts },
+        image.naturalWidth || image.width,
+        image.naturalHeight || image.height,
+        image,
+        { errorCorrectionLevel: 'H' }
+      );
+      const styleSummary = result.appearances
+        .map((a) => `${a.shape}${a.logo ? '+logo-preserved' : ''}`)
+        .join(', ');
+      console.log(
+        `[downloadDesignOnlyPDF] Vector QR overlay: drew ${result.drawn} crisp QR(s) [${styleSummary}]` +
+          (result.skipped > 0 ? `, skipped ${result.skipped} (rotation/aspect/encoding)` : '')
+      );
+    }
 
     if (spotColors && spotColors.length > 0) {
       const spotLabels = await addSpotColorVectorsToPDF(

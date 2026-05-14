@@ -642,6 +642,23 @@ function processContour(
   let zhBgColor: { r: number; g: number; b: number } | null = null;
 
   if (isZeroHero) {
+    // ============================================================
+    // [ZH:0] SESSION START
+    // ============================================================
+    console.log(
+      '%c━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━',
+      'color:#a855f7;font-weight:bold'
+    );
+    console.log(
+      '%c[ZH:0] ZERO HERO SESSION START',
+      'color:#a855f7;font-weight:bold;font-size:14px',
+      `\n  input: ${width}×${height} px (${(width * height).toLocaleString()} pixels)` +
+      `\n  hi-res: ${hiResWidth}×${hiResHeight} (×${SUPER_SAMPLE} super-sample)` +
+      `\n  effective DPI: ${effectiveDPI} → hi-res DPI: ${effectiveDPI * SUPER_SAMPLE}` +
+      `\n  alpha threshold setting: ${strokeSettings.alphaThreshold}` +
+      `\n  include holes: ${strokeSettings.includeHoles}`
+    );
+
     // Detect whether the input has meaningful transparency. If virtually
     // every pixel is opaque, the design boundary is defined by COLOR, not
     // alpha — switch to color-saliency tracing.
@@ -675,9 +692,21 @@ function processContour(
     for (let i = 0; i < zhField.length; i++) {
       if (zhField[i] >= zhAlphaThreshold) hiResMask[i] = 1;
     }
-    console.log('[Worker] Zero hero: mode=' + zhMode +
-      (zhBgColor ? ' (bg=rgb(' + zhBgColor.r + ',' + zhBgColor.g + ',' + zhBgColor.b + '))' : '') +
-      ', threshold=' + zhAlphaThreshold);
+    // ============================================================
+    // [ZH:1] HI-RES MASK BUILT
+    // ============================================================
+    let maskOnPx = 0;
+    for (let i = 0; i < hiResMask.length; i++) if (hiResMask[i] === 1) maskOnPx++;
+    const maskCoverage = (maskOnPx / hiResMask.length) * 100;
+    console.log(
+      '%c[ZH:1] hi-res mask built',
+      'color:#a855f7;font-weight:bold',
+      `\n  source field: ${zhMode}` +
+      (zhBgColor ? ` (bg color rgb(${zhBgColor.r},${zhBgColor.g},${zhBgColor.b}))` : '') +
+      `\n  threshold: ${zhAlphaThreshold} / 255` +
+      `\n  opaque hi-res pixels: ${maskOnPx.toLocaleString()} (${maskCoverage.toFixed(2)}% coverage)` +
+      `\n  translucent ratio in source: ${(translucentRatio * 100).toFixed(1)}%`
+    );
   } else {
     const loThreshold = 20;
     let hiThreshold = Math.max(strokeSettings.alphaThreshold, 128);
@@ -745,6 +774,28 @@ function processContour(
     console.log('[Worker] Composite re-mask merged', mergedCount, 'new pixels into mask, faintArtMode=', faintArtMode);
   }
 
+  // ============================================================
+  // [ZH:2] PRELIMINARY COMPONENTS
+  // ============================================================
+  if (isZeroHero) {
+    const totalPx = hiResWidth * hiResHeight;
+    const sortedComps = [...prelimComps].sort((a, b) => b.area - a.area);
+    const top = sortedComps.slice(0, 8).map((c, i) => {
+      const bw = c.bounds.maxX - c.bounds.minX;
+      const bh = c.bounds.maxY - c.bounds.minY;
+      const pct = (c.area / totalPx * 100).toFixed(2);
+      return `    #${i}: id=${c.id} area=${c.area.toLocaleString()} (${pct}%) bbox=${bw}×${bh} @(${c.bounds.minX},${c.bounds.minY})`;
+    }).join('\n');
+    console.log(
+      '%c[ZH:2] preliminary component labeling',
+      'color:#a855f7;font-weight:bold',
+      `\n  total components: ${prelimComps.length}` +
+      `\n  significant (area ≥ ${prelimDynMin}): ${prelimSignificant.length}` +
+      `\n  composite mode triggered: ${prelimCompositeDetected}` +
+      `\n  top components by area:\n${top}`
+    );
+  }
+
   const mainComponentMask = selectMainComponentWithOrphans(
     hiResMask, hiResWidth, hiResHeight, hiResDPI,
     minComponentAreaPx, keepNearMainDistInches, bladeWidthInches, faintArtMode,
@@ -752,6 +803,27 @@ function processContour(
   );
 
   const filledMainMask = fillSilhouette(mainComponentMask, hiResWidth, hiResHeight);
+
+  // ============================================================
+  // [ZH:3] AFTER MAIN-COMPONENT SELECTION + FILL
+  // ============================================================
+  if (isZeroHero) {
+    let mainOnPx = 0, filledOnPx = 0;
+    for (let i = 0; i < mainComponentMask.length; i++) {
+      if (mainComponentMask[i] === 1) mainOnPx++;
+      if (filledMainMask[i] === 1) filledOnPx++;
+    }
+    console.log(
+      '%c[ZH:3] main-component selection + fillSilhouette',
+      'color:#a855f7;font-weight:bold',
+      `\n  pixels after main+orphans selection: ${mainOnPx.toLocaleString()}` +
+      `\n  pixels after fillSilhouette (holes filled): ${filledOnPx.toLocaleString()}` +
+      `\n  delta from fill: ${(filledOnPx - mainOnPx).toLocaleString()} pixels (interior holes)` +
+      `\n  ► Components dropped here will NOT appear in the final contour.` +
+      `\n  ► If the design has detail elements that are missing in the preview,` +
+      `\n    look at [ZH:Component] log lines for "DROPPED" decisions above.`
+    );
+  }
 
   // Detect interior holes before they get filled (for Include Holes feature)
   const includeHoles = !!strokeSettings.includeHoles;
@@ -801,7 +873,22 @@ function processContour(
 
     // Re-label connected components in the filled mask
     const zeroComps = labelComponents(filledMainMask, hiResWidth, hiResHeight);
-    console.log('[Worker] Zero hero: found', zeroComps.length, 'components in filled mask');
+    // ============================================================
+    // [ZH:4] FINAL COMPONENTS GOING INTO BOUNDARY TRACE
+    // ============================================================
+    const _zhCompsSorted = [...zeroComps].sort((a, b) => b.area - a.area);
+    const _zhCompList = _zhCompsSorted.map((c, i) => {
+      const bw = c.bounds.maxX - c.bounds.minX;
+      const bh = c.bounds.maxY - c.bounds.minY;
+      return `    #${i}: id=${c.id} area=${c.area.toLocaleString()} bbox=${bw}×${bh} @(${c.bounds.minX},${c.bounds.minY})`;
+    }).join('\n');
+    console.log(
+      '%c[ZH:4] components going into boundary trace',
+      'color:#a855f7;font-weight:bold',
+      `\n  count: ${zeroComps.length}` +
+      `\n  ► One contour will be emitted per component (each gets its own polyline + Bezier path).` +
+      `\n  ► If you expect more contours than shown here, the missing ones were dropped at [ZH:Component] above.\n${_zhCompList}`
+    );
 
     if (zeroComps.length === 0) {
       return createOutputWithImage(imageData, canvasWidth, canvasHeight, padding, effectiveDPI, effectiveBackgroundColor);
@@ -1195,8 +1282,57 @@ function processContour(
     let totalBezierSegs = 0;
     let totalBezierLines = 0;
     let totalBezierCubics = 0;
-    for (const path of allZeroPaths) {
+    type PathFate = {
+      idx: number; pts: number; bw: number; bh: number;
+      cubicSegs: number; lineSegs: number;
+      fate: 'CIRCLE/ELLIPSE-SNAP' | 'BEZIER-FITTED' | 'STRAIGHT-LINES' | 'MIXED';
+    };
+    const _pathFates: PathFate[] = [];
+    for (let pathIdx = 0; pathIdx < allZeroPaths.length; pathIdx++) {
+      const path = allZeroPaths[pathIdx];
+      // Per-path bbox so we can correlate console diagnostics with which
+      // component is which when a design has multiple shapes.
+      let _pMinX = Infinity, _pMinY = Infinity, _pMaxX = -Infinity, _pMaxY = -Infinity;
+      for (const p of path) {
+        if (p.x < _pMinX) _pMinX = p.x;
+        if (p.y < _pMinY) _pMinY = p.y;
+        if (p.x > _pMaxX) _pMaxX = p.x;
+        if (p.y > _pMaxY) _pMaxY = p.y;
+      }
+      const _pBw = Math.round(_pMaxX - _pMinX);
+      const _pBh = Math.round(_pMaxY - _pMinY);
+      console.log(
+        `%c[ZH:Path #${pathIdx}] starting Bezier reconstruction`,
+        'color:#06b6d4;font-weight:bold',
+        `\n  ${path.length} polyline pts, bbox ${_pBw}×${_pBh} at (${Math.round(_pMinX)},${Math.round(_pMinY)})`
+      );
       const bp = polylineToBezierPath(path, bezierTolerancePx, bezierStraightTolPx);
+
+      // Classify what happened to this path.
+      let _cubicCount = 0, _lineCount = 0;
+      for (const s of bp.segments) {
+        if (s.type === 'cubic') _cubicCount++;
+        else _lineCount++;
+      }
+      let _fate: PathFate['fate'];
+      if (bp.segments.length === 4 && _cubicCount === 4) {
+        _fate = 'CIRCLE/ELLIPSE-SNAP';
+      } else if (_cubicCount > 0 && _lineCount === 0) {
+        _fate = 'BEZIER-FITTED';
+      } else if (_cubicCount === 0 && _lineCount > 0) {
+        _fate = 'STRAIGHT-LINES';
+      } else {
+        _fate = 'MIXED';
+      }
+      _pathFates.push({
+        idx: pathIdx, pts: path.length, bw: _pBw, bh: _pBh,
+        cubicSegs: _cubicCount, lineSegs: _lineCount, fate: _fate,
+      });
+      console.log(
+        `%c[ZH:Path #${pathIdx}] → ${_fate}`,
+        'color:#06b6d4',
+        `(${bp.segments.length} segs: ${_cubicCount} cubic, ${_lineCount} line)`
+      );
       // Preview-coord version (matches allPreviewPathPoints).
       const bpPreview: BezierPath = {
         start: { x: bp.start.x + offsetX, y: bp.start.y + offsetY },
@@ -1229,6 +1365,44 @@ function processContour(
       '[Worker] Zero hero bezier reconstruction:', allBezierPaths.length, 'path(s),',
       totalBezierSegs, 'segments (', totalBezierLines, 'line +', totalBezierCubics, 'cubic) — was',
       allZeroPaths.reduce((s, p) => s + p.length, 0), 'polyline vertices'
+    );
+
+    // ============================================================
+    // [ZH:5] FINAL PATH FATE SUMMARY
+    // ============================================================
+    const _circleCount = _pathFates.filter(f => f.fate === 'CIRCLE/ELLIPSE-SNAP').length;
+    const _bezierCount = _pathFates.filter(f => f.fate === 'BEZIER-FITTED').length;
+    const _straightCount = _pathFates.filter(f => f.fate === 'STRAIGHT-LINES').length;
+    const _mixedCount = _pathFates.filter(f => f.fate === 'MIXED').length;
+    console.log(
+      '%c[ZH:5] FINAL path fate summary',
+      'color:#a855f7;font-weight:bold;font-size:14px',
+      `\n  ${allBezierPaths.length} contour path(s) emitted → PDF/preview` +
+      `\n  ► circle/ellipse-snapped: ${_circleCount}` +
+      `\n  ► bezier-fitted curves:   ${_bezierCount}` +
+      `\n  ► straight-line only:     ${_straightCount}` +
+      `\n  ► mixed:                  ${_mixedCount}`
+    );
+    if (typeof console.table === 'function') {
+      console.table(_pathFates.map(f => ({
+        path: `#${f.idx}`, pts: f.pts,
+        bbox: `${f.bw}×${f.bh}`,
+        fate: f.fate,
+        cubic: f.cubicSegs, line: f.lineSegs,
+      })));
+    }
+    if (_circleCount > 0 && _pathFates.length === 1) {
+      console.warn(
+        '%c[ZH:5] ⚠  Only ONE path emitted and it was snapped to a circle.\n' +
+        '   If your design has features that should appear OUTSIDE that circle\n' +
+        '   (axes, poles, sun-rays, etc), they were filtered earlier in the\n' +
+        '   pipeline. Check [ZH:Component] decisions above for "DROPPED" lines.',
+        'color:#dc2626;font-weight:bold'
+      );
+    }
+    console.log(
+      '%c━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━',
+      'color:#a855f7;font-weight:bold'
     );
 
     console.log('[Worker] Zero hero page size (inches):', pageWidthInches.toFixed(4), 'x', pageHeightInches.toFixed(4));
@@ -1996,11 +2170,41 @@ function selectMainComponentWithOrphans(
       .filter(c => c.id !== main.id && c.area >= areaThreshold)
       .sort((a, b) => b.area - a.area);
 
+    const belowAreaThreshold = comps
+      .filter(c => c.id !== main.id && c.area < areaThreshold);
+
+    type CompDecision = {
+      id: number; area: number;
+      bw: number; bh: number; minX: number; minY: number;
+      verdict: 'KEPT (main)' | 'KEPT' | 'DROPPED';
+      reason: string; pass: number;
+    };
+    const decisions: CompDecision[] = [{
+      id: main.id, area: main.area,
+      bw: mainBounds.maxX - mainBounds.minX,
+      bh: mainBounds.maxY - mainBounds.minY,
+      minX: mainBounds.minX, minY: mainBounds.minY,
+      verdict: 'KEPT (main)', reason: 'largest component', pass: 0,
+    }];
+    for (const c of belowAreaThreshold) {
+      decisions.push({
+        id: c.id, area: c.area,
+        bw: c.bounds.maxX - c.bounds.minX,
+        bh: c.bounds.maxY - c.bounds.minY,
+        minX: c.bounds.minX, minY: c.bounds.minY,
+        verdict: 'DROPPED',
+        reason: `area ${c.area} < dynamicMinArea ${dynamicMinArea}`,
+        pass: 0,
+      });
+      removed++;
+    }
+
     const maxKeep = 50;
     const chainDistPx = expandPx;
     const included: LabeledComponent[] = [main];
     let unionIncluded: BoundingBox = { ...mainBounds };
     const added = new Set<number>([main.id]);
+    const dropReasonByCandidate = new Map<number, string>();
 
     let changed = true;
     let passes = 0;
@@ -2015,14 +2219,27 @@ function selectMainComponentWithOrphans(
         if (kept >= maxKeep) break;
 
         const expandedUnion = expandBounds(unionIncluded, expandPx);
-        const ok =
-          boundsIntersect(expandedUnion, c.bounds) ||
-          isNearAny(c, included, chainDistPx) ||
-          isCaptionLike(c.bounds);
+        const okIntersect = boundsIntersect(expandedUnion, c.bounds);
+        const okNear = isNearAny(c, included, chainDistPx);
+        const okCaption = isCaptionLike(c.bounds);
 
-        if (!ok) continue;
-        if (!passesDensity(c)) continue;
-        if (extraAreaKept + c.area > maxExtraArea) continue;
+        if (!okIntersect && !okNear && !okCaption) {
+          const distToUnion = distBounds(unionIncluded, c.bounds);
+          dropReasonByCandidate.set(c.id, `not near union: dist-to-union ${distToUnion}px > chain ${chainDistPx}px, not in expanded union bbox, not caption-like`);
+          continue;
+        }
+        if (!passesDensity(c)) {
+          const bw = c.bounds.maxX - c.bounds.minX;
+          const bh = c.bounds.maxY - c.bounds.minY;
+          const bboxArea = Math.max(1, (bw + 1) * (bh + 1));
+          const density = c.pixels.length / bboxArea;
+          dropReasonByCandidate.set(c.id, `density ${density.toFixed(4)} < threshold ${densityThreshold} (sparse/spread-out)`);
+          continue;
+        }
+        if (extraAreaKept + c.area > maxExtraArea) {
+          dropReasonByCandidate.set(c.id, `would exceed maxExtraArea (${extraAreaKept + c.area} > ${maxExtraArea})`);
+          continue;
+        }
 
         for (const idx of c.pixels) outMask[idx] = 1;
         kept++;
@@ -2031,11 +2248,48 @@ function selectMainComponentWithOrphans(
         added.add(c.id);
         unionIncluded = unionBoundsOf(unionIncluded, c.bounds);
         changed = true;
+        dropReasonByCandidate.delete(c.id);
+
+        decisions.push({
+          id: c.id, area: c.area,
+          bw: c.bounds.maxX - c.bounds.minX,
+          bh: c.bounds.maxY - c.bounds.minY,
+          minX: c.bounds.minX, minY: c.bounds.minY,
+          verdict: 'KEPT',
+          reason: [
+            okIntersect ? 'inside expanded union bbox' : null,
+            okNear ? `near a kept comp ≤ ${chainDistPx}px` : null,
+            okCaption ? 'caption-like' : null,
+          ].filter(Boolean).join(' + '),
+          pass: passes,
+        });
       }
+    }
+
+    for (const c of candidates) {
+      if (added.has(c.id)) continue;
+      decisions.push({
+        id: c.id, area: c.area,
+        bw: c.bounds.maxX - c.bounds.minX,
+        bh: c.bounds.maxY - c.bounds.minY,
+        minX: c.bounds.minX, minY: c.bounds.minY,
+        verdict: 'DROPPED',
+        reason: dropReasonByCandidate.get(c.id) || 'never reached (loop exited or maxKeep hit)',
+        pass: passes,
+      });
+      removed++;
     }
 
     removed = comps.length - kept;
     console.log('[Worker] Composite flood-fill: passes=', passes, 'chain dist=', chainDistPx, 'px');
+
+    // NOTE: console.table inside a Web Worker can hang DevTools when the
+    // panel is open and the table has many rows; emit plain log lines.
+    console.log('%c[ZH:Component] selection verdict (composite mode) — ' + decisions.length + ' rows',
+      'color:#a855f7;font-weight:bold');
+    for (const d of decisions) {
+      console.log(`[ZH:Component] id=${d.id} area=${d.area} bbox=${d.bw}×${d.bh} @(${d.minX},${d.minY}) pass=${d.pass} → ${d.verdict}: ${d.reason}`);
+    }
   } else if (faintArtMode) {
     const faintAreaThreshold = Math.max(dynamicMinArea, 80);
     const sortedComps = comps
@@ -2063,25 +2317,76 @@ function selectMainComponentWithOrphans(
 
     removed = comps.length - kept;
   } else {
+    // Per-component decision trace. Records the keep/drop verdict +
+    // the reason for every non-main component so we can see exactly
+    // why detail elements (e.g. axes, poles, small graphic accents)
+    // are surviving or being filtered.
+    type CompDecision = {
+      id: number; area: number;
+      bw: number; bh: number; minX: number; minY: number;
+      verdict: 'KEPT (main)' | 'KEPT' | 'DROPPED';
+      reason: string;
+    };
+    const decisions: CompDecision[] = [{
+      id: main.id, area: main.area,
+      bw: mainBounds.maxX - mainBounds.minX,
+      bh: mainBounds.maxY - mainBounds.minY,
+      minX: mainBounds.minX, minY: mainBounds.minY,
+      verdict: 'KEPT (main)', reason: 'largest component',
+    }];
+
     for (const c of comps) {
       if (c.id === main.id) continue;
+      const bw = c.bounds.maxX - c.bounds.minX;
+      const bh = c.bounds.maxY - c.bounds.minY;
+      const dist = distBounds(mainBounds, c.bounds);
+      const decision: CompDecision = {
+        id: c.id, area: c.area, bw, bh, minX: c.bounds.minX, minY: c.bounds.minY,
+        verdict: 'DROPPED', reason: '',
+      };
 
-      if (c.area < dynamicMinArea) { removed++; continue; }
+      if (c.area < dynamicMinArea) {
+        decision.reason = `area ${c.area} < dynamicMinArea ${dynamicMinArea}`;
+        decisions.push(decision); removed++; continue;
+      }
 
-      const ok =
-        boundsIntersect(expandedMain, c.bounds) ||
-        (distBounds(mainBounds, c.bounds) <= keepNearMainDistPx) ||
-        isCaptionLike(c.bounds);
+      const okIntersect = boundsIntersect(expandedMain, c.bounds);
+      const okDist = dist <= keepNearMainDistPx;
+      const okCaption = isCaptionLike(c.bounds);
+      if (!okIntersect && !okDist && !okCaption) {
+        decision.reason = `not near main: dist ${dist}px > limit ${keepNearMainDistPx}px, not in expanded bbox, not caption-like`;
+        decisions.push(decision); removed++; continue;
+      }
 
-      if (!ok) { removed++; continue; }
+      if (!passesDensity(c)) {
+        const bboxArea = Math.max(1, (bw + 1) * (bh + 1));
+        const density = c.pixels.length / bboxArea;
+        decision.reason = `density ${density.toFixed(4)} < threshold ${densityThreshold} (sparse/spread-out)`;
+        decisions.push(decision); removed++; continue;
+      }
 
-      if (!passesDensity(c)) { removed++; continue; }
-
-      if (extraAreaKept + c.area > maxExtraArea) { removed++; continue; }
+      if (extraAreaKept + c.area > maxExtraArea) {
+        decision.reason = `would exceed maxExtraArea (${extraAreaKept + c.area} > ${maxExtraArea})`;
+        decisions.push(decision); removed++; continue;
+      }
 
       for (const idx of c.pixels) outMask[idx] = 1;
       kept++;
       extraAreaKept += c.area;
+      decision.verdict = 'KEPT';
+      const reasons: string[] = [];
+      if (okIntersect) reasons.push('inside expanded main bbox');
+      if (okDist) reasons.push(`dist ${dist}px ≤ ${keepNearMainDistPx}px`);
+      if (okCaption) reasons.push('caption-like');
+      decision.reason = reasons.join(' + ');
+      decisions.push(decision);
+    }
+
+    // Plain log lines (console.table inside a Web Worker can hang DevTools).
+    console.log('%c[ZH:Component] selection verdict (normal mode) — ' + decisions.length + ' rows',
+      'color:#a855f7;font-weight:bold');
+    for (const d of decisions) {
+      console.log(`[ZH:Component] id=${d.id} area=${d.area} bbox=${d.bw}×${d.bh} @(${d.minX},${d.minY}) → ${d.verdict}: ${d.reason}`);
     }
   }
 
@@ -2971,9 +3276,29 @@ function detectBorderBackgroundColor(
   }
 
   const bg = { r: Math.round(avgR), g: Math.round(avgG), b: Math.round(avgB) };
+
+  // Sanity-check #1: a real canvas background is near-achromatic (white,
+  // cream, gray, off-black). If the detected color is highly saturated
+  // (e.g. pure red, vivid blue), the border samples almost certainly came
+  // from foreground pixels reaching the image edge — common after a
+  // Remove-Background + crop step where the four corners outside the
+  // design are transparent and the only OPAQUE border samples are the
+  // foreground tips that touch the bbox.
+  const maxC = Math.max(bg.r, bg.g, bg.b);
+  const minC = Math.min(bg.r, bg.g, bg.b);
+  const saturation = maxC === 0 ? 0 : (maxC - minC) / maxC;
+  const SATURATION_LIMIT = 0.25;
+  if (saturation > SATURATION_LIMIT) {
+    console.log('[Worker] detectBorderBackgroundColor: rejected rgb(' +
+      bg.r + ',' + bg.g + ',' + bg.b + ') — saturation ' +
+      (saturation * 100).toFixed(0) + '% > ' + (SATURATION_LIMIT * 100) +
+      '% (likely a foreground color, not the canvas). Falling back to alpha-based tracing.');
+    return null;
+  }
+
   console.log('[Worker] detectBorderBackgroundColor: solid bg detected rgb(' +
     bg.r + ',' + bg.g + ',' + bg.b + ') with ' + (agreeRatio * 100).toFixed(0) +
-    '% agreement across ' + samples.length + ' border samples');
+    '% border agreement, saturation ' + (saturation * 100).toFixed(0) + '%');
   return bg;
 }
 
@@ -5603,10 +5928,10 @@ function _ellipseResiduals(
 
 function detectAndSnapEllipse(
   polyline: Point[],
-  acceptanceRadialFraction: number = 0.04
+  acceptanceRadialFraction: number = 0.015
 ): EllipseFit | null {
   const n = polyline.length;
-  if (n < 12) return null;
+  if (n < 24) return null;
 
   // 1) Centroid (arithmetic mean of vertices). For uniformly-sampled boundary
   //    points this is the ellipse center. The sub-pixel marching squares output
@@ -5654,7 +5979,7 @@ function detectAndSnapEllipse(
   let rxInit = Math.sqrt(2 * lambda1);
   let ryInit = Math.sqrt(2 * lambda2);
   if (rxInit < 3 || ryInit < 3) return null;
-  if (rxInit / ryInit > 8) return null; // implausibly elongated → skip ellipse fit
+  if (rxInit / ryInit > 4) return null; // implausibly elongated → skip ellipse fit
 
   // 4) Transform polyline into ellipse-local coords (centered, axis-aligned).
   const cosT = Math.cos(-theta);
@@ -5709,7 +6034,50 @@ function detectAndSnapEllipse(
   // few way-off vertices that would visibly deviate from the smooth ellipse.
   const rmsOk = rms <= minorAxis * acceptanceRadialFraction;
   const maxOk = max <= minorAxis * (acceptanceRadialFraction * 2.5);
-  if (!rmsOk || !maxOk) return null;
+
+  // Convexity-defect gate: count points that sit SIGNIFICANTLY INSIDE the
+  // fitted ellipse. A true ellipse has tracer-noise-level inward deviation
+  // (few points, small magnitude). A "rounded blob with protrusions" — e.g.
+  // a logo where small features stick out and create concavities at their
+  // base — has many points sitting inward of the fitted ellipse at the
+  // concavities. Even when individual deviations don't exceed the `max`
+  // gate, the COUNT of inward deviations does.
+  //
+  // For each point, compute the radial distance to the ellipse boundary at
+  // its parametric angle. If `pointRadius < ellipseRadius - threshold`,
+  // count it as a concavity vote. Reject if the concavity count exceeds 8%
+  // of the polyline.
+  let concavityVotes = 0;
+  let maxInwardDev = 0;
+  const concavityThreshold = minorAxis * 0.01; // 1% of minor axis
+  for (const p of localPts) {
+    const angle = Math.atan2(p.y / ry, p.x / rx);
+    const ex = rx * Math.cos(angle);
+    const ey = ry * Math.sin(angle);
+    const ellipseR = Math.sqrt(ex * ex + ey * ey);
+    const pointR = Math.sqrt(p.x * p.x + p.y * p.y);
+    const inwardDev = ellipseR - pointR; // positive = point is INSIDE ellipse
+    if (inwardDev > concavityThreshold) {
+      concavityVotes++;
+      if (inwardDev > maxInwardDev) maxInwardDev = inwardDev;
+    }
+  }
+  const concavityFrac = concavityVotes / localPts.length;
+  const concavityOk = concavityFrac <= 0.08; // ≤8% of points sit inward → still ellipse-like
+
+  // Always log what the snap tried — helps debug "why did this snap" and
+  // "why didn't this snap" cases. Cheap (one log per closed polyline).
+  console.log(
+    '[Worker] Ellipse fit attempt: n=' + localPts.length +
+    ' rx=' + rx.toFixed(1) + ' ry=' + ry.toFixed(1) +
+    ' rms=' + rms.toFixed(2) + 'px (limit ' + (minorAxis * acceptanceRadialFraction).toFixed(2) + ')' +
+    ' max=' + max.toFixed(2) + 'px (limit ' + (minorAxis * acceptanceRadialFraction * 2.5).toFixed(2) + ')' +
+    ' concavity=' + (concavityFrac * 100).toFixed(1) + '%' +
+    ' (' + concavityVotes + '/' + localPts.length + ', maxInward=' + maxInwardDev.toFixed(2) + 'px)' +
+    ' → rmsOk=' + rmsOk + ' maxOk=' + maxOk + ' concavityOk=' + concavityOk
+  );
+
+  if (!rmsOk || !maxOk || !concavityOk) return null;
 
   return { cx, cy, rx, ry, theta, rmsResidualPx: rms, maxResidualPx: max };
 }
@@ -5867,34 +6235,62 @@ function polylineToBezierPath(
     };
   }
 
-  // 0) Analytical ellipse snap. Before any corner detection / Schneider
-  //    fitting, check whether this whole closed polyline IS an ellipse
-  //    (or circle). If so, emit 4 perfect cubic-Bezier quarter-arcs —
-  //    mathematically exact, ~16 anchor+control points instead of dozens
-  //    of fitted micro-cubics. Acceptance is gated on a tight radial
-  //    residual so this only triggers on actually-elliptical shapes.
-  const ellipse = detectAndSnapEllipse(closedPolyline, 0.04);
-  if (ellipse) {
-    console.log(
-      '[Worker] Ellipse snap accepted: cx=' + ellipse.cx.toFixed(2) +
-      ', cy=' + ellipse.cy.toFixed(2) +
-      ', rx=' + ellipse.rx.toFixed(2) +
-      ', ry=' + ellipse.ry.toFixed(2) +
-      ', theta=' + (ellipse.theta * 180 / Math.PI).toFixed(1) + '°' +
-      ', rms=' + ellipse.rmsResidualPx.toFixed(3) + 'px' +
-      ', max=' + ellipse.maxResidualPx.toFixed(3) + 'px' +
-      ' → emitting 4 quarter-arc cubics'
-    );
-    return ellipseToBezierPath(ellipse);
-  }
+  // 1) Detect real corners FIRST. Strict threshold (70°), narrow detection
+  //    window (~3 px of arc), wide NMS (~12 px of arc) — this combination
+  //    is what distinguishes "actual corner that needs a tangent break"
+  //    from "soft bend in a smooth arc". Without strict NMS the dense-
+  //    polyline (post light-RDP) input fragments into hundreds of micro-
+  //    corners → micro-sub-segments → degenerate near-linear cubics →
+  //    rough-looking PDF.
+  //    We compute corners up front so the ellipse snap below can refuse
+  //    to fire on shapes that have real sharp corners (stars, gears,
+  //    blobs with tabs, etc.) — otherwise a low average radial residual
+  //    would let those shapes get replaced with a perfect circle.
+  // Corner threshold dropped from 70° to 50° so the ellipse-snap below
+  // refuses to fire on shapes with even moderately sharp protrusions
+  // (e.g. logos with thin axes/poles attached to a round body — fire
+  // badges, gears, sun-rays, etc).
+  let corners = detectCornersByCurvature(closedPolyline, 3, 50, 12);
+  let cornerCount = 0;
+  for (let i = 0; i < n; i++) if (corners[i]) cornerCount++;
 
-  // 1) Detect real corners. Strict threshold (70°), narrow detection window
-  //    (~3 px of arc), wide NMS (~12 px of arc) — this combination is what
-  //    distinguishes "actual corner that needs a tangent break" from "soft
-  //    bend in a smooth arc". Without strict NMS the dense-polyline (post
-  //    light-RDP) input fragments into hundreds of micro-corners → micro-
-  //    sub-segments → degenerate near-linear cubics → rough-looking PDF.
-  let corners = detectCornersByCurvature(closedPolyline, 3, 70, 12);
+  // 0) Analytical ellipse snap — DISABLED by default.
+  //
+  //    This pass used to detect smooth closed loops (cornerCount < 2) that
+  //    fit a true ellipse within ~1.5% radial residual and replace them
+  //    with 4 perfect cubic-Bezier quarter-arcs (the "perfect-circle"
+  //    snapping). It produced compact PDFs for genuine circle/oval inputs
+  //    but had a long tail of false positives on near-circular badges
+  //    (fire-dept seals, ham-radio logos, anything with thin protrusions
+  //    from a roundish body) where it would overwrite the user's actual
+  //    outline with a perfect ellipse — visually wrong even when the fit
+  //    residual happened to be low.
+  //
+  //    The user has asked for it to be removed multiple times. Gated
+  //    behind a flag so that the analytical fit machinery (still used
+  //    elsewhere as a diagnostic and potentially useful for an explicit
+  //    "auto-ellipse" UI option later) doesn't have to be deleted.
+  //
+  //    To re-enable: set ENABLE_ANALYTICAL_ELLIPSE_SNAP to true. To
+  //    delete entirely: also remove `detectAndSnapEllipse` and
+  //    `ellipseToBezierPath` further down in this file.
+  const ENABLE_ANALYTICAL_ELLIPSE_SNAP = false;
+  if (ENABLE_ANALYTICAL_ELLIPSE_SNAP && cornerCount < 2) {
+    const ellipse = detectAndSnapEllipse(closedPolyline, 0.015);
+    if (ellipse) {
+      console.log(
+        '[Worker] Ellipse snap accepted: cx=' + ellipse.cx.toFixed(2) +
+        ', cy=' + ellipse.cy.toFixed(2) +
+        ', rx=' + ellipse.rx.toFixed(2) +
+        ', ry=' + ellipse.ry.toFixed(2) +
+        ', theta=' + (ellipse.theta * 180 / Math.PI).toFixed(1) + '°' +
+        ', rms=' + ellipse.rmsResidualPx.toFixed(3) + 'px' +
+        ', max=' + ellipse.maxResidualPx.toFixed(3) + 'px' +
+        ' → emitting 4 quarter-arc cubics'
+      );
+      return ellipseToBezierPath(ellipse);
+    }
+  }
 
   // 2) If no real corners exist (e.g. ellipse/blob), synthesize 4 soft
   //    corners at the bbox extremes (top, right, bottom, left). This breaks

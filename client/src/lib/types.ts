@@ -15,6 +15,43 @@ export interface ImageInfo {
   isPDF?: boolean;
   pdfCutContourInfo?: PDFCutContourInfo;
   originalPdfData?: ArrayBuffer;
+  /**
+   * Hex colours removed by the "Remove Color" tool, most-recent first.
+   * Surfaced as the first swatches in fill / bleed pickers so the user can
+   * put the original background colour back behind the cut contour after the
+   * cutline has been traced against the transparent design — and can pick
+   * any of the previously-removed colours, not only the latest one.
+   */
+  removedColors?: string[];
+  /**
+   * QR codes detected in the source image (run on upload, off-thread).
+   * Each entry includes the decoded payload + the source-pixel bbox so the
+   * export pipelines can replace the (potentially blurred-by-resize) source
+   * pixels with a freshly-rendered crisp QR at the target print resolution.
+   * Empty / undefined = no QRs in this design.
+   */
+  qrCodes?: import('./qr').DetectedQR[];
+  /**
+   * `true` once the off-thread QR detection pass has completed for this
+   * image (regardless of how many codes were found). Lets the UI tell apart
+   * "haven't tried yet" (show spinner) from "tried, found nothing" (show a
+   * neutral badge with a re-scan affordance).
+   */
+  qrDetectionRan?: boolean;
+  /**
+   * User opt-IN for the QR re-render pass. Default false (= leave the
+   * source QR pixels as-is). Detection still runs automatically so we
+   * know a QR is present; the re-render (force-square modules, white
+   * wipe + halo, logo carve-out, horizontal run-merge) only kicks in
+   * after the user clicks the QR badge to enable it.
+   *
+   * Made opt-in because the re-render visually changes the QR (forces
+   * pure-black squares regardless of any custom dot styling, redraws
+   * the modules around any centre logo) — a user with a clean,
+   * reliable original QR may not want any of that, while a user with
+   * a blurry / low-DPI source QR can opt in for crisp prints.
+   */
+  qrRerenderEnabled?: boolean;
 }
 
 export type ContourMode = 'smooth' | 'scattered';

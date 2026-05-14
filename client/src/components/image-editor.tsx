@@ -12,6 +12,7 @@ import { getContourWorkerManager, processContourInWorker, type DetectedAlgorithm
 import { downloadShapePDF, calculateShapeDimensions, generateShapePathPointsInches } from "@/lib/shape-outline";
 import { useDebouncedValue } from "@/hooks/use-debounce";
 import { removeBackgroundFromImage } from "@/lib/background-removal";
+import { magicWandErase } from "@/lib/magic-wand";
 import type { ParsedPDFData } from "@/lib/pdf-parser";
 import { detectShape, mapDetectedShapeToType } from "@/lib/shape-detection";
 import { useToast } from "@/hooks/use-toast";
@@ -62,6 +63,9 @@ export default function ImageEditor({ onDesignUploaded }: { onDesignUploaded?: (
   const [stickerSize, setStickerSize] = useState<StickerSize>(4); // Default 4 inch max dimension
   const [isProcessing, setIsProcessing] = useState(false);
   const [isRemovingBackground, setIsRemovingBackground] = useState(false);
+  const [magicWandMode, setMagicWandMode] = useState(false);
+  const [magicWandTolerance, setMagicWandTolerance] = useState(0.08); // 0..1
+  const [isMagicWandRunning, setIsMagicWandRunning] = useState(false);
   const [spotPreviewData, setSpotPreviewData] = useState<SpotPreviewData>({ enabled: false, colors: [] });
   const [spotColorRestore, setSpotColorRestore] = useState<{ colors: ExtractedColor[]; id: number } | null>(null);
   const [highlightedColor, setHighlightedColor] = useState<{ colorIndex: number; regionId: number | null } | null>(null);
@@ -265,6 +269,31 @@ export default function ImageEditor({ onDesignUploaded }: { onDesignUploaded?: (
     }
   }, [showCutLabelDropdown, showApplyAddDropdown]);
 
+  // Keep `strokeSettings.width` aligned with the option list that the Contour
+  // Margin dropdown will actually render. The list narrows when
+  // `detectedAlgorithm` flips to 'scattered' (smaller margins look cluttered
+  // on multi-blob designs, and Zero Hero in particular produces dozens of
+  // tiny per-component outlines). If the saved width isn't in the new list,
+  // shadcn's <Select> renders an empty box — that's the bug we're fixing.
+  // We snap to the closest valid option whenever the algorithm transitions.
+  useEffect(() => {
+    const validForScattered = [0.07, 0.14, 0.25];
+    const validForComplex = [0, 0.02, 0.04, 0.07, 0.14, 0.25];
+    const valid = detectedAlgorithm === 'scattered' ? validForScattered : validForComplex;
+    if (valid.includes(strokeSettings.width)) return;
+    let nearest = valid[0];
+    let minDiff = Math.abs(strokeSettings.width - nearest);
+    for (const v of valid) {
+      const d = Math.abs(strokeSettings.width - v);
+      if (d < minDiff) { nearest = v; minDiff = d; }
+    }
+    console.log(
+      `[ContourMargin] width=${strokeSettings.width} not in ${detectedAlgorithm ?? 'complex'} ` +
+      `option list — snapping to nearest valid value ${nearest}`
+    );
+    setStrokeSettings((prev) => ({ ...prev, width: nearest }));
+  }, [detectedAlgorithm, strokeSettings.width]);
+
   const handleApplyAndAdd = useCallback((newLabel: 'CutContour' | 'PerfCutContour' | 'KissCut') => {
     const workerManager = getContourWorkerManager();
     const contourData = workerManager.getCachedContourData();
@@ -455,11 +484,67 @@ export default function ImageEditor({ onDesignUploaded }: { onDesignUploaded?: (
     setSpotPreviewData({ enabled: false, colors: [] });
     setDetectedAlgorithm(undefined);
     setSpotPaintMode(null);
+    setLockedContour(null);
+    setCadCutBounds(null);
+    setDetectedShapeType(null);
+    setDetectedShapeInfo(null);
     const workerManager = getContourWorkerManager();
+    // Important: cancel + clear, in that order. Otherwise any in-flight
+    // contour trace would resolve into a now-empty cache slot and
+    // potentially flash the old design's outline against the new (or no)
+    // image after upload.
+    workerManager.cancelInFlight('Design cleared');
     workerManager.clearCache();
   }, []);
 
+  /**
+   * Re-run shape detection and invalidate every cached cutpath artefact
+   * after the underlying pixels have changed (white-bg removal, magic-wand
+   * erase, AI enhance, …). Detected shape type + bounding box drive the
+   * contour pipeline's primitive-snap pass and the auto-shape (square /
+   * circle / rounded-rect) wrap, so they MUST be recomputed against the
+   * new pixel data — otherwise the cutline keeps tracing the silhouette of
+   * the original image (e.g. wrapping a rectangle around a logo whose
+   * white box was just deleted).
+   *
+   * Caller is responsible for `setImageInfo(newImageInfo)` separately;
+   * this helper only refreshes the derived state.
+   */
+  const refreshDerivedShapeState = useCallback((newImage: HTMLImageElement) => {
+    const detectionResult = detectShape(newImage);
+    const detectedType = mapDetectedShapeToType(detectionResult.shape);
+    setDetectedShapeType(detectedType);
+    setDetectedShapeInfo(detectedType ? {
+      type: detectedType,
+      boundingBox: detectionResult.boundingBox,
+    } : null);
+
+    // Drop any pinned outline — it was traced from the previous pixels and
+    // would otherwise keep drawing the old cutline in the preview / PDF.
+    setLockedContour(null);
+    // CadCut bounds were computed from the previous bounding box.
+    setCadCutBounds(null);
+    // Manager-level + worker-level cache reset so the next preview render
+    // re-traces from scratch instead of returning the previous result.
+    const workerManager = getContourWorkerManager();
+    workerManager.cancelInFlight('Pixels mutated; previous trace stale');
+    workerManager.clearCache();
+
+    console.log(
+      `[ShapePipeline] Re-detected after pixel mutation: shape=${detectedType ?? 'none'}, bbox=`,
+      detectedType ? detectionResult.boundingBox : null,
+    );
+  }, []);
+
   const applyNewImage = useCallback((newImageInfo: ImageInfo, widthInches: number, heightInches: number) => {
+    // Drop any in-flight trace from the previous design before we swap.
+    // Without this, the old image's contour can resolve into the cache
+    // slot for the new image (or worse, leave the "Processing… 0%"
+    // overlay frozen because the bumped processingId discards the result).
+    const workerManager = getContourWorkerManager();
+    workerManager.cancelInFlight('Design swapped');
+    workerManager.clearCache();
+
     setImageInfo(newImageInfo);
 
     const detectionResult = detectShape(newImageInfo.image);
@@ -763,11 +848,14 @@ export default function ImageEditor({ onDesignUploaded }: { onDesignUploaded?: (
   }, [imageInfo, shapeSettings, updateCadCutBounds]);
 
   const handleRemoveBackground = useCallback(async (threshold: number) => {
+    console.log('[BgRemoval-handler] handleRemoveBackground invoked, threshold=', threshold, 'hasImage=', !!imageInfo);
     if (!imageInfo) return;
-    
+
     setIsRemovingBackground(true);
     try {
+      console.log('[BgRemoval-handler] awaiting removeBackgroundFromImage...');
       const bgRemovedImage = await removeBackgroundFromImage(imageInfo.image, threshold);
+      console.log('[BgRemoval-handler] removeBackgroundFromImage resolved, cropping...');
       
       // Crop to content bounds after background removal so shape fits actual visible content
       const croppedCanvas = cropImageToContent(bgRemovedImage);
@@ -797,18 +885,13 @@ export default function ImageEditor({ onDesignUploaded }: { onDesignUploaded?: (
       };
 
       // Keep the user's width/height inches — only pixels changed after crop; do not reset to "natural" size at dpi.
-      
-      // Clear contour cache to force recomputation with new image
-      const workerManager = getContourWorkerManager();
-      workerManager.clearCache();
-      
-      // Reset CadCut bounds
-      setCadCutBounds(null);
-      
-      // Log the change
+
       console.log(`[BackgroundRemoval] Complete! Original: ${imageInfo.originalWidth}x${imageInfo.originalHeight}, New: ${newWidth}x${newHeight}`);
-      
+
       setImageInfo(newImageInfo);
+      // Re-run shape detection + reset every cached cutpath artefact so the
+      // contour pipeline traces the bg-removed silhouette, not the old one.
+      refreshDerivedShapeState(finalImage);
       
       // Show success toast
       toast({
@@ -825,7 +908,64 @@ export default function ImageEditor({ onDesignUploaded }: { onDesignUploaded?: (
     } finally {
       setIsRemovingBackground(false);
     }
-  }, [imageInfo, toast]);
+  }, [imageInfo, toast, refreshDerivedShapeState]);
+
+  const handleMagicWandClick = useCallback(async (imageX: number, imageY: number) => {
+    if (!imageInfo || isMagicWandRunning) return;
+
+    setIsMagicWandRunning(true);
+    try {
+      const erased = await magicWandErase(imageInfo.image, imageX, imageY, magicWandTolerance);
+
+      const croppedCanvas = cropImageToContent(erased);
+      const finalCanvas = croppedCanvas ?? (() => {
+        const c = document.createElement('canvas');
+        c.width = erased.naturalWidth || erased.width;
+        c.height = erased.naturalHeight || erased.height;
+        c.getContext('2d')?.drawImage(erased, 0, 0);
+        return c;
+      })();
+
+      const finalImage = await new Promise<HTMLImageElement>((resolve, reject) => {
+        const img = new Image();
+        img.onload = () => resolve(img);
+        img.onerror = reject;
+        img.src = finalCanvas.toDataURL('image/png');
+      });
+
+      const newWidth = finalImage.naturalWidth || finalImage.width;
+      const newHeight = finalImage.naturalHeight || finalImage.height;
+
+      const newImageInfo: ImageInfo = {
+        ...imageInfo,
+        image: finalImage,
+        originalWidth: newWidth,
+        originalHeight: newHeight,
+      };
+
+      console.log(`[MagicWand] Erased region around (${imageX.toFixed(0)}, ${imageY.toFixed(0)}) tol=${magicWandTolerance.toFixed(3)}; size: ${imageInfo.originalWidth}x${imageInfo.originalHeight} → ${newWidth}x${newHeight}`);
+
+      setImageInfo(newImageInfo);
+      // Pixels just changed — re-detect shape + invalidate every cached
+      // cutpath so the next preview retraces the new silhouette.
+      refreshDerivedShapeState(finalImage);
+
+      toast({
+        title: "Color Erased",
+        description: "Click another area to erase more, or click Done.",
+      });
+    } catch (error) {
+      if ((error as Error).message?.includes('Cancelled')) return;
+      console.error('Magic wand error:', error);
+      toast({
+        title: "Error",
+        description: "Magic wand failed. Please try again.",
+        variant: "destructive",
+      });
+    } finally {
+      setIsMagicWandRunning(false);
+    }
+  }, [imageInfo, magicWandTolerance, isMagicWandRunning, toast, refreshDerivedShapeState]);
 
   const handleStrokeChange = useCallback((newSettings: Partial<StrokeSettings>) => {
     const updated = { ...strokeSettings, ...newSettings };
@@ -965,12 +1105,9 @@ export default function ImageEditor({ onDesignUploaded }: { onDesignUploaded?: (
       };
 
       setImageInfo(newImageInfo);
-
-      const workerManager = getContourWorkerManager();
-      workerManager.recreateWorker();
-      workerManager.clearCache();
-      setCadCutBounds(null);
-      setLockedContour(null);
+      // Enhanced pixels = different silhouette; rebuild every cached
+      // cutpath artefact off the new image.
+      refreshDerivedShapeState(enhancedImage);
 
       const modeLabel = mode === 'ai' ? 'AI Design' : mode === 'faces' ? 'Faces' : 'Design';
 
@@ -993,7 +1130,7 @@ export default function ImageEditor({ onDesignUploaded }: { onDesignUploaded?: (
       setEnhancingMode(null);
       setEnhanceStage('');
     }
-  }, [imageInfo, enhancingMode, toast]);
+  }, [imageInfo, enhancingMode, toast, refreshDerivedShapeState]);
 
   const handleSegmentationChange = useCallback((data: Partial<SegmentationData>) => {
     setSegmentationData(prev => ({ ...prev, ...data }));
@@ -1373,7 +1510,43 @@ export default function ImageEditor({ onDesignUploaded }: { onDesignUploaded?: (
                 <span className="relative">{isRemovingBackground ? 'Removing...' : 'Remove White Background'}</span>
               </button>
             )}
-            
+
+            {imageInfo && (
+              <button
+                onClick={() => setMagicWandMode(prev => !prev)}
+                disabled={isRemovingBackground || isMagicWandRunning}
+                className={`group relative flex items-center gap-2 px-4 py-2 rounded-lg text-xs font-semibold whitespace-nowrap text-white shadow-md disabled:opacity-50 overflow-hidden transition-all duration-200 active:scale-[0.95] active:shadow-sm ${magicWandMode
+                  ? 'bg-gradient-to-r from-fuchsia-600 to-pink-600 hover:from-fuchsia-700 hover:to-pink-700 ring-2 ring-fuchsia-300'
+                  : 'bg-gradient-to-r from-fuchsia-500 to-pink-500 hover:from-fuchsia-600 hover:to-pink-600 hover:shadow-lg hover:shadow-fuchsia-200'}`}
+                title={magicWandMode ? 'Click on the preview to erase a color region' : 'Magic wand: click to erase any color'}
+              >
+                <span className="absolute inset-0 bg-white/20 translate-y-full group-hover:translate-y-0 transition-transform duration-300 ease-out rounded-lg"></span>
+                {isMagicWandRunning ? (
+                  <svg className="relative w-4 h-4 animate-spin" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><path d="M12 2v4M12 18v4M4.93 4.93l2.83 2.83M16.24 16.24l2.83 2.83M2 12h4M18 12h4M4.93 19.07l2.83-2.83M16.24 7.76l2.83-2.83" /></svg>
+                ) : (
+                  <svg className="relative w-4 h-4 transition-transform duration-200 group-hover:rotate-12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="m14 4 6 6"/><path d="M14 4l-2.5 2.5"/><path d="M11.5 6.5 4 14l6 6 7.5-7.5"/><path d="m18 8 4 4"/></svg>
+                )}
+                <span className="relative">{magicWandMode ? (isMagicWandRunning ? 'Erasing...' : 'Click to Erase') : 'Magic Wand'}</span>
+              </button>
+            )}
+
+            {magicWandMode && (
+              <div className="flex items-center gap-2 px-3 py-1.5 rounded-lg bg-fuchsia-50 border border-fuchsia-100">
+                <span className="text-[10px] font-semibold text-fuchsia-700 uppercase tracking-wide">Tolerance</span>
+                <input
+                  type="range"
+                  min={0}
+                  max={50}
+                  step={1}
+                  value={Math.round(magicWandTolerance * 100)}
+                  onChange={(e) => setMagicWandTolerance(parseInt(e.target.value, 10) / 100)}
+                  className="w-28 accent-fuchsia-500"
+                  title="Higher = matches more colors. 5-10% works for most solid backgrounds."
+                />
+                <span className="text-[10px] font-mono text-fuchsia-700 w-7 text-right">{Math.round(magicWandTolerance * 100)}%</span>
+              </div>
+            )}
+
             <div className="flex-1"></div>
             
             {(strokeSettings.enabled || shapeSettings.enabled || (imageInfo?.isPDF && imageInfo?.pdfCutContourInfo?.hasCutContour)) && (
@@ -1496,6 +1669,8 @@ export default function ImageEditor({ onDesignUploaded }: { onDesignUploaded?: (
             canUndo={canUndo}
             canRedo={canRedo}
             spotPaintMode={spotPaintMode}
+            magicWandMode={magicWandMode}
+            onMagicWandPick={handleMagicWandClick}
             onSpotColorClick={(colorIndex, regionId) => {
               if (spotPaintMode) {
                 if (snapshotTimerRef.current) {

@@ -762,6 +762,137 @@ ${pdfData ? '<p><strong>PDF design with CutContour is attached.</strong></p>' : 
     }
   });
 
+  // AI Background Removal using Replicate BiRefNet (men1scus/birefnet).
+  // Returns a transparent PNG suitable for downstream contour tracing.
+  // Includes a cheap fast-path: if the input already has meaningful
+  // transparency (>1% of pixels with alpha < 250), we skip the ML call and
+  // re-encode the input as-is.
+  app.post("/api/remove-background-ai", upload.single('image'), async (req, res) => {
+    try {
+      if (!req.file) {
+        return res.status(400).json({ error: "No image file provided" });
+      }
+
+      const start = Date.now();
+      const inputMeta = await sharp(req.file.buffer).metadata();
+      const imgWidth = inputMeta.width || 1;
+      const imgHeight = inputMeta.height || 1;
+
+      // Sanity cap: BiRefNet on A100 handles ~2k cleanly; above ~4k we risk
+      // timeouts and excess cost without quality gain (the contour pipeline
+      // re-rasterises at most 300 DPI anyway).
+      const longestSide = Math.max(imgWidth, imgHeight);
+      if (longestSide > 4096) {
+        return res.status(400).json({
+          error: `Image too large for AI background removal (${imgWidth}x${imgHeight}). Max longest side: 4096px.`,
+        });
+      }
+
+      // ── Fast-path: already transparent ──
+      // Sample at 256px on the longest side; counting every pixel of a 4k PNG
+      // here would dominate the route latency.
+      const sampleLong = 256;
+      const sampleScale = Math.min(1, sampleLong / longestSide);
+      const sampleW = Math.max(1, Math.round(imgWidth * sampleScale));
+      const sampleH = Math.max(1, Math.round(imgHeight * sampleScale));
+      const { data: sampleData, info: sampleInfo } = await sharp(req.file.buffer)
+        .resize(sampleW, sampleH, { fit: 'fill' })
+        .ensureAlpha()
+        .raw()
+        .toBuffer({ resolveWithObject: true });
+      const sampleCh = sampleInfo.channels;
+      let transparentish = 0;
+      const totalSampled = sampleW * sampleH;
+      for (let i = 0; i < totalSampled; i++) {
+        if (sampleData[i * sampleCh + 3] < 250) transparentish++;
+      }
+      const transparencyRatio = transparentish / totalSampled;
+
+      if (transparencyRatio > 0.01) {
+        // Image already has alpha; re-encode untouched so the client can
+        // treat the response uniformly.
+        const passthrough = await sharp(req.file.buffer).png().toBuffer();
+        const elapsed = Date.now() - start;
+        console.log(
+          `[BG-AI] Skipped ML (${(transparencyRatio * 100).toFixed(1)}% already transparent), ${elapsed}ms`
+        );
+        res.set('Content-Type', 'image/png');
+        res.set('X-Bg-Removal-Mode', 'passthrough');
+        res.set('X-Original-Width', String(imgWidth));
+        res.set('X-Original-Height', String(imgHeight));
+        return res.send(passthrough);
+      }
+
+      const apiToken = process.env.REPLICATE_API_TOKEN;
+      if (!apiToken) {
+        console.error("Replicate API token not configured");
+        return res.status(500).json({
+          error: "AI background removal service not configured. Set REPLICATE_API_TOKEN environment variable.",
+        });
+      }
+
+      console.log(`[BG-AI] Starting BiRefNet on ${imgWidth}x${imgHeight}`);
+
+      const replicate = new Replicate({ auth: apiToken, useFileOutput: false });
+
+      const base64 = req.file.buffer.toString('base64');
+      const mimeType = req.file.mimetype || 'image/png';
+      const dataUri = `data:${mimeType};base64,${base64}`;
+
+      const output = await replicate.run(
+        "men1scus/birefnet:f74986db0355b58403ed20963af156525e2891ea3c2d499bfbfb2a28cd87c5d7",
+        { input: { image: dataUri } }
+      );
+
+      let resultUrl: string | null = null;
+      if (typeof output === 'string') {
+        resultUrl = output;
+      } else if (Array.isArray(output) && output.length > 0 && typeof output[0] === 'string') {
+        resultUrl = output[0] as string;
+      } else if (output && typeof (output as any).url === 'function') {
+        resultUrl = (output as any).url();
+      } else if (output && typeof output === 'object') {
+        resultUrl = String(output);
+      }
+
+      console.log(
+        `[BG-AI] Replicate output type: ${typeof output}, resultUrl: ${resultUrl ? resultUrl.substring(0, 80) + '...' : 'null'}`
+      );
+
+      if (!resultUrl || resultUrl === '[object Object]' || resultUrl === '[object ReadableStream]') {
+        throw new Error("Unexpected output format from Replicate AI model");
+      }
+
+      const imgResponse = await fetch(resultUrl);
+      if (!imgResponse.ok) throw new Error(`Failed to download AI result: ${imgResponse.status}`);
+
+      const arrayBuf = await imgResponse.arrayBuffer();
+      // Re-encode through Sharp to guarantee a clean RGBA PNG (the model
+      // sometimes emits images Chrome decodes oddly without a re-encode).
+      const pngBuffer = await sharp(Buffer.from(arrayBuf)).ensureAlpha().png().toBuffer();
+      const outMeta = await sharp(pngBuffer).metadata();
+      const outWidth = outMeta.width || imgWidth;
+      const outHeight = outMeta.height || imgHeight;
+
+      const elapsed = Date.now() - start;
+      console.log(`[BG-AI] Done in ${elapsed}ms! ${imgWidth}x${imgHeight} → ${outWidth}x${outHeight}`);
+
+      res.set('Content-Type', 'image/png');
+      res.set('X-Bg-Removal-Mode', 'birefnet');
+      res.set('X-Original-Width', String(imgWidth));
+      res.set('X-Original-Height', String(imgHeight));
+      res.set('X-Result-Width', String(outWidth));
+      res.set('X-Result-Height', String(outHeight));
+      res.send(pngBuffer);
+    } catch (error) {
+      console.error("[BG-AI] Error:", error);
+      res.status(500).json({
+        error: "AI background removal failed",
+        details: error instanceof Error ? error.message : "Unknown error",
+      });
+    }
+  });
+
   const httpServer = createServer(app);
   return httpServer;
 }

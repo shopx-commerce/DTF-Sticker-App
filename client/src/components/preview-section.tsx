@@ -28,6 +28,8 @@ interface PreviewSectionProps {
   segmentationData?: SegmentationData;
   onSpotColorClick?: (colorIndex: number, regionId: number | null) => void;
   spotPaintMode?: 'white' | 'gloss' | 'both' | 'clear' | null;
+  magicWandMode?: boolean;
+  onMagicWandPick?: (imageX: number, imageY: number) => void;
   fileName?: string;
   onResizeChange?: (settings: Partial<ResizeSettings>) => void;
   onUndo?: () => void;
@@ -77,7 +79,7 @@ function InchInput({ value, onCommit, min = 0.5, max = 50, className }: {
 }
 
 const PreviewSection = forwardRef<HTMLCanvasElement, PreviewSectionProps>(
-  ({ imageInfo, strokeSettings, resizeSettings, shapeSettings, cadCutBounds, spotPreviewData, showCutLineInfo, onDetectedAlgorithm, detectedShapeType, detectedShapeInfo, detectedAlgorithm, onStrokeChange, lockedContour, segmentationData, onSpotColorClick, spotPaintMode, fileName, onResizeChange, onUndo, onRedo, canUndo, canRedo }, ref) => {
+  ({ imageInfo, strokeSettings, resizeSettings, shapeSettings, cadCutBounds, spotPreviewData, showCutLineInfo, onDetectedAlgorithm, detectedShapeType, detectedShapeInfo, detectedAlgorithm, onStrokeChange, lockedContour, segmentationData, onSpotColorClick, spotPaintMode, magicWandMode, onMagicWandPick, fileName, onResizeChange, onUndo, onRedo, canUndo, canRedo }, ref) => {
     const canvasRef = useRef<HTMLCanvasElement>(null);
     const containerRef = useRef<HTMLDivElement>(null);
     const [zoom, setZoom] = useState(1);
@@ -256,14 +258,32 @@ const PreviewSection = forwardRef<HTMLCanvasElement, PreviewSectionProps>(
       mouseDownPosRef.current = null;
       syncRefsToState();
 
-      if (downPos && onSpotColorClick && spotPreviewData?.pixelMap && imageInfo) {
+      if (downPos) {
         const dx = e.clientX - downPos.x;
         const dy = e.clientY - downPos.y;
-        if (Math.abs(dx) < 4 && Math.abs(dy) < 4) {
+        const isClick = Math.abs(dx) < 4 && Math.abs(dy) < 4;
+
+        if (isClick && magicWandMode && onMagicWandPick && imageInfo && canvasRef.current) {
+          const canvas = canvasRef.current;
+          const rect = canvas.getBoundingClientRect();
+          const canvasX = (e.clientX - rect.left) * (canvas.width / rect.width);
+          const canvasY = (e.clientY - rect.top) * (canvas.height / rect.height);
+          const imgRect = lastImageRenderRef.current;
+          if (imgRect && imgRect.width > 0 && imgRect.height > 0) {
+            const imgX = (canvasX - imgRect.x) / imgRect.width * imageInfo.image.width;
+            const imgY = (canvasY - imgRect.y) / imgRect.height * imageInfo.image.height;
+            if (imgX >= 0 && imgX < imageInfo.image.width && imgY >= 0 && imgY < imageInfo.image.height) {
+              onMagicWandPick(imgX, imgY);
+            }
+          }
+          return;
+        }
+
+        if (isClick && onSpotColorClick && spotPreviewData?.pixelMap && imageInfo) {
           handleCanvasClick(e);
         }
       }
-    }, [onSpotColorClick, spotPreviewData, imageInfo, selectionRect, applySelectionZoom, syncRefsToState]);
+    }, [onSpotColorClick, spotPreviewData, imageInfo, selectionRect, applySelectionZoom, syncRefsToState, magicWandMode, onMagicWandPick]);
     
     const handleCanvasClick = useCallback((e: React.MouseEvent) => {
       if (!imageInfo || !spotPreviewData?.pixelMap || !onSpotColorClick || !canvasRef.current) return;
@@ -581,10 +601,21 @@ const PreviewSection = forwardRef<HTMLCanvasElement, PreviewSectionProps>(
         clearTimeout(contourDebounceRef.current);
         contourDebounceRef.current = null;
       }
-      
+
       if (!imageInfo || !strokeSettings.enabled || shapeSettings.enabled) {
         contourCacheRef.current = null;
         contourTransformRef.current = null;
+        // CRITICAL: invalidate any in-flight worker run AND reset the
+        // overlay state. Without these two lines, removing/swapping a
+        // design while the previous trace is in flight leaves
+        // `isProcessing=true` and the "Processing… 0%" overlay stuck on
+        // top of the new image (or empty canvas) forever, because the
+        // .then() handler on the in-flight promise will be discarded by
+        // the bumped processingIdRef and never get to call
+        // setIsProcessing(false).
+        ++processingIdRef.current;
+        setIsProcessing(false);
+        setProcessingProgress(0);
         return;
       }
 
@@ -1741,7 +1772,7 @@ const PreviewSection = forwardRef<HTMLCanvasElement, PreviewSectionProps>(
                   onTouchStart={handleTouchStart}
                   onTouchMove={handleTouchMove}
                   onTouchEnd={handleTouchEnd}
-                  className={`relative w-full flex items-center justify-center ${isTransparentBg ? 'checkerboard' : ''} ${spotPaintMode ? 'cursor-cell' : selectZoomMode ? 'cursor-crosshair' : zoom > 1 ? (isDragging ? 'cursor-grabbing' : 'cursor-grab') : 'cursor-crosshair'} ${showHighlight ? 'ring-4 ring-indigo-400 ring-opacity-75 transition-shadow duration-300' : ''}`}
+                  className={`relative w-full flex items-center justify-center ${isTransparentBg ? 'checkerboard' : ''} ${magicWandMode ? 'cursor-crosshair ring-2 ring-fuchsia-400 ring-opacity-70' : spotPaintMode ? 'cursor-cell' : selectZoomMode ? 'cursor-crosshair' : zoom > 1 ? (isDragging ? 'cursor-grabbing' : 'cursor-grab') : 'cursor-crosshair'} ${showHighlight ? 'ring-4 ring-indigo-400 ring-opacity-75 transition-shadow duration-300' : ''}`}
                   style={{ 
                     width: '100%',
                     height: '100%',

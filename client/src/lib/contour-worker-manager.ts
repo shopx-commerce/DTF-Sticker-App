@@ -1,6 +1,15 @@
 import ContourWorker from './contour-worker?worker';
+import { workersHealthy } from './worker-health';
 
 const MAX_PROCESSING_DIMENSION = 4000;
+
+// Tighter cap for the main-thread fallback. The silhouette-mask /
+// gap-bridge / morphology pipeline in `createSilhouetteContour` is O(W*H)
+// and runs synchronously, so anything above ~1500 px on the longest side
+// freezes the UI for many seconds (or minutes for 3000–4000 px inputs).
+// For a preview cutpath, 1500 px is more than enough fidelity to trace
+// the silhouette accurately.
+const MAX_FALLBACK_DIMENSION = 1500;
 
 function downsampleImage(image: HTMLImageElement): { canvas: HTMLCanvasElement; scale: number } {
   const maxDim = Math.max(image.width, image.height);
@@ -157,8 +166,14 @@ class ContourWorkerManager {
   private lastProcessKey: string | null = null;
   private lastProcessResult: { canvas: HTMLCanvasElement; downsampleScale: number; imageCanvasX: number; imageCanvasY: number; contourData?: ContourData; detectedAlgorithm?: DetectedAlgorithm } | null = null;
 
+  // Resolves once the health probe finishes. While pending, `process()`
+  // routes through the fallback so we never block on a worker that may be
+  // dead. After it resolves we either kept `worker !== null` (real
+  // browser) or set it to null (Cursor preview / similar).
+  private workerHealthReady: Promise<void>;
+
   constructor() {
-    this.initWorker();
+    this.workerHealthReady = this.initWorker();
   }
   
   getCachedContourData(): ContourData | null {
@@ -171,13 +186,46 @@ class ContourWorkerManager {
     this.lastProcessResult = null;
   }
 
-  private initWorker() {
+  /**
+   * Reject anything in flight or queued without tearing the worker down.
+   * Cheap counterpart to `recreateWorker()` — call when the design has
+   * been swapped/removed and the previous trace is no longer relevant.
+   * The worker may still be computing the old image, but its eventual
+   * `result` message will hit `handleMessage` with `currentRequest === null`
+   * and be ignored.
+   */
+  cancelInFlight(reason: string = 'Cancelled by caller') {
+    if (this.currentRequest) {
+      this.currentRequest.reject(new Error(reason));
+      this.currentRequest = null;
+    }
+    if (this.pendingRequest) {
+      this.pendingRequest.reject(new Error(reason));
+      this.pendingRequest = null;
+    }
+    this.isProcessing = false;
+  }
+
+  private async initWorker(): Promise<void> {
+    // Probe whether `new Worker(...)` is actually functional in this
+    // environment before instantiating the contour worker. Embedded
+    // browsers (notably Cursor IDE's Electron preview) silently swallow
+    // postMessage in workers, which previously caused the contour pipeline
+    // to hang forever. In real browsers the probe resolves in single-digit
+    // ms and we get the full off-thread benefit.
+    const healthy = await workersHealthy();
+    if (!healthy) {
+      console.warn('[ContourWorker] worker probe failed — staying on main-thread fallback');
+      this.worker = null;
+      return;
+    }
     try {
       this.worker = new ContourWorker();
       this.worker.onmessage = this.handleMessage.bind(this);
       this.worker.onerror = this.handleError.bind(this);
+      console.log('[ContourWorker] worker thread active');
     } catch (error) {
-      console.warn('Web Worker not available, falling back to main thread');
+      console.warn('[ContourWorker] construct threw — falling back to main thread:', error);
       this.worker = null;
     }
   }
@@ -200,7 +248,7 @@ class ContourWorkerManager {
     // next process() call would short-circuit and return the previous
     // worker's result (computed with the old code), defeating the HMR update.
     this.clearCache();
-    this.initWorker();
+    this.workerHealthReady = this.initWorker();
     console.log('[ContourWorker] Worker recreated for code update (cache cleared)');
   }
 
@@ -268,9 +316,17 @@ class ContourWorkerManager {
       return this.lastProcessResult;
     }
 
+    // Wait for the worker-health probe to settle so the first call after
+    // page load doesn't race-fall-back to the main thread before the
+    // worker has even had a chance to be constructed.
+    await this.workerHealthReady;
+
     if (!this.worker) {
-      const canvas = await this.processFallback(image, strokeSettings, resizeSettings);
-      return { canvas, downsampleScale: 1, imageCanvasX: 0, imageCanvasY: 0 };
+      const canvas = await this.processFallback(image, strokeSettings, resizeSettings, onProgress);
+      const fallbackResult = { canvas, downsampleScale: 1, imageCanvasX: 0, imageCanvasY: 0 };
+      this.lastProcessKey = processKey;
+      this.lastProcessResult = fallbackResult;
+      return fallbackResult;
     }
 
     const { canvas, scale } = downsampleImage(image);
@@ -367,18 +423,22 @@ class ContourWorkerManager {
       autoBridgingThreshold: number;
       contourMode?: ContourMode;
     },
-    resizeSettings: ResizeSettings
+    resizeSettings: ResizeSettings,
+    onProgress?: ProgressCallback,
   ): Promise<HTMLCanvasElement> {
     let processImage = image;
     const maxDim = Math.max(image.width, image.height);
-    
-    if (maxDim > MAX_PROCESSING_DIMENSION) {
-      const scale = MAX_PROCESSING_DIMENSION / maxDim;
+
+    // Main-thread fallback ⇒ much tighter cap than the worker path. The
+    // silhouette pipeline is O(W*H) and synchronous; without this, a
+    // 3000–4000 px design freezes the UI for minutes.
+    if (maxDim > MAX_FALLBACK_DIMENSION) {
+      const scale = MAX_FALLBACK_DIMENSION / maxDim;
       const newWidth = Math.round(image.width * scale);
       const newHeight = Math.round(image.height * scale);
-      
-      console.log(`[ContourFallback] Downsampling from ${image.width}x${image.height} to ${newWidth}x${newHeight}`);
-      
+
+      console.log(`[ContourFallback] Downsampling from ${image.width}x${image.height} to ${newWidth}x${newHeight} (scale=${scale.toFixed(3)})`);
+
       const tempCanvas = document.createElement('canvas');
       tempCanvas.width = newWidth;
       tempCanvas.height = newHeight;
@@ -386,17 +446,29 @@ class ContourWorkerManager {
       tempCtx.imageSmoothingEnabled = true;
       tempCtx.imageSmoothingQuality = 'high';
       tempCtx.drawImage(image, 0, 0, newWidth, newHeight);
-      
-      processImage = await new Promise<HTMLImageElement>((resolve) => {
+
+      processImage = await new Promise<HTMLImageElement>((resolve, reject) => {
         const img = new Image();
         img.onload = () => resolve(img);
+        img.onerror = () => reject(new Error('Failed to decode downsampled fallback image'));
         img.src = tempCanvas.toDataURL('image/png');
       });
     }
-    
+
+    onProgress?.(0.05);
+    // Yield once so React can paint the "Processing... 0%" state and any
+    // recent state updates before we hog the main thread inside the
+    // synchronous trace.
+    await new Promise<void>((r) => setTimeout(r, 0));
+
     const { createSilhouetteContour } = await import('./contour-outline');
     const fullStrokeSettings = { ...strokeSettings, cornerMode: 'rounded' as const };
-    return createSilhouetteContour(processImage, fullStrokeSettings, resizeSettings);
+    onProgress?.(0.15);
+    const t0 = performance.now();
+    const result = createSilhouetteContour(processImage, fullStrokeSettings, resizeSettings);
+    console.log(`[ContourFallback] createSilhouetteContour finished in ${(performance.now() - t0).toFixed(0)} ms (input ${processImage.width}x${processImage.height})`);
+    onProgress?.(1);
+    return result;
   }
 
   terminate() {

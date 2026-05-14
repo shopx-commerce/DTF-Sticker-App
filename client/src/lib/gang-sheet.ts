@@ -6,6 +6,7 @@ import {
 } from './contour-outline';
 import type { BezierPath } from './contour-worker-manager';
 import type { ResizeSettings, StrokeSettings, ShapeSettings } from './types';
+import { renderImageWithCrispQRs } from './qr';
 
 const MAX_CANVAS_DIM = 16384;
 const MAX_CANVAS_PIXELS = 268_435_456; // ~16384²; Chrome's hard limit
@@ -35,6 +36,16 @@ export interface GangSheetItem {
   shapeSettings?: ShapeSettings;
   cutContourLabel: string;
   quantity: number;
+  /**
+   * QR codes detected in `imageElement` (in source pixel coords).
+   * The PDF rasteriser uses this to replace QR regions with crisp re-renders
+   * at the target print resolution so they survive aggressive downscaling
+   * (a 1000px QR scaled to 200px via Lanczos becomes unscannable).
+   * Empty array / undefined = no QRs / detection still pending → skip pass.
+   */
+  qrCodes?: import('./qr').DetectedQR[];
+  /** User opt-IN for crisp re-render (default off — preserves source QR as-is). */
+  qrRerenderEnabled?: boolean;
 }
 
 export interface GangSheetSettings {
@@ -346,12 +357,17 @@ function remapPathToSheet(
   return localPath.map(p => {
     let sx: number, sy: number;
     if (rotated) {
+      // CCW 90° rotation to match the image rotation (`rotate(-π/2)`) applied
+      // to the design pixels. Using a transpose here instead would mirror the
+      // contour relative to the image for asymmetric designs (e.g. text
+      // protruding off one edge), causing the cutline to miss the design
+      // content after the packer flips to the rotated layout.
       if (isShape) {
         sx = placementX + p.y;
         sy = sheetHeightInches - (placementY + (itemWidthInches - p.x));
       } else {
         sx = placementX + (itemHeightInches - p.y);
-        sy = sheetHeightInches - (placementY + p.x);
+        sy = sheetHeightInches - (placementY + (itemWidthInches - p.x));
       }
     } else {
       const localY = isShape ? p.y : (itemHeightInches - p.y);
@@ -380,12 +396,14 @@ function remapBezierPathToSheet(
   const tx = (p: { x: number; y: number }): { x: number; y: number } => {
     let sx: number, sy: number;
     if (rotated) {
+      // Same CCW 90° rotation as remapPathToSheet — see the comment there for
+      // why a transpose breaks asymmetric designs after the packer rotates.
       if (isShape) {
         sx = placementX + p.y;
         sy = sheetHeightInches - (placementY + (itemWidthInches - p.x));
       } else {
         sx = placementX + (itemHeightInches - p.y);
-        sy = sheetHeightInches - (placementY + p.x);
+        sy = sheetHeightInches - (placementY + (itemWidthInches - p.x));
       }
     } else {
       const localY = isShape ? p.y : (itemHeightInches - p.y);
@@ -553,12 +571,27 @@ export async function downloadGangSheetPDF(
     let pdfImage = imageCache.get(item.id);
     if (!pdfImage) {
       const imgClamped = clampCanvasDims(imgNatW, imgNatH);
-      const canvas = document.createElement('canvas');
-      canvas.width = imgClamped.w;
-      canvas.height = imgClamped.h;
-      const ctx = canvas.getContext('2d');
-      if (!ctx) throw new Error(`Failed to create design canvas context for ${item.id}`);
-      ctx.drawImage(item.imageElement, 0, 0, imgClamped.w, imgClamped.h);
+      // QR-safe rasterise: if the design has detected QRs and the user
+      // hasn't opted out, replace each QR's pixel region with a freshly
+      // rendered, integer-pixel-aligned QR at the destination scale.
+      // Otherwise fall back to a plain drawImage. Same output shape either
+      // way (a canvas at imgClamped.w × imgClamped.h).
+      const useQRFix = item.qrRerenderEnabled === true && item.qrCodes && item.qrCodes.length > 0;
+      const canvas = useQRFix
+        ? await renderImageWithCrispQRs(item.imageElement, {
+            destWidth: imgClamped.w,
+            destHeight: imgClamped.h,
+            qrCodes: item.qrCodes!,
+          })
+        : (() => {
+            const c = document.createElement('canvas');
+            c.width = imgClamped.w;
+            c.height = imgClamped.h;
+            const cx = c.getContext('2d');
+            if (!cx) throw new Error(`Failed to create design canvas context for ${item.id}`);
+            cx.drawImage(item.imageElement, 0, 0, imgClamped.w, imgClamped.h);
+            return c;
+          })();
 
       const blob = await new Promise<Blob>((resolve, reject) => {
         canvas.toBlob(b => b ? resolve(b) : reject(new Error('design blob failed')), 'image/png');
@@ -607,10 +640,23 @@ export async function downloadGangSheetPDF(
         rotCanvas.height = rotClamped.h;
         const rotCtx = rotCanvas.getContext('2d');
         if (rotCtx) {
+          // QR-safe: rasterise the un-rotated design at full target resolution
+          // first (with crisp QR overlays), then rotate that. Keeps the QR's
+          // module grid integer-aligned in the un-rotated canvas before the
+          // 90° turn — the rotation is exact (no resampling), so crispness
+          // survives.
+          const srcClamped = clampCanvasDims(imgNatW, imgNatH);
+          const useQRFix = item.qrRerenderEnabled === true && item.qrCodes && item.qrCodes.length > 0;
+          const sourceForRotation: CanvasImageSource = useQRFix
+            ? await renderImageWithCrispQRs(item.imageElement, {
+                destWidth: srcClamped.w,
+                destHeight: srcClamped.h,
+                qrCodes: item.qrCodes!,
+              })
+            : item.imageElement;
           rotCtx.translate(rotCanvas.width / 2, rotCanvas.height / 2);
           rotCtx.rotate(-Math.PI / 2);
-          const srcClamped = clampCanvasDims(imgNatW, imgNatH);
-          rotCtx.drawImage(item.imageElement, -srcClamped.w / 2, -srcClamped.h / 2, srcClamped.w, srcClamped.h);
+          rotCtx.drawImage(sourceForRotation, -srcClamped.w / 2, -srcClamped.h / 2, srcClamped.w, srcClamped.h);
           const rotBlob = await new Promise<Blob>((resolve, reject) => {
             rotCanvas.toBlob(b => b ? resolve(b) : reject(new Error('rot blob failed')), 'image/png');
           });

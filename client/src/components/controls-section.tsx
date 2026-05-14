@@ -165,8 +165,16 @@ export default function ControlsSection({
   const fillPalette = (() => {
     const base = ['#FFFFFF', '#000000', '#FF0000', '#0066FF', '#00AA00'];
     const designHexes = extractedColors.slice(0, 3).map(c => c.hex.toUpperCase());
-    const merged = new Set([...base, ...designHexes]);
-    return Array.from(merged).slice(0, 5);
+    // Colours the user removed via "Remove Color" go first (most-recent first
+    // — that's the order they're stored in). They typically want to put one
+    // of those exact colours back behind the cut contour (or use it as bleed)
+    // once the cutline has been traced against the transparent design.
+    const removed = (imageInfo?.removedColors ?? []).map((c) => c.toUpperCase());
+    const ordered = [...removed, ...base, ...designHexes];
+    const merged = Array.from(new Set(ordered));
+    // Make room for every removed colour plus the base palette; cap so the
+    // strip doesn't grow unbounded.
+    return merged.slice(0, Math.max(5, removed.length) + 5).slice(0, 9);
   })();
 
   const spotRestoreIdRef = useRef<number>(0);
