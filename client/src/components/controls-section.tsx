@@ -20,6 +20,14 @@ export interface SpotPreviewData {
   pixelMap?: Int16Array;
   mapWidth?: number;
   mapHeight?: number;
+  /**
+   * User-editable spot color separation labels. Default to RDG_WHITE /
+   * RDG_GLOSS in the controls section. Threaded into SpotPreviewData so
+   * downstream consumers (e.g. the gang sheet add-to handler) can apply
+   * the same custom names that single-design downloads use.
+   */
+  spotWhiteName?: string;
+  spotGlossName?: string;
 }
 
 interface ControlsSectionProps {
@@ -380,8 +388,10 @@ export default function ControlsSection({
       pixelMap: ext?.pixelMap,
       mapWidth: ext?.width,
       mapHeight: ext?.height,
+      spotWhiteName,
+      spotGlossName,
     });
-  }, [spotPreviewEnabled, extractedColors, onSpotPreviewChange]);
+  }, [spotPreviewEnabled, extractedColors, onSpotPreviewChange, spotWhiteName, spotGlossName]);
 
   const handleSendDesign = async () => {
     if (!customerName.trim() || !customerEmail.trim()) {

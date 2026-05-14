@@ -3,10 +3,12 @@ import {
   contourPointsToPDFPathOps,
   bezierPathToPDFPathOps,
   type CachedContourData,
+  type SpotColorInput,
 } from './contour-outline';
 import type { BezierPath } from './contour-worker-manager';
 import type { ResizeSettings, StrokeSettings, ShapeSettings } from './types';
 import { renderImageWithCrispQRs } from './qr';
+import { addGangSheetSpotColorsToPDF, type SpotPixelMapData } from './spot-color-vectors';
 
 const MAX_CANVAS_DIM = 16384;
 const MAX_CANVAS_PIXELS = 268_435_456; // ~16384²; Chrome's hard limit
@@ -46,6 +48,16 @@ export interface GangSheetItem {
   qrCodes?: import('./qr').DetectedQR[];
   /** User opt-IN for crisp re-render (default off — preserves source QR as-is). */
   qrRerenderEnabled?: boolean;
+  /**
+   * Snapshot of the design's spot color extraction at the moment it was
+   * added to the gang sheet. When any of the spot flags (white / gloss /
+   * fluorescent) are enabled, the gang sheet PDF export traces this design
+   * and emits the matching vector spot color separations on every placement
+   * — the same separations a single-design export would produce, just tiled.
+   */
+  spotColors?: SpotColorInput[];
+  /** Pixel-exact selection map (matches the on-canvas overlay) for spot color tracing. */
+  spotPixelMap?: SpotPixelMapData;
 }
 
 export interface GangSheetSettings {
@@ -819,6 +831,36 @@ export async function downloadGangSheetPDF(
         const newContents = context.obj([existingContents, contentStreamRef]);
         page.node.set(PDFName.of('Contents'), newContents);
       }
+    }
+  }
+
+  // --- Spot color vector layers (RDG_WHITE / RDG_GLOSS / fluorescent) ---
+  // For each item with active spot color flags, trace its regions ONCE and
+  // tile them across every placement on the sheet. All separations land on
+  // the same page (singleArtboard semantics), color spaces deduped by name.
+  const spotItems = items
+    .filter(item => item.spotColors && item.spotColors.length > 0)
+    .map(item => {
+      const itemPlacements = placements
+        .filter(p => p.itemId === item.id)
+        .map(p => ({ x: p.x, y: p.y, rotated: !!p.rotated }));
+      return {
+        imageElement: item.imageElement,
+        spotColors: item.spotColors!,
+        spotPixelMap: item.spotPixelMap,
+        widthInches: item.contourData.widthInches,
+        heightInches: item.contourData.heightInches,
+        placements: itemPlacements,
+      };
+    })
+    .filter(it => it.placements.length > 0);
+
+  if (spotItems.length > 0) {
+    try {
+      await addGangSheetSpotColorsToPDF(pdfDoc, page, spotItems, sheetHeight);
+    } catch (err) {
+      // Don't fail the whole PDF if spot color tracing throws — log and skip.
+      console.error('[GangSheet] Spot color emission failed:', err);
     }
   }
 

@@ -345,6 +345,167 @@ function addSpotColorRegionToPage(
   }
 }
 
+// ─── Gang sheet spot color export ───
+//
+// For each unique gang-sheet item, we trace its spot color regions ONCE in
+// design-local inch coords (Y-DOWN, origin at top-left of the design), then
+// for every placement of that item we remap the paths to sheet coords
+// (handling rotation) and emit them all to the same page using shared
+// separation color spaces (deduped by spot color name).
+//
+// This keeps the heavy marching-squares trace from running per-placement, and
+// guarantees that the gang sheet PDF contains the same vector spot color
+// layers a single-design export would produce — just tiled across the sheet.
+
+export interface GangSheetSpotItem {
+  imageElement: HTMLImageElement;
+  spotColors: SpotColorInput[];
+  spotPixelMap?: SpotPixelMapData;
+  /** Design width in inches (matches contourData.widthInches). */
+  widthInches: number;
+  /** Design height in inches (matches contourData.heightInches). */
+  heightInches: number;
+  /** All placements for this item on the sheet. */
+  placements: Array<{ x: number; y: number; rotated: boolean }>;
+}
+
+/**
+ * Remaps a spot-color path (design-local inches, Y-DOWN, top-left origin)
+ * to PDF sheet coords (Y-UP, bottom-left origin). Mirrors the `isShape=true`
+ * branch of `remapPathToSheet` in gang-sheet.ts so the spot color overlay
+ * lines up exactly with the placed design image.
+ */
+function remapSpotPathToSheet(
+  localPath: Point[],
+  itemWidthInches: number,
+  itemHeightInches: number,
+  placementX: number,
+  placementY: number,
+  sheetHeightInches: number,
+  rotated: boolean
+): Point[] {
+  return localPath.map(p => {
+    if (rotated) {
+      // CCW 90° rotation matches the design pixels' rotation in the packer.
+      return {
+        x: placementX + p.y,
+        y: sheetHeightInches - (placementY + (itemWidthInches - p.x)),
+      };
+    }
+    return {
+      x: placementX + p.x,
+      y: sheetHeightInches - (placementY + p.y),
+    };
+  });
+}
+
+export async function addGangSheetSpotColorsToPDF(
+  pdfDoc: PDFDocument,
+  page: PDFPage,
+  items: GangSheetSpotItem[],
+  sheetHeightInches: number
+): Promise<string[]> {
+  // Filter to items that actually have any spot color flag set.
+  const activeItems = items.filter(item =>
+    item.spotColors.some(c =>
+      c.spotWhite || c.spotGloss ||
+      c.spotFluorY || c.spotFluorM || c.spotFluorG || c.spotFluorOrange
+    )
+  );
+  if (activeItems.length === 0) return [];
+
+  // Trace each item's regions ONCE. Items with identical imageElement +
+  // settings could be deduped further, but tracing is cheap relative to
+  // the rest of the pipeline and items already cache by `id` in the caller.
+  const itemRegions: Array<{
+    item: GangSheetSpotItem;
+    regions: SpotColorRegion[];
+  }> = [];
+  for (const item of activeItems) {
+    const regions = await traceColorRegionsAsync(
+      item.imageElement,
+      item.spotColors,
+      item.widthInches,
+      item.heightInches,
+      item.spotPixelMap
+    );
+    if (regions.length > 0) itemRegions.push({ item, regions });
+  }
+  if (itemRegions.length === 0) return [];
+
+  // Collect all unique separation names across every item & register one
+  // color space per name on the page (shared by every path that uses it).
+  // Tint per name is taken from the first region we see with that name.
+  const context = pdfDoc.context;
+  const tintByName = new Map<string, [number, number, number, number]>();
+  for (const { regions } of itemRegions) {
+    for (const r of regions) {
+      if (!tintByName.has(r.name)) tintByName.set(r.name, r.tintCMYK);
+    }
+  }
+
+  let pageResources = page.node.Resources();
+  if (!pageResources) {
+    pageResources = context.obj({});
+    page.node.set(PDFName.of('Resources'), pageResources);
+  }
+  let colorSpaceDict = pageResources.get(PDFName.of('ColorSpace'));
+  if (!colorSpaceDict) {
+    colorSpaceDict = context.obj({});
+    (pageResources as PDFDict).set(PDFName.of('ColorSpace'), colorSpaceDict);
+  }
+
+  const addedLabels: string[] = [];
+  for (const [name, tint] of tintByName.entries()) {
+    const tintFunction = context.obj({
+      FunctionType: 2,
+      Domain: [0, 1],
+      C0: [0, 0, 0, 0],
+      C1: tint,
+      N: 1,
+    });
+    const tintFnRef = context.register(tintFunction);
+    const sepCS = context.obj([
+      PDFName.of('Separation'),
+      PDFName.of(name),
+      PDFName.of('DeviceCMYK'),
+      tintFnRef,
+    ]);
+    const sepRef = context.register(sepCS);
+    (colorSpaceDict as PDFDict).set(PDFName.of(name), sepRef);
+    addedLabels.push(name);
+  }
+
+  // For each placement, remap every region's paths and emit ops. We
+  // accumulate everything into a single content stream for efficiency.
+  let allOps = '';
+  for (const { item, regions } of itemRegions) {
+    for (const placement of item.placements) {
+      for (const region of regions) {
+        const remapped = region.paths.map(path =>
+          remapSpotPathToSheet(
+            path,
+            item.widthInches,
+            item.heightInches,
+            placement.x,
+            placement.y,
+            sheetHeightInches,
+            placement.rotated
+          )
+        );
+        allOps += spotColorPathsToPDFOps(remapped, region.name);
+      }
+    }
+  }
+
+  if (allOps.length > 0) {
+    appendContentStream(page, context, allOps);
+  }
+
+  console.log(`[GangSheet SpotColor] Emitted ${addedLabels.length} separations: ${addedLabels.join(', ')}`);
+  return addedLabels;
+}
+
 export async function addSpotColorVectorsToPDF(
   pdfDoc: PDFDocument,
   page: PDFPage,

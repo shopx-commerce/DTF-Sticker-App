@@ -450,6 +450,39 @@ export default function ImageEditor({ onDesignUploaded }: { onDesignUploaded?: (
     ctx.drawImage(imageInfo.image, 0, 0, canvas.width, canvas.height);
     const thumbnail = canvas.toDataURL('image/png');
 
+    // Snapshot the current spot color extraction (white / gloss / fluorescent
+    // assignments + per-region selection) so the gang sheet PDF export can
+    // emit the same vector spot color separations the single-design export
+    // would. We deep-clone to insulate the snapshot from later UI edits.
+    const hasAnySpotFlag = spotPreviewData.colors.some(c =>
+      c.spotWhite || c.spotGloss ||
+      c.spotFluorY || c.spotFluorM || c.spotFluorG || c.spotFluorOrange
+    );
+    // Apply the user's editable separation names (RDG_WHITE / RDG_GLOSS by
+    // default, or whatever they renamed them to in the controls section) so
+    // gang sheet separations match what a single-design export would produce.
+    const wName = spotPreviewData.spotWhiteName || 'RDG_WHITE';
+    const gName = spotPreviewData.spotGlossName || 'RDG_GLOSS';
+    const spotColorsSnapshot = hasAnySpotFlag
+      ? spotPreviewData.colors.map(c => ({
+          hex: c.hex,
+          rgb: { ...c.rgb },
+          spotWhite: c.spotWhite,
+          spotGloss: c.spotGloss,
+          spotWhiteName: wName,
+          spotGlossName: gName,
+          spotFluorY: c.spotFluorY,
+          spotFluorM: c.spotFluorM,
+          spotFluorG: c.spotFluorG,
+          spotFluorOrange: c.spotFluorOrange,
+          regions: c.regions?.map(r => ({ ...r })),
+          regionMap: c.regionMap, // shared ref OK — never mutated post-extract
+        }))
+      : undefined;
+    const spotPixelMapSnapshot = (hasAnySpotFlag && spotPreviewData.pixelMap && spotPreviewData.mapWidth && spotPreviewData.mapHeight)
+      ? { pixelMap: spotPreviewData.pixelMap, mapWidth: spotPreviewData.mapWidth, mapHeight: spotPreviewData.mapHeight }
+      : undefined;
+
     const newItem: GangSheetItem = {
       id: crypto.randomUUID(),
       thumbnail,
@@ -462,6 +495,8 @@ export default function ImageEditor({ onDesignUploaded }: { onDesignUploaded?: (
       quantity: 1,
       qrCodes: imageInfo.qrCodes,
       qrRerenderEnabled: imageInfo.qrRerenderEnabled,
+      spotColors: spotColorsSnapshot,
+      spotPixelMap: spotPixelMapSnapshot,
     };
 
     setGangSheetItems(prev => [...prev, newItem]);
