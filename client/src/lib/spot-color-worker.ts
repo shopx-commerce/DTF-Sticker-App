@@ -193,6 +193,25 @@ function morphologicalClose(mask: Uint8Array, width: number, height: number, rad
   return erode(dilate(mask, width, height, radius), width, height, radius);
 }
 
+/**
+ * Builds a binary mask of every visible pixel in the input image (alpha >=
+ * threshold). Used for the "all colors tagged" case where the user wants
+ * the spot separation to cover the entire design silhouette, with no
+ * color-boundary gaps possible. Sidesteps closest-color matching entirely.
+ */
+function buildAlphaSilhouetteMask(
+  data: Uint8ClampedArray,
+  width: number,
+  height: number,
+  alphaThreshold: number
+): Uint8Array {
+  const mask = new Uint8Array(width * height);
+  for (let i = 0, p = 0; i < mask.length; i++, p += 4) {
+    if (data[p + 3] >= alphaThreshold) mask[i] = 1;
+  }
+  return mask;
+}
+
 function marchingSquaresTrace(mask: Uint8Array, width: number, height: number): Point[][] {
   function getMask(x: number, y: number): number {
     if (x < 0 || x >= width || y < 0 || y >= height) return 0;
@@ -356,20 +375,32 @@ function processSpotColors(
 
   const regions: SpotColorRegionWorker[] = [];
 
-  // Morphological closing radius in pixels. At 300 DPI, 2 pixels ≈ 0.0067"
-  // (~0.17mm) — invisible at print scale but enough to bridge sub-pixel
-  // anti-alias gaps at color boundaries. This is what turns an "All Gloss"
-  // tagging from a swiss-cheese coverage into one solid region.
-  const closingRadius = Math.max(1, Math.round(dpi / 150));
+  // Morphological closing radius in pixels. At 300 DPI, ~4 pixels ≈ 0.013"
+  // (~0.34mm) — still invisible at print scale but enough to bridge wider
+  // anti-alias / color-extraction gaps between adjacent colors. Small
+  // intentional features (e.g. the gap inside a thin O) are preserved
+  // because closing only fills holes ≤ 2*radius wide.
+  const closingRadius = Math.max(2, Math.round(dpi / 75));
+
+  // "All tagged" shortcut: if EVERY extracted spot color carries this
+  // separation's flag, the user is asking for full design coverage. Skip
+  // the per-color closest-color matching (which inevitably has anti-alias
+  // misses at color boundaries) and just use the alpha silhouette of the
+  // input image. Guarantees one solid region with zero pinholes.
+  const allTaggedWhite = spotColors.length > 0 && spotColors.every(c => c.spotWhite);
+  const allTaggedGloss = spotColors.length > 0 && spotColors.every(c => c.spotGloss);
 
   if (whiteColors.length > 0) {
-    const mask = createClosestColorMask(pixelData, width, height, whiteColors, spotColors, 60, 240);
+    let mask = allTaggedWhite
+      ? buildAlphaSilhouetteMask(pixelData, width, height, 1)
+      : createClosestColorMask(pixelData, width, height, whiteColors, spotColors, 60, 240);
     if (whiteInclusionMask) {
       for (let i = 0; i < mask.length; i++) {
         if (!whiteInclusionMask[i]) mask[i] = 0;
       }
     }
-    const closed = morphologicalClose(mask, width, height, closingRadius);
+    // Skip closing for the alpha silhouette path — it's already gap-free.
+    const closed = allTaggedWhite ? mask : morphologicalClose(mask, width, height, closingRadius);
     const paths = traceMaskToInchPaths(closed, width, height, dpi);
     if (paths.length > 0) {
       regions.push({ name: whiteName, paths, tintCMYK: [0, 1, 0, 0] });
@@ -377,13 +408,15 @@ function processSpotColors(
   }
 
   if (glossColors.length > 0) {
-    const mask = createClosestColorMask(pixelData, width, height, glossColors, spotColors, 60, 240);
+    let mask = allTaggedGloss
+      ? buildAlphaSilhouetteMask(pixelData, width, height, 1)
+      : createClosestColorMask(pixelData, width, height, glossColors, spotColors, 60, 240);
     if (glossInclusionMask) {
       for (let i = 0; i < mask.length; i++) {
         if (!glossInclusionMask[i]) mask[i] = 0;
       }
     }
-    const closed = morphologicalClose(mask, width, height, closingRadius);
+    const closed = allTaggedGloss ? mask : morphologicalClose(mask, width, height, closingRadius);
     const paths = traceMaskToInchPaths(closed, width, height, dpi);
     if (paths.length > 0) {
       regions.push({ name: glossName, paths, tintCMYK: [0, 1, 0, 0] });
