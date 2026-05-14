@@ -491,6 +491,8 @@ export default function ImageEditor({ onDesignUploaded }: { onDesignUploaded?: (
     setCadCutBounds(null);
     setDetectedShapeType(null);
     setDetectedShapeInfo(null);
+    setDetectedQRs([]);
+    setIsDetectingQR(false);
     const workerManager = getContourWorkerManager();
     // Important: cancel + clear, in that order. Otherwise any in-flight
     // contour trace would resolve into a now-empty cache slot and
@@ -676,6 +678,19 @@ export default function ImageEditor({ onDesignUploaded }: { onDesignUploaded?: (
       const { widthInches, heightInches } = calculateImageDimensions(origW, origH, dpi);
 
       applyNewImage(newImageInfo, widthInches, heightInches);
+
+      // Run QR detection in background — non-blocking
+      setDetectedQRs([]);
+      setIsDetectingQR(true);
+      detectQRsInImage(finalImage)
+        .then(qrCodes => {
+          setDetectedQRs(qrCodes);
+          if (qrCodes.length > 0) {
+            console.log(`[QR] Detected ${qrCodes.length} QR code(s) in design`);
+          }
+        })
+        .catch(err => console.warn('[QR] Detection failed:', err))
+        .finally(() => setIsDetectingQR(false));
     } catch (error) {
       console.error('Error processing uploaded image:', error);
       handleFallbackImage(file, image);
@@ -1362,6 +1377,24 @@ export default function ImageEditor({ onDesignUploaded }: { onDesignUploaded?: (
       } else {
         // Standard download - shape background or contour outline
         const nameWithoutExt = imageInfo.file.name.replace(/\.[^/.]+$/, '');
+
+        // If QR codes were detected, replace the raster layer with a crisp re-render
+        // at the target print resolution so modules stay sharp in the PDF output.
+        let exportImage = imageInfo.image;
+        if (detectedQRs.length > 0) {
+          const targetW = Math.round(resizeSettings.widthInches * 300);
+          const targetH = Math.round(resizeSettings.heightInches * 300);
+          try {
+            exportImage = await renderImageElementWithCrispQRs(imageInfo.image, {
+              destWidth: targetW,
+              destHeight: targetH,
+              qrCodes: detectedQRs,
+            });
+            console.log(`[QR] Replaced ${detectedQRs.length} QR region(s) with crisp render at ${targetW}x${targetH}`);
+          } catch (e) {
+            console.warn('[QR] QR-safe render failed, using original:', e);
+          }
+        }
         
         if (strokeSettings.enabled) {
           // Contour mode: Download PDF with raster image + vector contour
@@ -1372,7 +1405,7 @@ export default function ImageEditor({ onDesignUploaded }: { onDesignUploaded?: (
           const cachedData = workerManager.getCachedContourData() as CachedContourData | undefined;
           
           await downloadContourPDF(
-            imageInfo.image,
+            exportImage,
             strokeSettings,
             resizeSettings,
             filename,
@@ -1386,7 +1419,7 @@ export default function ImageEditor({ onDesignUploaded }: { onDesignUploaded?: (
           // Shape background mode: Download PDF with shape + CutContour spot color
           const filename = `${nameWithoutExt}_with_shape.pdf`;
           await downloadShapePDF(
-            imageInfo.image,
+            exportImage,
             shapeSettings,
             resizeSettings,
             filename,
@@ -1547,6 +1580,29 @@ export default function ImageEditor({ onDesignUploaded }: { onDesignUploaded?: (
                   title="Higher = matches more colors. 5-10% works for most solid backgrounds."
                 />
                 <span className="text-[10px] font-mono text-fuchsia-700 w-7 text-right">{Math.round(magicWandTolerance * 100)}%</span>
+              </div>
+            )}
+
+            {imageInfo && (isDetectingQR || detectedQRs.length > 0) && (
+              <div className={`flex items-center gap-1.5 px-2.5 py-1.5 rounded-lg border text-[10px] font-medium transition-colors ${
+                isDetectingQR
+                  ? 'bg-amber-50 border-amber-200 text-amber-700'
+                  : 'bg-emerald-50 border-emerald-200 text-emerald-700'
+              }`}>
+                {isDetectingQR ? (
+                  <>
+                    <svg className="w-3.5 h-3.5 animate-spin" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><path d="M12 2v4M12 18v4M4.93 4.93l2.83 2.83M16.24 16.24l2.83 2.83M2 12h4M18 12h4M4.93 19.07l2.83-2.83M16.24 7.76l2.83-2.83"/></svg>
+                    <span>Scanning QR…</span>
+                  </>
+                ) : (
+                  <>
+                    <svg className="w-3.5 h-3.5" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                      <rect x="3" y="3" width="7" height="7" rx="1"/><rect x="14" y="3" width="7" height="7" rx="1"/>
+                      <rect x="3" y="14" width="7" height="7" rx="1"/><rect x="14" y="14" width="7" height="7" rx="1"/>
+                    </svg>
+                    <span>QR Safe ({detectedQRs.length})</span>
+                  </>
+                )}
               </div>
             )}
 
