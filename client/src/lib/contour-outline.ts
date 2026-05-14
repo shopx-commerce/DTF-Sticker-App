@@ -2,7 +2,7 @@ import type { StrokeSettings, ResizeSettings } from "@/lib/types";
 import { PDFDocument, PDFName, PDFArray, PDFDict, PDFPage, rgb, degrees } from 'pdf-lib';
 import { removeLoopsWithClipper, ensureClockwise, detectSelfIntersections, gaussianSmoothContour, subsamplePolygon, polygonToSplinePath } from "@/lib/clipper-path";
 import { getContourWorkerManager, type BezierPath } from "@/lib/contour-worker-manager";
-import { addSpotColorVectorsToPDF } from "@/lib/spot-color-vectors";
+import { addSpotColorVectorsToPDF, type SpotPixelMapData } from "@/lib/spot-color-vectors";
 import { planVectorQROverlays, detectQRAppearance, type DetectedQR, type QRAppearance } from "@/lib/qr";
 
 // ─── Vector QR overlay (source-aware) ────────────────────────────────────
@@ -2277,7 +2277,8 @@ export async function downloadContourPDF(
   singleArtboard: boolean = false,
   cutContourLabel: string = 'CutContour',
   lockedContour?: { label: string; pathPoints: Array<{x: number; y: number}>; allPathPoints?: Array<Array<{x: number; y: number}>>; widthInches: number; heightInches: number } | null,
-  qrOptions?: QRExportOptions
+  qrOptions?: QRExportOptions,
+  spotPixelMap?: SpotPixelMapData
 ): Promise<void> {
   try {
     console.log('[downloadContourPDF] Starting, cached:', !!cachedContourData);
@@ -2665,7 +2666,7 @@ export async function downloadContourPDF(
       pdfDoc, page, image, spotColors,
       resizeSettings.widthInches, resizeSettings.heightInches,
       heightInches, imageOffsetX, imageOffsetY,
-      singleArtboard, widthPts, heightPts
+      singleArtboard, widthPts, heightPts, spotPixelMap
     );
     console.log('[downloadContourPDF] Added spot color vector layers:', spotLabels);
   }
@@ -2702,7 +2703,8 @@ export async function downloadDesignOnlyPDF(
   filename: string,
   spotColors?: SpotColorInput[],
   singleArtboard: boolean = false,
-  qrOptions?: QRExportOptions
+  qrOptions?: QRExportOptions,
+  spotPixelMap?: SpotPixelMapData
 ): Promise<void> {
   try {
     console.log('[downloadDesignOnlyPDF] Starting design-only PDF (no cut lines)');
@@ -2772,7 +2774,7 @@ export async function downloadDesignOnlyPDF(
         pdfDoc, page, image, spotColors,
         widthInches, heightInches,
         heightInches, 0, 0,
-        singleArtboard, widthPts, heightPts
+        singleArtboard, widthPts, heightPts, spotPixelMap
       );
       console.log('[downloadDesignOnlyPDF] Added spot color vector layers:', spotLabels);
     }

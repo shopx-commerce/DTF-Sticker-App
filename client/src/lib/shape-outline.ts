@@ -2,7 +2,7 @@ import type { ShapeSettings, ResizeSettings } from "@/lib/types";
 import { PDFDocument, PDFName, PDFArray, PDFDict, type PDFImage } from 'pdf-lib';
 import { cropImageToContent } from './image-crop';
 import { simplifyPathForPDF, buildSmoothPdfPath, type SpotColorInput } from './contour-outline';
-import { addSpotColorVectorsToPDF } from './spot-color-vectors';
+import { addSpotColorVectorsToPDF, type SpotPixelMapData } from './spot-color-vectors';
 
 function rotatePoint(px: number, py: number, cx: number, cy: number, deg: number): { x: number; y: number } {
   if (deg === 0) return { x: px, y: py };
@@ -350,7 +350,8 @@ export async function downloadShapePDF(
   spotColors?: SpotColorInput[],
   singleArtboard: boolean = true,
   cutContourLabel: string = 'CutContour',
-  lockedContour?: { label: string; pathPoints: Array<{x: number; y: number}>; allPathPoints?: Array<Array<{x: number; y: number}>>; widthInches: number; heightInches: number; imageOffsetX: number; imageOffsetY: number } | null
+  lockedContour?: { label: string; pathPoints: Array<{x: number; y: number}>; allPathPoints?: Array<Array<{x: number; y: number}>>; widthInches: number; heightInches: number; imageOffsetX: number; imageOffsetY: number } | null,
+  spotPixelMap?: SpotPixelMapData
 ): Promise<void> {
   let shapeDims = calculateShapeDimensions(
     resizeSettings.widthInches,
@@ -547,7 +548,7 @@ export async function downloadShapePDF(
       pdfDoc, page, image, spotColors,
       resizeSettings.widthInches, resizeSettings.heightInches,
       pageHeightInches, imgOffsetXInches, imgOffsetYInches,
-      singleArtboard, widthPts, heightPts
+      singleArtboard, widthPts, heightPts, spotPixelMap
     );
     console.log('[downloadShapePDF] Added spot color vector layers:', spotLabels);
   }

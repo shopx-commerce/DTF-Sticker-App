@@ -1415,6 +1415,12 @@ export default function ImageEditor({ onDesignUploaded }: { onDesignUploaded?: (
         // Standard download - shape background or contour outline
         const nameWithoutExt = imageInfo.file.name.replace(/\.[^/.]+$/, '');
         
+        // Build spotPixelMap from spotPreviewData so the PDF export uses
+        // the same pixel assignments as the preview (no interpolation drift).
+        const spotPixelMap = (spotPreviewData.pixelMap && spotPreviewData.mapWidth && spotPreviewData.mapHeight)
+          ? { pixelMap: spotPreviewData.pixelMap, mapWidth: spotPreviewData.mapWidth, mapHeight: spotPreviewData.mapHeight }
+          : undefined;
+
         if (strokeSettings.enabled) {
           // Contour mode: Download PDF with raster image + vector contour
           const filename = `${nameWithoutExt}_with_contour.pdf`;
@@ -1433,7 +1439,8 @@ export default function ImageEditor({ onDesignUploaded }: { onDesignUploaded?: (
             singleArtboard,
             cutContourLabel,
             lockedContour ? { label: lockedContour.label, pathPoints: lockedContour.pathPoints, allPathPoints: lockedContour.allPathPoints, widthInches: lockedContour.widthInches, heightInches: lockedContour.heightInches } : null,
-            { qrCodes: imageInfo.qrCodes, enabled: imageInfo.qrRerenderEnabled === true }
+            { qrCodes: imageInfo.qrCodes, enabled: imageInfo.qrRerenderEnabled === true },
+            spotPixelMap
           );
         } else if (shapeSettings.enabled) {
           // Shape background mode: Download PDF with shape + CutContour spot color
@@ -1446,7 +1453,8 @@ export default function ImageEditor({ onDesignUploaded }: { onDesignUploaded?: (
             spotColors,
             singleArtboard,
             cutContourLabel,
-            lockedContour ? { label: lockedContour.label, pathPoints: lockedContour.pathPoints, allPathPoints: lockedContour.allPathPoints, widthInches: lockedContour.widthInches, heightInches: lockedContour.heightInches, imageOffsetX: lockedContour.imageOffsetX, imageOffsetY: lockedContour.imageOffsetY } : null
+            lockedContour ? { label: lockedContour.label, pathPoints: lockedContour.pathPoints, allPathPoints: lockedContour.allPathPoints, widthInches: lockedContour.widthInches, heightInches: lockedContour.heightInches, imageOffsetX: lockedContour.imageOffsetX, imageOffsetY: lockedContour.imageOffsetY } : null,
+            spotPixelMap
           );
         } else {
           setIsProcessing(false);
@@ -1833,13 +1841,17 @@ export default function ImageEditor({ onDesignUploaded }: { onDesignUploaded?: (
                   try {
                     const nameWithoutExt = imageInfo.file.name.replace(/\.[^/.]+$/, '');
                     if (args?.format === 'pdf') {
+                      const noCtlinesSpotPixelMap = (spotPreviewData.pixelMap && spotPreviewData.mapWidth && spotPreviewData.mapHeight)
+                        ? { pixelMap: spotPreviewData.pixelMap, mapWidth: spotPreviewData.mapWidth, mapHeight: spotPreviewData.mapHeight }
+                        : undefined;
                       await downloadDesignOnlyPDF(
                         imageInfo.image,
                         resizeSettings,
                         `${nameWithoutExt}.pdf`,
                         args.spotColors,
                         args.singleArtboard,
-                        { qrCodes: imageInfo.qrCodes, enabled: imageInfo.qrRerenderEnabled === true }
+                        { qrCodes: imageInfo.qrCodes, enabled: imageInfo.qrRerenderEnabled === true },
+                        noCtlinesSpotPixelMap
                       );
                     } else {
                       const dpi = 300;

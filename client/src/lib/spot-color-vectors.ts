@@ -2,6 +2,12 @@ import { PDFDocument, PDFName, PDFArray, PDFDict, PDFPage } from 'pdf-lib';
 import { type SpotColorInput } from './contour-outline';
 import SpotColorWorker from './spot-color-worker?worker';
 
+export interface SpotPixelMapData {
+  pixelMap: Int16Array;
+  mapWidth: number;
+  mapHeight: number;
+}
+
 interface Point {
   x: number;
   y: number;
@@ -66,7 +72,8 @@ function traceColorRegionsAsync(
   image: HTMLImageElement,
   spotColors: SpotColorInput[],
   widthInches: number,
-  heightInches: number
+  heightInches: number,
+  spotPixelMap?: SpotPixelMapData
 ): Promise<SpotColorRegion[]> {
   return new Promise((resolve) => {
     let cW = Math.round(widthInches * SPOT_COLOR_DPI);
@@ -79,18 +86,50 @@ function traceColorRegionsAsync(
       const ps = Math.sqrt(MAX_CANVAS_PIXELS / (cW * cH));
       cW = Math.round(cW * ps); cH = Math.round(cH * ps);
     }
-    const canvas = document.createElement('canvas');
-    canvas.width = cW;
-    canvas.height = cH;
-    const ctx = canvas.getContext('2d');
-    if (!ctx) { console.warn('[SpotColor] Canvas context creation failed'); resolve([]); return; }
-    ctx.drawImage(image, 0, 0, canvas.width, canvas.height);
-    const imageData = ctx.getImageData(0, 0, canvas.width, canvas.height);
+
+    let imageData: ImageData;
+
+    if (spotPixelMap && spotPixelMap.pixelMap.length > 0) {
+      // Build pixel data from the color-extractor's pixelMap for exact preview matching.
+      // Each export pixel is painted with its extracted color's exact RGB via nearest-neighbor
+      // lookup — no bilinear interpolation, no blended edge pixels.
+      // The worker's Euclidean distance then gets dist=0 for every assigned pixel → perfect match.
+      const { pixelMap, mapWidth, mapHeight } = spotPixelMap;
+      const rawData = new Uint8ClampedArray(cW * cH * 4);
+      for (let y = 0; y < cH; y++) {
+        const srcY = Math.min(Math.floor(y * mapHeight / cH), mapHeight - 1);
+        for (let x = 0; x < cW; x++) {
+          const srcX = Math.min(Math.floor(x * mapWidth / cW), mapWidth - 1);
+          const colorIdx = pixelMap[srcY * mapWidth + srcX];
+          const di = (y * cW + x) * 4;
+          if (colorIdx >= 0 && colorIdx < spotColors.length) {
+            const color = spotColors[colorIdx];
+            rawData[di]     = color.rgb.r;
+            rawData[di + 1] = color.rgb.g;
+            rawData[di + 2] = color.rgb.b;
+            rawData[di + 3] = 255;
+          }
+          // else: transparent / unassigned — alpha stays 0, worker skips (alpha < alphaThreshold)
+        }
+      }
+      imageData = new ImageData(rawData, cW, cH);
+      console.log(`[SpotColor] Built ${cW}x${cH} canvas from pixelMap (exact preview match)`);
+    } else {
+      // Fallback: draw image at export resolution when no pixelMap is available
+      const canvas = document.createElement('canvas');
+      canvas.width = cW;
+      canvas.height = cH;
+      const ctx = canvas.getContext('2d');
+      if (!ctx) { console.warn('[SpotColor] Canvas context creation failed'); resolve([]); return; }
+      ctx.drawImage(image, 0, 0, cW, cH);
+      imageData = ctx.getImageData(0, 0, cW, cH);
+      console.log(`[SpotColor] Drew image at ${cW}x${cH} (no pixelMap — fallback mode)`);
+    }
 
     const srcW = image.naturalWidth;
     const srcH = image.naturalHeight;
     const inclusionMasks = buildRegionInclusionMasks(
-      spotColors, canvas.width, canvas.height, srcW, srcH
+      spotColors, cW, cH, srcW, srcH
     );
 
     const workerColors = spotColors.map(c => ({
@@ -119,7 +158,7 @@ function traceColorRegionsAsync(
       return;
     }
 
-    const pixelCount = canvas.width * canvas.height;
+    const pixelCount = cW * cH;
     const timeoutMs = Math.max(30000, Math.round(pixelCount / 50000) * 1000);
 
     const timeout = setTimeout(() => {
@@ -150,14 +189,14 @@ function traceColorRegionsAsync(
       resolve([]);
     };
 
-    console.log(`[SpotColor] Sending to worker: ${canvas.width}x${canvas.height} at ${SPOT_COLOR_DPI} DPI`);
+    console.log(`[SpotColor] Sending to worker: ${cW}x${cH} at ${SPOT_COLOR_DPI} DPI`);
     const buffer = imageData.data.buffer;
     const transferables: Transferable[] = [buffer];
     const msg: any = {
       type: 'trace',
       imageBuffer: buffer,
-      imageWidth: canvas.width,
-      imageHeight: canvas.height,
+      imageWidth: cW,
+      imageHeight: cH,
       spotColors: workerColors,
       widthInches,
       heightInches,
@@ -282,7 +321,8 @@ export async function addSpotColorVectorsToPDF(
   imageOffsetYInches: number,
   singleArtboard: boolean = false,
   pageWidthPts?: number,
-  pageHeightPts?: number
+  pageHeightPts?: number,
+  spotPixelMap?: SpotPixelMapData
 ): Promise<string[]> {
   if (!spotColors || spotColors.length === 0) return [];
 
@@ -291,7 +331,7 @@ export async function addSpotColorVectorsToPDF(
   const hasFluor = spotColors.some(c => c.spotFluorY || c.spotFluorM || c.spotFluorG || c.spotFluorOrange);
   if (!hasWhite && !hasGloss && !hasFluor) return [];
 
-  const regions = await traceColorRegionsAsync(image, spotColors, widthInches, heightInches);
+  const regions = await traceColorRegionsAsync(image, spotColors, widthInches, heightInches, spotPixelMap);
   if (regions.length === 0) return [];
 
   const addedLabels: string[] = [];
