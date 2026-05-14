@@ -436,9 +436,33 @@ export default function ImageEditor({ onDesignUploaded }: { onDesignUploaded?: (
       };
     }
 
+    // No contour/shape was set — synthesize a rectangular bounding box
+    // sized to the requested print dimensions. The item will go onto the
+    // gang sheet with its image + spot color separations only (no magenta
+    // cut path, no shape fill). Useful for clients who just want spot
+    // color print without cutting.
+    let isNoCutPath = false;
     if (!contourSnapshot) {
-      toast({ title: "No contour available", description: "Enable a contour or shape mode before adding to the gang sheet.", variant: "destructive" });
-      return;
+      const w = resizeSettings.widthInches;
+      const h = resizeSettings.heightInches;
+      contourSnapshot = {
+        pathPoints: [
+          { x: 0, y: 0 }, { x: w, y: 0 }, { x: w, y: h }, { x: 0, y: h }, { x: 0, y: 0 },
+        ],
+        previewPathPoints: [
+          { x: 0, y: 0 }, { x: w, y: 0 }, { x: w, y: h }, { x: 0, y: h }, { x: 0, y: 0 },
+        ],
+        widthInches: w,
+        heightInches: h,
+        imageOffsetX: 0,
+        imageOffsetY: 0,
+        backgroundColor: 'transparent',
+        effectiveDPI: 300,
+        minPathX: 0,
+        minPathY: 0,
+        bleedInches: 0,
+      };
+      isNoCutPath = true;
     }
 
     const canvas = document.createElement('canvas');
@@ -492,6 +516,7 @@ export default function ImageEditor({ onDesignUploaded }: { onDesignUploaded?: (
       strokeSettings: { ...strokeSettings },
       shapeSettings: shapeSettings.enabled ? { ...shapeSettings } : undefined,
       cutContourLabel,
+      noCutPath: isNoCutPath,
       quantity: 1,
       qrCodes: imageInfo.qrCodes,
       qrRerenderEnabled: imageInfo.qrRerenderEnabled,
@@ -1794,7 +1819,7 @@ export default function ImageEditor({ onDesignUploaded }: { onDesignUploaded?: (
           </div>
 
           {/* Gang Sheet - separate from CutContour controls */}
-          {imageInfo && (strokeSettings.enabled || shapeSettings.enabled || (imageInfo?.isPDF && imageInfo?.pdfCutContourInfo?.hasCutContour)) && (
+          {imageInfo && (
             <div className="flex items-center gap-2 bg-emerald-50 rounded-lg border border-emerald-200 shadow-sm px-3 py-2">
               <button
                 onClick={handleAddToGangSheet}

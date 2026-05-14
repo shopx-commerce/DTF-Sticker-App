@@ -37,6 +37,14 @@ export interface GangSheetItem {
   strokeSettings: StrokeSettings;
   shapeSettings?: ShapeSettings;
   cutContourLabel: string;
+  /**
+   * When true, this item should be placed and printed without any cut
+   * path drawn (no magenta CutContour line in the PDF). Used for clients
+   * who only want the spot color separations + design — no cutting.
+   * The contourData still holds a rectangular bounding box so packing
+   * and placement work normally.
+   */
+  noCutPath?: boolean;
   quantity: number;
   /**
    * QR codes detected in `imageElement` (in source pixel coords).
@@ -475,6 +483,10 @@ export async function downloadGangSheetPDF(
   for (const placement of placements) {
     const item = itemMap.get(placement.itemId);
     if (!item) continue;
+    // Spot-color-only items: no shape fill / bleed background — just leave
+    // the area transparent so the image (and its spot color separations)
+    // are the only thing rendered.
+    if (item.noCutPath) continue;
     const { contourData } = item;
     const fillColor = contourData.backgroundColor || '#ffffff';
     const bleedColor = item.shapeSettings?.bleedEnabled
@@ -780,6 +792,10 @@ export async function downloadGangSheetPDF(
   for (const placement of placements) {
     const item = itemMap.get(placement.itemId);
     if (!item) continue;
+    // Spot-color-only items: skip cut path emission entirely. The design
+    // and any spot color separations are still drawn elsewhere; we just
+    // don't add a magenta CutContour line for these items.
+    if (item.noCutPath) continue;
     const { contourData } = item;
     const label = item.cutContourLabel;
     const isShapeCut = !!item.shapeSettings?.enabled;
