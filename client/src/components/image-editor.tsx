@@ -397,12 +397,21 @@ export default function ImageEditor({ onDesignUploaded }: { onDesignUploaded?: (
       }
     }
 
+    // A "real" cut path only exists when the user actually enabled stroke,
+    // shape mode, or imported a PDF that already has a CutContour. Without
+    // any of these, the cached contour data (if any) is stale from a
+    // previous session and we must NOT emit a magenta cut line for it.
+    const hasUserCutPath =
+      strokeSettings.enabled ||
+      shapeSettings.enabled ||
+      !!(imageInfo?.isPDF && imageInfo?.pdfCutContourInfo?.hasCutContour);
+
     let contourSnapshot: CachedContourData | null = null;
 
     const workerManager = getContourWorkerManager();
     const cachedData = workerManager.getCachedContourData();
 
-    if (cachedData && cachedData.pathPoints && cachedData.pathPoints.length >= 3) {
+    if (hasUserCutPath && cachedData && cachedData.pathPoints && cachedData.pathPoints.length >= 3) {
       contourSnapshot = {
         pathPoints: [...cachedData.pathPoints],
         previewPathPoints: [...cachedData.previewPathPoints],
