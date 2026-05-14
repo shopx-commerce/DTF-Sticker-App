@@ -840,12 +840,10 @@ export async function downloadGangSheetPDF(
   // paths get scaled to the contour bounds (typically larger than the
   // image) and offset to the contour origin instead of the image origin.
   //
-  // When any spot colors are present we default to multi-page emission:
-  // page 1 stays the design layout (raster + cuts), and we add one new
-  // page per separation label (RDG_WHITE / RDG_GLOSS / fluor*) containing
-  // just that separation's tiled paths. Matches the single-design
-  // `singleArtboard=false` convention so RIP/cutter software gets a
-  // familiar one-separation-per-page layout.
+  // Spot color separations are emitted onto the SAME page as the design
+  // and cut contours — single artboard, all layers together. Cutter / RIP
+  // software reads the named separations (RDG_WHITE / RDG_GLOSS / fluor*)
+  // from the page resources regardless of whether they share the page.
   const spotItems = items
     .filter(item => item.spotColors && item.spotColors.length > 0)
     .map(item => {
@@ -896,7 +894,7 @@ export async function downloadGangSheetPDF(
 
   if (spotItems.length > 0) {
     try {
-      await addGangSheetSpotColorsToPDF(pdfDoc, page, spotItems, sheetWidth, sheetHeight, true);
+      await addGangSheetSpotColorsToPDF(pdfDoc, page, spotItems, sheetWidth, sheetHeight, false);
     } catch (err) {
       // Don't fail the whole PDF if spot color tracing throws — log and skip.
       console.error('[GangSheet] Spot color emission failed:', err);
