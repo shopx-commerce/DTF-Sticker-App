@@ -35,6 +35,15 @@
 import jsQR from 'jsqr';
 import { scanImageData, ZBarSymbolType, type ZBarSymbol } from '@undecaf/zbar-wasm';
 
+// Relay worker-internal logs to the main thread so they appear in the
+// browser console without needing to switch DevTools to the worker context.
+function workerLog(message: string) {
+  (self as unknown as Worker).postMessage({ type: 'log', message });
+}
+function workerWarn(message: string) {
+  (self as unknown as Worker).postMessage({ type: 'warn', message });
+}
+
 interface DetectRequest {
   imageData: Uint8ClampedArray;
   width: number;
@@ -271,8 +280,7 @@ async function detectWithZBar(
     }
     return out;
   } catch (err) {
-    // ZBar wasm load failure (e.g. blocked by CSP) — log once and continue.
-    console.warn('[QR] ZBar engine failed, falling through to other engines:', err);
+    workerWarn(`ZBar engine failed (wasm may not have loaded): ${err}`);
     return [];
   }
 }
@@ -391,7 +399,7 @@ async function detectWithNative(
     }
     return out;
   } catch (err) {
-    console.warn('[QR] BarcodeDetector engine failed, falling through:', err);
+    workerWarn(`BarcodeDetector engine failed: ${err}`);
     return [];
   }
 }
@@ -635,9 +643,9 @@ self.onmessage = async (e: MessageEvent) => {
 
     if (final.length > 0) {
       const sources = final.map((f) => `"${f.payload.slice(0, 30)}${f.payload.length > 30 ? '…' : ''}" via ${f.source}`).join(' | ');
-      console.log(`[QR worker] ${final.length} unique QR(s) in ${Date.now() - start}ms (workScale=${workScale.toFixed(2)}) — ${sources}`);
+      workerLog(`${final.length} unique QR(s) in ${Date.now() - start}ms (workScale=${workScale.toFixed(2)}) — ${sources}`);
     } else {
-      console.log(`[QR worker] No QRs found in ${Date.now() - start}ms (workScale=${workScale.toFixed(2)})`);
+      workerLog(`No QRs found in ${Date.now() - start}ms (workScale=${workScale.toFixed(2)}) — all engines × all variants tried`);
     }
 
     (self as unknown as Worker).postMessage({

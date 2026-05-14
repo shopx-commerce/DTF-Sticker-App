@@ -53,6 +53,32 @@ function getDetectWorker(): Worker {
  * Returns an empty array if no QRs are present (this is the common case
  * for non-QR designs — fast no-op).
  */
+// ─── Server-side fallback detection ─────────────────────────────────────
+// Uploads the image to /api/detect-qr and runs jsQR in Node.js over
+// multiple preprocessing variants. Used when the in-browser worker finds
+// nothing — bypasses all wasm/CORS/CSP/browser-compatibility issues.
+async function detectQRsOnServer(image: HTMLImageElement): Promise<DetectedQR[]> {
+  try {
+    const canvas = document.createElement('canvas');
+    canvas.width = image.naturalWidth || image.width;
+    canvas.height = image.naturalHeight || image.height;
+    const ctx = canvas.getContext('2d');
+    if (!ctx) return [];
+    ctx.drawImage(image, 0, 0);
+    const blob = await new Promise<Blob | null>((res) => canvas.toBlob(res, 'image/png'));
+    if (!blob) return [];
+
+    const form = new FormData();
+    form.append('image', blob, 'design.png');
+    const resp = await fetch('/api/detect-qr', { method: 'POST', body: form });
+    if (!resp.ok) return [];
+    const json = await resp.json() as { qrCodes?: DetectedQR[] };
+    return json.qrCodes ?? [];
+  } catch {
+    return [];
+  }
+}
+
 export function detectQRsInImage(
   image: HTMLImageElement,
   options: DetectQRsOptions = {}
@@ -60,6 +86,12 @@ export function detectQRsInImage(
   return new Promise((resolve, reject) => {
     const width = image.naturalWidth || image.width;
     const height = image.naturalHeight || image.height;
+
+    if (!width || !height) {
+      // Image not decoded yet — skip worker, go straight to server fallback
+      detectQRsOnServer(image).then(resolve).catch(reject);
+      return;
+    }
 
     const canvas = document.createElement('canvas');
     canvas.width = width;
@@ -76,17 +108,50 @@ export function detectQRsInImage(
     const buffer = new Uint8ClampedArray(imageData.data);
 
     const worker = getDetectWorker();
+
     const onMessage = (e: MessageEvent) => {
+      // Forward worker log messages to the main-thread console so failures
+      // are visible without needing DevTools worker context switching.
+      if (e.data.type === 'log') {
+        console.log('[QR worker]', e.data.message);
+        return; // keep listening — result comes in a separate message
+      }
+      if (e.data.type === 'warn') {
+        console.warn('[QR worker]', e.data.message);
+        return;
+      }
+
       worker.removeEventListener('message', onMessage);
       worker.removeEventListener('error', onError);
+
       if (e.data.type === 'error') return reject(new Error(e.data.error));
-      resolve(e.data.qrCodes as DetectedQR[]);
+
+      const codes = (e.data.qrCodes ?? []) as DetectedQR[];
+      if (codes.length > 0) {
+        resolve(codes);
+        return;
+      }
+
+      // Worker found nothing — try the server-side fallback before giving up.
+      console.log('[QR] Worker found 0 codes, trying server-side fallback…');
+      detectQRsOnServer(image).then((serverCodes) => {
+        if (serverCodes.length > 0) {
+          console.log(`[QR] Server fallback found ${serverCodes.length} QR(s)`);
+        } else {
+          console.log('[QR] Server fallback also found 0 QRs — design has no QR code');
+        }
+        resolve(serverCodes);
+      }).catch(() => resolve([]));
     };
+
     const onError = (err: ErrorEvent) => {
       worker.removeEventListener('message', onMessage);
       worker.removeEventListener('error', onError);
-      reject(new Error(err.message));
+      // Worker crashed — try server fallback
+      console.warn('[QR] Worker error, trying server fallback:', err.message);
+      detectQRsOnServer(image).then(resolve).catch(() => resolve([]));
     };
+
     worker.addEventListener('message', onMessage);
     worker.addEventListener('error', onError);
     worker.postMessage(

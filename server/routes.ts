@@ -621,6 +621,153 @@ ${pdfData ? '<p><strong>PDF design with CutContour is attached.</strong></p>' : 
     }
   });
 
+  // Server-side QR code detection — reliable fallback when the in-browser
+  // wasm engines (ZBar / BarcodeDetector) fail or aren't available.
+  // Uses jsQR (pure JS, works in Node.js) over multiple preprocessing
+  // variants so even low-contrast / inverted / coloured QRs are caught.
+  app.post("/api/detect-qr", upload.single('image'), async (req, res) => {
+    try {
+      if (!req.file) return res.status(400).json({ error: "No image provided" });
+
+      // Convert to raw RGBA at working resolution (cap at 1500×1500 so
+      // jsQR stays fast; QR modules need ~5–7px each to decode reliably).
+      const metadata = await sharp(req.file.buffer).metadata();
+      const srcW = metadata.width ?? 1;
+      const srcH = metadata.height ?? 1;
+      const MAX = 1500;
+      const scale = Math.min(1, MAX / Math.max(srcW, srcH));
+      const workW = Math.round(srcW * scale);
+      const workH = Math.round(srcH * scale);
+
+      // Get raw RGBA
+      const rawBuf = await sharp(req.file.buffer)
+        .resize(workW, workH, { kernel: sharp.kernel.lanczos3 })
+        .ensureAlpha()
+        .raw()
+        .toBuffer();
+
+      // jsQR works on plain Node Buffers that look like Uint8ClampedArray
+      // eslint-disable-next-line @typescript-eslint/no-require-imports
+      const jsQR = require('jsqr') as (data: Uint8Array, w: number, h: number, opts?: { inversionAttempts?: string }) => { data: string; location: { topLeftCorner: {x:number;y:number}; topRightCorner: {x:number;y:number}; bottomLeftCorner: {x:number;y:number}; bottomRightCorner: {x:number;y:number} } } | null;
+
+      interface QRResult {
+        payload: string;
+        bbox: { x: number; y: number; width: number; height: number };
+        corners: { topLeft: {x:number;y:number}; topRight: {x:number;y:number}; bottomLeft: {x:number;y:number}; bottomRight: {x:number;y:number} };
+        source: string;
+      }
+
+      const results: QRResult[] = [];
+      const seen = new Set<string>();
+
+      function tryScan(buf: Buffer, label: string) {
+        // jsQR returns one result per call; mask + retry to get multiple
+        const working = Buffer.from(buf);
+        for (let attempt = 0; attempt < 6; attempt++) {
+          const res2 = jsQR(working, workW, workH, { inversionAttempts: 'attemptBoth' });
+          if (!res2) break;
+          const loc = res2.location;
+          const xs = [loc.topLeftCorner.x, loc.topRightCorner.x, loc.bottomLeftCorner.x, loc.bottomRightCorner.x];
+          const ys = [loc.topLeftCorner.y, loc.topRightCorner.y, loc.bottomLeftCorner.y, loc.bottomRightCorner.y];
+          const minX = Math.min(...xs), maxX = Math.max(...xs);
+          const minY = Math.min(...ys), maxY = Math.max(...ys);
+          if (!seen.has(res2.data)) {
+            seen.add(res2.data);
+            // Map coords back to source-image space
+            const up = 1 / scale;
+            results.push({
+              payload: res2.data,
+              bbox: { x: minX * up, y: minY * up, width: (maxX - minX) * up, height: (maxY - minY) * up },
+              corners: {
+                topLeft: { x: loc.topLeftCorner.x * up, y: loc.topLeftCorner.y * up },
+                topRight: { x: loc.topRightCorner.x * up, y: loc.topRightCorner.y * up },
+                bottomLeft: { x: loc.bottomLeftCorner.x * up, y: loc.bottomLeftCorner.y * up },
+                bottomRight: { x: loc.bottomRightCorner.x * up, y: loc.bottomRightCorner.y * up },
+              },
+              source: `server-jsqr:${label}`,
+            });
+          }
+          // Mask detected region out of working buffer so next pass finds another
+          const x0 = Math.max(0, Math.floor(minX)), y0 = Math.max(0, Math.floor(minY));
+          const x1 = Math.min(workW, Math.ceil(maxX)), y1 = Math.min(workH, Math.ceil(maxY));
+          for (let y = y0; y < y1; y++) {
+            for (let x = x0; x < x1; x++) {
+              const idx = (y * workW + x) * 4;
+              working[idx] = 255; working[idx+1] = 255; working[idx+2] = 255; working[idx+3] = 255;
+            }
+          }
+        }
+      }
+
+      // Build preprocessing variants
+      // 1. Raw (composite against white so transparent pixels are white)
+      const whiteBg = Buffer.alloc(rawBuf.length);
+      for (let i = 0; i < rawBuf.length; i += 4) {
+        const a = rawBuf[i+3] / 255;
+        whiteBg[i]   = Math.round(rawBuf[i]   * a + 255 * (1 - a));
+        whiteBg[i+1] = Math.round(rawBuf[i+1] * a + 255 * (1 - a));
+        whiteBg[i+2] = Math.round(rawBuf[i+2] * a + 255 * (1 - a));
+        whiteBg[i+3] = 255;
+      }
+      tryScan(whiteBg, 'raw');
+
+      // 2. Grayscale → Otsu threshold
+      const luma = new Uint8Array(workW * workH);
+      for (let i = 0; i < whiteBg.length; i += 4) {
+        luma[i/4] = (0.299 * whiteBg[i] + 0.587 * whiteBg[i+1] + 0.114 * whiteBg[i+2]) | 0;
+      }
+      // Otsu
+      const hist = new Int32Array(256);
+      for (const v of luma) hist[v]++;
+      const n = workW * workH;
+      let sumB = 0, wB = 0, sum = 0, maxVar = 0, thresh = 128;
+      for (let i = 0; i < 256; i++) sum += i * hist[i];
+      for (let t = 0; t < 256; t++) {
+        wB += hist[t]; if (!wB) continue;
+        const wF = n - wB; if (!wF) break;
+        sumB += t * hist[t];
+        const mB = sumB / wB, mF = (sum - sumB) / wF;
+        const v = wB * wF * (mB - mF) ** 2;
+        if (v > maxVar) { maxVar = v; thresh = t; }
+      }
+      const otsuBuf = Buffer.alloc(rawBuf.length);
+      for (let i = 0, j = 0; i < rawBuf.length; i += 4, j++) {
+        const v = luma[j] <= thresh ? 0 : 255;
+        otsuBuf[i] = v; otsuBuf[i+1] = v; otsuBuf[i+2] = v; otsuBuf[i+3] = 255;
+      }
+      tryScan(otsuBuf, 'otsu');
+
+      // 3. Inverted Otsu (catches white-on-dark QRs)
+      const invBuf = Buffer.alloc(rawBuf.length);
+      for (let i = 0; i < otsuBuf.length; i += 4) {
+        invBuf[i] = 255 - otsuBuf[i]; invBuf[i+1] = 255 - otsuBuf[i+1];
+        invBuf[i+2] = 255 - otsuBuf[i+2]; invBuf[i+3] = 255;
+      }
+      tryScan(invBuf, 'otsu-inv');
+
+      // 4. Centre-logo erased (22% wipe defeats centred logo QRs)
+      if (results.length < 4) {
+        const erased = Buffer.from(whiteBg);
+        const cx = Math.floor(workW / 2), cy = Math.floor(workH / 2);
+        const rx = Math.floor(workW * 0.22 / 2), ry = Math.floor(workH * 0.22 / 2);
+        for (let y = cy - ry; y < cy + ry; y++) {
+          for (let x = cx - rx; x < cx + rx; x++) {
+            if (x < 0 || x >= workW || y < 0 || y >= workH) continue;
+            const idx = (y * workW + x) * 4;
+            erased[idx] = 255; erased[idx+1] = 255; erased[idx+2] = 255; erased[idx+3] = 255;
+          }
+        }
+        tryScan(erased, 'logo-erased');
+      }
+
+      console.log(`[QR server] Detected ${results.length} QR(s) in ${workW}×${workH} work image`);
+      res.json({ qrCodes: results });
+    } catch (err) {
+      console.error("[QR server] Detection error:", err);
+      res.status(500).json({ error: "QR detection failed", details: String(err) });
+    }
+  });
+
   // Image Enhancement using Sharp Lanczos3 upscaling
   app.post("/api/enhance-image", upload.single('image'), async (req, res) => {
     try {
