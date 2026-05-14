@@ -111,6 +111,88 @@ function createClosestColorMask(
   return mask;
 }
 
+/**
+ * Morphological dilation with a square structuring element of the given radius.
+ * Each output pixel is 1 if any pixel within the radius (Chebyshev distance) is 1.
+ * Implemented as two passes (horizontal then vertical) for O(w*h*radius) cost
+ * instead of O(w*h*radius²).
+ */
+function dilate(mask: Uint8Array, width: number, height: number, radius: number): Uint8Array {
+  if (radius <= 0) return mask;
+  const tmp = new Uint8Array(width * height);
+  // Horizontal pass
+  for (let y = 0; y < height; y++) {
+    const row = y * width;
+    for (let x = 0; x < width; x++) {
+      let v = 0;
+      const x0 = Math.max(0, x - radius);
+      const x1 = Math.min(width - 1, x + radius);
+      for (let i = x0; i <= x1; i++) {
+        if (mask[row + i]) { v = 1; break; }
+      }
+      tmp[row + x] = v;
+    }
+  }
+  // Vertical pass
+  const out = new Uint8Array(width * height);
+  for (let x = 0; x < width; x++) {
+    for (let y = 0; y < height; y++) {
+      let v = 0;
+      const y0 = Math.max(0, y - radius);
+      const y1 = Math.min(height - 1, y + radius);
+      for (let j = y0; j <= y1; j++) {
+        if (tmp[j * width + x]) { v = 1; break; }
+      }
+      out[y * width + x] = v;
+    }
+  }
+  return out;
+}
+
+/**
+ * Morphological erosion (inverse of dilate).
+ */
+function erode(mask: Uint8Array, width: number, height: number, radius: number): Uint8Array {
+  if (radius <= 0) return mask;
+  const tmp = new Uint8Array(width * height);
+  for (let y = 0; y < height; y++) {
+    const row = y * width;
+    for (let x = 0; x < width; x++) {
+      let v = 1;
+      const x0 = Math.max(0, x - radius);
+      const x1 = Math.min(width - 1, x + radius);
+      for (let i = x0; i <= x1; i++) {
+        if (!mask[row + i]) { v = 0; break; }
+      }
+      tmp[row + x] = v;
+    }
+  }
+  const out = new Uint8Array(width * height);
+  for (let x = 0; x < width; x++) {
+    for (let y = 0; y < height; y++) {
+      let v = 1;
+      const y0 = Math.max(0, y - radius);
+      const y1 = Math.min(height - 1, y + radius);
+      for (let j = y0; j <= y1; j++) {
+        if (!tmp[j * width + x]) { v = 0; break; }
+      }
+      out[y * width + x] = v;
+    }
+  }
+  return out;
+}
+
+/**
+ * Morphological closing: dilate then erode. Bridges sub-pixel gaps caused
+ * by anti-aliased boundary pixels failing the closest-color match, so a
+ * full "all white" or "all gloss" tag produces one solid coverage region
+ * instead of one with random pinhole gaps. Net shape change is ~0; only
+ * holes ≤ 2*radius wide get filled.
+ */
+function morphologicalClose(mask: Uint8Array, width: number, height: number, radius: number): Uint8Array {
+  return erode(dilate(mask, width, height, radius), width, height, radius);
+}
+
 function marchingSquaresTrace(mask: Uint8Array, width: number, height: number): Point[][] {
   function getMask(x: number, y: number): number {
     if (x < 0 || x >= width || y < 0 || y >= height) return 0;
@@ -274,6 +356,12 @@ function processSpotColors(
 
   const regions: SpotColorRegionWorker[] = [];
 
+  // Morphological closing radius in pixels. At 300 DPI, 2 pixels ≈ 0.0067"
+  // (~0.17mm) — invisible at print scale but enough to bridge sub-pixel
+  // anti-alias gaps at color boundaries. This is what turns an "All Gloss"
+  // tagging from a swiss-cheese coverage into one solid region.
+  const closingRadius = Math.max(1, Math.round(dpi / 150));
+
   if (whiteColors.length > 0) {
     const mask = createClosestColorMask(pixelData, width, height, whiteColors, spotColors, 60, 240);
     if (whiteInclusionMask) {
@@ -281,7 +369,8 @@ function processSpotColors(
         if (!whiteInclusionMask[i]) mask[i] = 0;
       }
     }
-    const paths = traceMaskToInchPaths(mask, width, height, dpi);
+    const closed = morphologicalClose(mask, width, height, closingRadius);
+    const paths = traceMaskToInchPaths(closed, width, height, dpi);
     if (paths.length > 0) {
       regions.push({ name: whiteName, paths, tintCMYK: [0, 1, 0, 0] });
     }
@@ -294,7 +383,8 @@ function processSpotColors(
         if (!glossInclusionMask[i]) mask[i] = 0;
       }
     }
-    const paths = traceMaskToInchPaths(mask, width, height, dpi);
+    const closed = morphologicalClose(mask, width, height, closingRadius);
+    const paths = traceMaskToInchPaths(closed, width, height, dpi);
     if (paths.length > 0) {
       regions.push({ name: glossName, paths, tintCMYK: [0, 1, 0, 0] });
     }
@@ -312,7 +402,8 @@ function processSpotColors(
     if (matchingColors.length > 0) {
       const fluorName = matchingColors[0][ft.nameField] || ft.defaultName;
       const mask = createClosestColorMask(pixelData, width, height, matchingColors, spotColors, 60, 240);
-      const paths = traceMaskToInchPaths(mask, width, height, dpi);
+      const closed = morphologicalClose(mask, width, height, closingRadius);
+      const paths = traceMaskToInchPaths(closed, width, height, dpi);
       if (paths.length > 0) {
         regions.push({ name: fluorName, paths, tintCMYK: [0, 1, 0, 0] });
       }
