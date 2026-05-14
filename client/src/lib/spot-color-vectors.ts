@@ -51,7 +51,13 @@ function buildRegionInclusionMasks(
 
       for (const color of colorsWithRegions) {
         const regionId = color.regionMap![srcIdx];
-        if (regionId < 0) continue;
+        if (regionId < 0) {
+          // Orphan pixel — not assigned to any region. When per-region selection is
+          // active for this color, exclude the pixel rather than defaulting to included.
+          whiteMask[pIdx] = 0;
+          glossMask[pIdx] = 0;
+          break;
+        }
 
         const region = color.regions!.find(r => r.id === regionId);
         if (!region) continue;
