@@ -5,6 +5,7 @@ import sharp from "sharp";
 import path from "path";
 import fs from "fs";
 import Replicate from "replicate";
+import jsQR from "jsqr";
 
 import sgMail from "@sendgrid/mail";
 
@@ -646,10 +647,6 @@ ${pdfData ? '<p><strong>PDF design with CutContour is attached.</strong></p>' : 
         .raw()
         .toBuffer();
 
-      // jsQR works on plain Node Buffers that look like Uint8ClampedArray
-      // eslint-disable-next-line @typescript-eslint/no-require-imports
-      const jsQR = require('jsqr') as (data: Uint8Array, w: number, h: number, opts?: { inversionAttempts?: string }) => { data: string; location: { topLeftCorner: {x:number;y:number}; topRightCorner: {x:number;y:number}; bottomLeftCorner: {x:number;y:number}; bottomRightCorner: {x:number;y:number} } } | null;
-
       interface QRResult {
         payload: string;
         bbox: { x: number; y: number; width: number; height: number };
@@ -661,10 +658,11 @@ ${pdfData ? '<p><strong>PDF design with CutContour is attached.</strong></p>' : 
       const seen = new Set<string>();
 
       function tryScan(buf: Buffer, label: string) {
-        // jsQR returns one result per call; mask + retry to get multiple
-        const working = Buffer.from(buf);
+        // jsQR requires Uint8ClampedArray (not Buffer/Uint8Array).
+        // Copy into one so mutations (masking) don't touch the original.
+        const working = new Uint8ClampedArray(buf);
         for (let attempt = 0; attempt < 6; attempt++) {
-          const res2 = jsQR(working, workW, workH, { inversionAttempts: 'attemptBoth' });
+          const res2 = jsQR(working as unknown as Uint8ClampedArray, workW, workH, { inversionAttempts: 'attemptBoth' });
           if (!res2) break;
           const loc = res2.location;
           const xs = [loc.topLeftCorner.x, loc.topRightCorner.x, loc.bottomLeftCorner.x, loc.bottomRightCorner.x];

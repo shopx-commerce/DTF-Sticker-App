@@ -33,7 +33,10 @@
 // returned in image-pixel coords (caller's source image).
 
 import jsQR from 'jsqr';
-import { scanImageData, ZBarSymbolType, type ZBarSymbol } from '@undecaf/zbar-wasm';
+// ZBar wasm is intentionally excluded: in a Vite worker build the WASM binary
+// URL resolves to the Vite HTML 404 page (magic bytes <!DO instead of \0asm),
+// causing every call to throw and all variants to silently return [].
+// jsQR + native BarcodeDetector cover the same ground reliably without wasm.
 
 // Relay worker-internal logs to the main thread so they appear in the
 // browser console without needing to switch DevTools to the worker context.
@@ -249,42 +252,6 @@ function unrotateCorners(
 
 // ─── Engine adapters ─────────────────────────────────────────────────────
 
-async function detectWithZBar(
-  rgba: Uint8ClampedArray,
-  width: number,
-  height: number,
-  source: string,
-): Promise<DetectedQRPayload[]> {
-  try {
-    const symbols: ZBarSymbol[] = await scanImageData(new ImageData(rgba, width, height));
-    const out: DetectedQRPayload[] = [];
-    for (const sym of symbols) {
-      if (sym.type !== ZBarSymbolType.ZBAR_QRCODE) continue;
-      const payload = sym.decode();
-      const pts = sym.points;
-      if (pts.length < 4) continue;
-      // ZBar gives 4 points but order isn't guaranteed to be TL/TR/BL/BR;
-      // fall back to bbox-derived corner labels so we have *some* rotation
-      // estimate. A 4-point Hungarian matching would be more accurate but
-      // we don't actually need precise corner identity for any downstream
-      // logic — only the bbox.
-      const corners = approximateCornersFromPoints(pts);
-      out.push({
-        payload,
-        bbox: bboxFromCorners(corners),
-        corners,
-        rotation: rotationFromCorners(corners),
-        estimatedModuleSize: estimateModuleSize(corners),
-        source,
-      });
-    }
-    return out;
-  } catch (err) {
-    workerWarn(`ZBar engine failed (wasm may not have loaded): ${err}`);
-    return [];
-  }
-}
-
 function approximateCornersFromPoints(points: Array<{ x: number; y: number }>): DetectedQRPayload['corners'] {
   // Sort by y, take top two as top, bottom two as bottom; within each pair
   // sort by x. Robust enough for axis-ish-aligned QRs which is what we
@@ -423,13 +390,12 @@ async function runEngines(
 ): Promise<DetectedQRPayload[]> {
   const findings: DetectedQRPayload[] = [];
 
-  // Engine order: native first (best when present), then ZBar (best
-  // open-source), then jsQR (different failure mode catches edge cases).
+  // Engine order: native BarcodeDetector first (OS-backed, most accurate
+  // when present), then jsQR (pure JS, reliable, different failure mode).
+  // ZBar wasm is excluded — in this Vite worker build the .wasm binary URL
+  // resolves to an HTML 404 page, causing instant RuntimeError on every call.
   const native = await detectWithNative(rgba, ctx.width, ctx.height, `native:${variant}`);
   findings.push(...native);
-
-  const zbar = await detectWithZBar(rgba, ctx.width, ctx.height, `zbar:${variant}`);
-  findings.push(...zbar);
 
   const js = detectWithJsQR(rgba, ctx.width, ctx.height, `jsqr:${variant}`);
   findings.push(...js);

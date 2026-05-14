@@ -64,6 +64,10 @@ async function detectQRsOnServer(image: HTMLImageElement): Promise<DetectedQR[]>
     canvas.height = image.naturalHeight || image.height;
     const ctx = canvas.getContext('2d');
     if (!ctx) return [];
+    // White background so transparent pixels become white, not black —
+    // otherwise a QR on a transparent PNG looks dark on black → unreadable.
+    ctx.fillStyle = '#FFFFFF';
+    ctx.fillRect(0, 0, canvas.width, canvas.height);
     ctx.drawImage(image, 0, 0);
     const blob = await new Promise<Blob | null>((res) => canvas.toBlob(res, 'image/png'));
     if (!blob) return [];
