@@ -53,18 +53,11 @@ self.onmessage = (e: MessageEvent<RegionWorkerInput>) => {
         if (y < minY) minY = y;
         if (y > maxY) maxY = y;
 
-        for (let dy = -1; dy <= 1; dy++) {
-          for (let dx = -1; dx <= 1; dx++) {
-            if (dx === 0 && dy === 0) continue;
-            const nx = x + dx, ny = y + dy;
-            if (nx < 0 || nx >= width || ny < 0 || ny >= height) continue;
-            const ni = ny * width + nx;
-            if (mask[ni] === 1 && labels[ni] === -1) {
-              labels[ni] = compId;
-              queue.push(ni);
-            }
-          }
-        }
+        // 4-connectivity: only up/down/left/right — keeps diagonally-touching blobs as separate regions
+        if (x > 0 && mask[idx - 1] === 1 && labels[idx - 1] === -1) { labels[idx - 1] = compId; queue.push(idx - 1); }
+        if (x < width - 1 && mask[idx + 1] === 1 && labels[idx + 1] === -1) { labels[idx + 1] = compId; queue.push(idx + 1); }
+        if (y > 0 && mask[idx - width] === 1 && labels[idx - width] === -1) { labels[idx - width] = compId; queue.push(idx - width); }
+        if (y < height - 1 && mask[idx + width] === 1 && labels[idx + width] === -1) { labels[idx + width] = compId; queue.push(idx + width); }
       }
 
       components.push({ id: compId, pixels: compPixels, minX, minY, maxX, maxY });
@@ -92,7 +85,9 @@ self.onmessage = (e: MessageEvent<RegionWorkerInput>) => {
       };
     });
 
-    // Assign orphan pixels (small clusters below minArea) to nearest significant region
+    // Assign orphan pixels (small clusters below minArea) to nearest significant region,
+    // but only if the orphan falls within that region's bounding box + a margin.
+    // This prevents remote scattered dots from polluting other region's selection.
     const centroids = significant.map(comp => {
       let cx = 0, cy = 0;
       for (const pi of comp.pixels) {
@@ -101,14 +96,19 @@ self.onmessage = (e: MessageEvent<RegionWorkerInput>) => {
       }
       return { x: cx / comp.pixels.length, y: cy / comp.pixels.length };
     });
+    const bboxMargin = Math.max(8, Math.sqrt(totalPixels) * 0.03); // ~3% of image dimension
 
     for (let i = 0; i < totalPixels; i++) {
       if (mask[i] === 1 && regionMap[i] === -1) {
         const px = i % width;
         const py = (i / width) | 0;
-        let bestIdx = 0;
+        let bestIdx = -1;
         let bestDist = Infinity;
-        for (let r = 0; r < centroids.length; r++) {
+        for (let r = 0; r < significant.length; r++) {
+          const comp = significant[r];
+          // Only consider regions whose bounding box (+ margin) contains this orphan
+          if (px < comp.minX - bboxMargin || px > comp.maxX + bboxMargin ||
+              py < comp.minY - bboxMargin || py > comp.maxY + bboxMargin) continue;
           const dx = px - centroids[r].x;
           const dy = py - centroids[r].y;
           const dist = dx * dx + dy * dy;
@@ -117,6 +117,7 @@ self.onmessage = (e: MessageEvent<RegionWorkerInput>) => {
             bestIdx = r;
           }
         }
+        if (bestIdx < 0) continue; // orphan is too far from all regions — leave as -1
         regionMap[i] = bestIdx;
         const reg = regions[bestIdx];
         reg.pixelCount++;
