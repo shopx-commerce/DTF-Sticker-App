@@ -514,13 +514,69 @@ self.onmessage = async (e: MessageEvent) => {
     // than one large RGBA buffer in memory at a time. Order is rough
     // priority — earlier variants are cheaper / more common to succeed.
     type VariantFn = () => { name: string; rgba: Uint8ClampedArray; w: number; h: number; rotations: number; baseOriginX: number; baseOriginY: number };
+    // Per-channel isolation: extract R, G, or B as greyscale then Otsu.
+    // Coloured QR modules (e.g. dark blue on colourful background) that
+    // blend into mid-luma on a standard Y' conversion become crisp B/W
+    // when isolated in the channel where they have maximum contrast.
+    const extractChannel = (rgba: Uint8ClampedArray, ch: 0|1|2): Uint8ClampedArray => {
+      const lm = new Uint8ClampedArray(rgba.length/4);
+      for (let i=0,j=0;i<rgba.length;i+=4,j++) {
+        const a=rgba[i+3]/255;
+        lm[j]=(rgba[i+ch]*a+255*(1-a))|0;
+      }
+      return lm;
+    };
+    const rLuma = extractChannel(workRgba, 0);
+    const gLuma = extractChannel(workRgba, 1);
+    const bLuma = extractChannel(workRgba, 2);
+    const rOtsuT = computeOtsuThreshold(rLuma);
+    const gOtsuT = computeOtsuThreshold(gLuma);
+    const bOtsuT = computeOtsuThreshold(bLuma);
+
+    // Local adaptive threshold: split into cells, Otsu per cell.
+    // Handles QRs embedded in uneven or busy backgrounds where a single
+    // global threshold fails.
+    const localAdaptive = (rgba: Uint8ClampedArray, w: number, h: number, cellSize: number): Uint8ClampedArray => {
+      const lm = new Uint8ClampedArray(rgba.length/4);
+      for (let i=0,j=0;i<rgba.length;i+=4,j++) {
+        const a=rgba[i+3]/255;
+        lm[j]=(0.299*(rgba[i]*a+255*(1-a))+0.587*(rgba[i+1]*a+255*(1-a))+0.114*(rgba[i+2]*a+255*(1-a)))|0;
+      }
+      const out = new Uint8ClampedArray(w*h*4);
+      const cols=Math.ceil(w/cellSize), rows=Math.ceil(h/cellSize);
+      for (let row=0;row<rows;row++) for (let col=0;col<cols;col++) {
+        const x0=col*cellSize,y0=row*cellSize,x1=Math.min(x0+cellSize,w),y1=Math.min(y0+cellSize,h);
+        const cell=new Uint8ClampedArray((x1-x0)*(y1-y0));
+        let k=0; for (let y=y0;y<y1;y++) for (let x=x0;x<x1;x++) cell[k++]=lm[y*w+x];
+        const t=computeOtsuThreshold(cell);
+        for (let y=y0;y<y1;y++) for (let x=x0;x<x1;x++) {
+          const v=lm[y*w+x]<t?0:255; const idx=(y*w+x)*4;
+          out[idx]=v;out[idx+1]=v;out[idx+2]=v;out[idx+3]=255;
+        }
+      }
+      return out;
+    };
+
     const variantFactories: VariantFn[] = [
       () => ({ name: 'raw', rgba: workRgba, w: width, h: height, rotations: 0, baseOriginX: 0, baseOriginY: 0 }),
       () => ({ name: 'otsu', rgba: otsuRgba, w: width, h: height, rotations: 0, baseOriginX: 0, baseOriginY: 0 }),
-      () => ({ name: 'logo-erased', rgba: eraseCentre(workRgba, width, height, 0.22), w: width, h: height, rotations: 0, baseOriginX: 0, baseOriginY: 0 }),
-      () => ({ name: 'otsu+logo-erased', rgba: eraseCentre(otsuRgba, width, height, 0.22), w: width, h: height, rotations: 0, baseOriginX: 0, baseOriginY: 0 }),
       () => ({ name: 'otsu-inv', rgba: lumaToRgba(applyThreshold(luma, otsuT, true)), w: width, h: height, rotations: 0, baseOriginX: 0, baseOriginY: 0 }),
       () => ({ name: 'contrast', rgba: lumaToRgba(applyThreshold(stretched, stretchedOtsuT)), w: width, h: height, rotations: 0, baseOriginX: 0, baseOriginY: 0 }),
+      // Per-channel: coloured QR modules
+      () => ({ name: 'ch-R', rgba: lumaToRgba(applyThreshold(rLuma, rOtsuT)), w: width, h: height, rotations: 0, baseOriginX: 0, baseOriginY: 0 }),
+      () => ({ name: 'ch-G', rgba: lumaToRgba(applyThreshold(gLuma, gOtsuT)), w: width, h: height, rotations: 0, baseOriginX: 0, baseOriginY: 0 }),
+      () => ({ name: 'ch-B', rgba: lumaToRgba(applyThreshold(bLuma, bOtsuT)), w: width, h: height, rotations: 0, baseOriginX: 0, baseOriginY: 0 }),
+      // Local adaptive: busy / uneven backgrounds
+      () => ({ name: 'local-adapt', rgba: localAdaptive(workRgba, width, height, 48), w: width, h: height, rotations: 0, baseOriginX: 0, baseOriginY: 0 }),
+      // Logo-erase at multiple radii
+      () => ({ name: 'erase22', rgba: eraseCentre(otsuRgba, width, height, 0.22), w: width, h: height, rotations: 0, baseOriginX: 0, baseOriginY: 0 }),
+      () => ({ name: 'erase30', rgba: eraseCentre(otsuRgba, width, height, 0.30), w: width, h: height, rotations: 0, baseOriginX: 0, baseOriginY: 0 }),
+      () => ({ name: 'erase40', rgba: eraseCentre(otsuRgba, width, height, 0.40), w: width, h: height, rotations: 0, baseOriginX: 0, baseOriginY: 0 }),
+      () => ({ name: 'erase50', rgba: eraseCentre(otsuRgba, width, height, 0.50), w: width, h: height, rotations: 0, baseOriginX: 0, baseOriginY: 0 }),
+      // Fixed thresholds: when Otsu picks wrong split point
+      () => ({ name: 't80',  rgba: lumaToRgba(applyThreshold(luma, 80)),  w: width, h: height, rotations: 0, baseOriginX: 0, baseOriginY: 0 }),
+      () => ({ name: 't128', rgba: lumaToRgba(applyThreshold(luma, 128)), w: width, h: height, rotations: 0, baseOriginX: 0, baseOriginY: 0 }),
+      () => ({ name: 't180', rgba: lumaToRgba(applyThreshold(luma, 180)), w: width, h: height, rotations: 0, baseOriginX: 0, baseOriginY: 0 }),
     ];
     // Rotation variants — most engines auto-rotate but jsQR doesn't, and
     // some heavily-stylised QRs are easier for engines to localise when

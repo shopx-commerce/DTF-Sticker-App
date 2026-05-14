@@ -6,6 +6,7 @@ import path from "path";
 import fs from "fs";
 import Replicate from "replicate";
 import jsQR from "jsqr";
+import { scanImageData as zbarScanImageData, ZBarSymbolType } from "@undecaf/zbar-wasm";
 
 import sgMail from "@sendgrid/mail";
 
@@ -622,30 +623,22 @@ ${pdfData ? '<p><strong>PDF design with CutContour is attached.</strong></p>' : 
     }
   });
 
-  // Server-side QR code detection — reliable fallback when the in-browser
-  // wasm engines (ZBar / BarcodeDetector) fail or aren't available.
-  // Uses jsQR (pure JS, works in Node.js) over multiple preprocessing
-  // variants so even low-contrast / inverted / coloured QRs are caught.
+  // Server-side QR detection — comprehensive multi-engine, multi-variant
+  // pipeline. Engines: ZBar (C library, strongest on stylized/occluded QRs)
+  // + jsQR (pure JS, catches crisp synthetic codes ZBar misses).
+  // Preprocessing variants cover: raw, Otsu, per-channel (R/G/B isolation
+  // for coloured modules), multiple fixed thresholds, local adaptive
+  // thresholding, contrast stretch, multiple logo-erase radii, rotations,
+  // and a 2× upscale pass for small QRs.
   app.post("/api/detect-qr", upload.single('image'), async (req, res) => {
     try {
       if (!req.file) return res.status(400).json({ error: "No image provided" });
 
-      // Convert to raw RGBA at working resolution (cap at 1500×1500 so
-      // jsQR stays fast; QR modules need ~5–7px each to decode reliably).
       const metadata = await sharp(req.file.buffer).metadata();
       const srcW = metadata.width ?? 1;
       const srcH = metadata.height ?? 1;
-      const MAX = 1500;
-      const scale = Math.min(1, MAX / Math.max(srcW, srcH));
-      const workW = Math.round(srcW * scale);
-      const workH = Math.round(srcH * scale);
 
-      // Get raw RGBA
-      const rawBuf = await sharp(req.file.buffer)
-        .resize(workW, workH, { kernel: sharp.kernel.lanczos3 })
-        .ensureAlpha()
-        .raw()
-        .toBuffer();
+      // ── Helpers ─────────────────────────────────────────────────────────
 
       interface QRResult {
         payload: string;
@@ -653,112 +646,259 @@ ${pdfData ? '<p><strong>PDF design with CutContour is attached.</strong></p>' : 
         corners: { topLeft: {x:number;y:number}; topRight: {x:number;y:number}; bottomLeft: {x:number;y:number}; bottomRight: {x:number;y:number} };
         source: string;
       }
-
       const results: QRResult[] = [];
       const seen = new Set<string>();
 
-      function tryScan(buf: Buffer, label: string) {
-        // jsQR requires Uint8ClampedArray (not Buffer/Uint8Array).
-        // Copy into one so mutations (masking) don't touch the original.
-        const working = new Uint8ClampedArray(buf);
-        for (let attempt = 0; attempt < 6; attempt++) {
-          const res2 = jsQR(working as unknown as Uint8ClampedArray, workW, workH, { inversionAttempts: 'attemptBoth' });
-          if (!res2) break;
-          const loc = res2.location;
-          const xs = [loc.topLeftCorner.x, loc.topRightCorner.x, loc.bottomLeftCorner.x, loc.bottomRightCorner.x];
-          const ys = [loc.topLeftCorner.y, loc.topRightCorner.y, loc.bottomLeftCorner.y, loc.bottomRightCorner.y];
-          const minX = Math.min(...xs), maxX = Math.max(...xs);
-          const minY = Math.min(...ys), maxY = Math.max(...ys);
-          if (!seen.has(res2.data)) {
-            seen.add(res2.data);
-            // Map coords back to source-image space
-            const up = 1 / scale;
-            results.push({
-              payload: res2.data,
-              bbox: { x: minX * up, y: minY * up, width: (maxX - minX) * up, height: (maxY - minY) * up },
-              corners: {
-                topLeft: { x: loc.topLeftCorner.x * up, y: loc.topLeftCorner.y * up },
-                topRight: { x: loc.topRightCorner.x * up, y: loc.topRightCorner.y * up },
-                bottomLeft: { x: loc.bottomLeftCorner.x * up, y: loc.bottomLeftCorner.y * up },
-                bottomRight: { x: loc.bottomRightCorner.x * up, y: loc.bottomRightCorner.y * up },
-              },
-              source: `server-jsqr:${label}`,
-            });
+      function addResult(payload: string, loc: { topLeftCorner:{x:number;y:number}; topRightCorner:{x:number;y:number}; bottomLeftCorner:{x:number;y:number}; bottomRightCorner:{x:number;y:number} }, upscale: number, src: string) {
+        if (seen.has(payload)) return;
+        seen.add(payload);
+        const xs = [loc.topLeftCorner.x, loc.topRightCorner.x, loc.bottomLeftCorner.x, loc.bottomRightCorner.x];
+        const ys = [loc.topLeftCorner.y, loc.topRightCorner.y, loc.bottomLeftCorner.y, loc.bottomRightCorner.y];
+        results.push({
+          payload,
+          bbox: { x: Math.min(...xs)*upscale, y: Math.min(...ys)*upscale, width: (Math.max(...xs)-Math.min(...xs))*upscale, height: (Math.max(...ys)-Math.min(...ys))*upscale },
+          corners: {
+            topLeft:     { x: loc.topLeftCorner.x*upscale,     y: loc.topLeftCorner.y*upscale },
+            topRight:    { x: loc.topRightCorner.x*upscale,    y: loc.topRightCorner.y*upscale },
+            bottomLeft:  { x: loc.bottomLeftCorner.x*upscale,  y: loc.bottomLeftCorner.y*upscale },
+            bottomRight: { x: loc.bottomRightCorner.x*upscale, y: loc.bottomRightCorner.y*upscale },
+          },
+          source: src,
+        });
+      }
+
+      // jsQR scan — tries up to 6 times masking found QRs each pass
+      function scanWithJsQR(rgba: Uint8ClampedArray, w: number, h: number, upscale: number, label: string) {
+        const working = new Uint8ClampedArray(rgba);
+        for (let i = 0; i < 6; i++) {
+          const r = jsQR(working, w, h, { inversionAttempts: 'attemptBoth' });
+          if (!r) break;
+          addResult(r.data, r.location, upscale, `server-jsqr:${label}`);
+          // Mask found region to white so next pass finds a different QR
+          const loc = r.location;
+          const x0 = Math.max(0, Math.floor(Math.min(loc.topLeftCorner.x, loc.bottomLeftCorner.x)));
+          const y0 = Math.max(0, Math.floor(Math.min(loc.topLeftCorner.y, loc.topRightCorner.y)));
+          const x1 = Math.min(w, Math.ceil(Math.max(loc.topRightCorner.x, loc.bottomRightCorner.x)));
+          const y1 = Math.min(h, Math.ceil(Math.max(loc.bottomLeftCorner.y, loc.bottomRightCorner.y)));
+          for (let y = y0; y < y1; y++) for (let x = x0; x < x1; x++) {
+            const idx = (y * w + x) * 4;
+            working[idx]=255; working[idx+1]=255; working[idx+2]=255; working[idx+3]=255;
           }
-          // Mask detected region out of working buffer so next pass finds another
-          const x0 = Math.max(0, Math.floor(minX)), y0 = Math.max(0, Math.floor(minY));
-          const x1 = Math.min(workW, Math.ceil(maxX)), y1 = Math.min(workH, Math.ceil(maxY));
-          for (let y = y0; y < y1; y++) {
-            for (let x = x0; x < x1; x++) {
-              const idx = (y * workW + x) * 4;
-              working[idx] = 255; working[idx+1] = 255; working[idx+2] = 255; working[idx+3] = 255;
+        }
+      }
+
+      // ZBar scan — single pass, returns all symbols found
+      async function scanWithZBar(rgba: Uint8ClampedArray, w: number, h: number, upscale: number, label: string) {
+        try {
+          const imageDataLike = { data: rgba, width: w, height: h };
+          const symbols = await zbarScanImageData(imageDataLike as ImageData);
+          for (const sym of symbols) {
+            if (sym.type !== ZBarSymbolType.ZBAR_QRCODE) continue;
+            const payload = sym.decode();
+            const pts = sym.points;
+            if (pts.length < 4) continue;
+            // Build a minimal loc object compatible with addResult
+            const sorted = [...pts].sort((a,b) => a.y - b.y);
+            const top = sorted.slice(0,2).sort((a,b) => a.x-b.x);
+            const bot = sorted.slice(2,4).sort((a,b) => a.x-b.x);
+            addResult(payload, {
+              topLeftCorner: top[0], topRightCorner: top[1],
+              bottomLeftCorner: bot[0], bottomRightCorner: bot[1],
+            }, upscale, `server-zbar:${label}`);
+          }
+        } catch { /* ZBar failed for this variant — continue */ }
+      }
+
+      // Run both engines on one buffer
+      async function runEngines(rgba: Uint8ClampedArray, w: number, h: number, upscale: number, label: string) {
+        scanWithJsQR(rgba, w, h, upscale, label);
+        await scanWithZBar(rgba, w, h, upscale, label);
+      }
+
+      // ── Preprocessing helpers ────────────────────────────────────────────
+
+      function compositeWhite(raw: Buffer): Uint8ClampedArray {
+        const out = new Uint8ClampedArray(raw.length);
+        for (let i = 0; i < raw.length; i += 4) {
+          const a = raw[i+3] / 255;
+          out[i]   = (raw[i]   * a + 255 * (1-a)) | 0;
+          out[i+1] = (raw[i+1] * a + 255 * (1-a)) | 0;
+          out[i+2] = (raw[i+2] * a + 255 * (1-a)) | 0;
+          out[i+3] = 255;
+        }
+        return out;
+      }
+
+      function toLuma(rgba: Uint8ClampedArray): Uint8Array {
+        const luma = new Uint8Array(rgba.length / 4);
+        for (let i = 0, j = 0; i < rgba.length; i += 4, j++)
+          luma[j] = (0.299*rgba[i] + 0.587*rgba[i+1] + 0.114*rgba[i+2]) | 0;
+        return luma;
+      }
+
+      function otsuThreshold(luma: Uint8Array): number {
+        const hist = new Int32Array(256);
+        for (const v of luma) hist[v]++;
+        const n = luma.length;
+        let sumAll = 0; for (let i=0;i<256;i++) sumAll += i*hist[i];
+        let sumB=0,wB=0,maxVar=0,t=128;
+        for (let i=0;i<256;i++) {
+          wB+=hist[i]; if(!wB) continue;
+          const wF=n-wB; if(!wF) break;
+          sumB+=i*hist[i];
+          const mB=sumB/wB, mF=(sumAll-sumB)/wF;
+          const v=wB*wF*(mB-mF)**2;
+          if(v>maxVar){maxVar=v;t=i;}
+        }
+        return t;
+      }
+
+      function applyFixed(luma: Uint8Array, thresh: number, invert=false): Uint8ClampedArray {
+        const out = new Uint8ClampedArray(luma.length*4);
+        for (let i=0,j=0;i<luma.length;i++,j+=4) {
+          const v = (luma[i]<thresh) !== invert ? 0 : 255;
+          out[j]=v; out[j+1]=v; out[j+2]=v; out[j+3]=255;
+        }
+        return out;
+      }
+
+      // Extract single channel as grayscale RGBA
+      function extractChannel(rgba: Uint8ClampedArray, ch: 0|1|2): Uint8ClampedArray {
+        const out = new Uint8ClampedArray(rgba.length);
+        for (let i=0;i<rgba.length;i+=4) {
+          const v = rgba[i+ch];
+          out[i]=v; out[i+1]=v; out[i+2]=v; out[i+3]=255;
+        }
+        return out;
+      }
+
+      // Local adaptive threshold — divides image into cells and Otsu per cell.
+      // Strongly handles QRs embedded in uneven/busy backgrounds.
+      function localAdaptive(rgba: Uint8ClampedArray, w: number, h: number, cellSize=48): Uint8ClampedArray {
+        const luma = toLuma(rgba);
+        const out = new Uint8ClampedArray(rgba.length);
+        const cols = Math.ceil(w/cellSize), rows = Math.ceil(h/cellSize);
+        for (let row=0;row<rows;row++) {
+          for (let col=0;col<cols;col++) {
+            const x0=col*cellSize, y0=row*cellSize;
+            const x1=Math.min(x0+cellSize,w), y1=Math.min(y0+cellSize,h);
+            // Collect cell luma
+            const cell = new Uint8Array((x1-x0)*(y1-y0));
+            let k=0;
+            for (let y=y0;y<y1;y++) for (let x=x0;x<x1;x++) cell[k++]=luma[y*w+x];
+            const thresh = otsuThreshold(cell);
+            // Apply to output
+            for (let y=y0;y<y1;y++) for (let x=x0;x<x1;x++) {
+              const v = luma[y*w+x] < thresh ? 0 : 255;
+              const idx=(y*w+x)*4;
+              out[idx]=v; out[idx+1]=v; out[idx+2]=v; out[idx+3]=255;
             }
           }
         }
+        return out;
       }
 
-      // Build preprocessing variants
-      // 1. Raw (composite against white so transparent pixels are white)
-      const whiteBg = Buffer.alloc(rawBuf.length);
-      for (let i = 0; i < rawBuf.length; i += 4) {
-        const a = rawBuf[i+3] / 255;
-        whiteBg[i]   = Math.round(rawBuf[i]   * a + 255 * (1 - a));
-        whiteBg[i+1] = Math.round(rawBuf[i+1] * a + 255 * (1 - a));
-        whiteBg[i+2] = Math.round(rawBuf[i+2] * a + 255 * (1 - a));
-        whiteBg[i+3] = 255;
-      }
-      tryScan(whiteBg, 'raw');
-
-      // 2. Grayscale → Otsu threshold
-      const luma = new Uint8Array(workW * workH);
-      for (let i = 0; i < whiteBg.length; i += 4) {
-        luma[i/4] = (0.299 * whiteBg[i] + 0.587 * whiteBg[i+1] + 0.114 * whiteBg[i+2]) | 0;
-      }
-      // Otsu
-      const hist = new Int32Array(256);
-      for (const v of luma) hist[v]++;
-      const n = workW * workH;
-      let sumB = 0, wB = 0, sum = 0, maxVar = 0, thresh = 128;
-      for (let i = 0; i < 256; i++) sum += i * hist[i];
-      for (let t = 0; t < 256; t++) {
-        wB += hist[t]; if (!wB) continue;
-        const wF = n - wB; if (!wF) break;
-        sumB += t * hist[t];
-        const mB = sumB / wB, mF = (sum - sumB) / wF;
-        const v = wB * wF * (mB - mF) ** 2;
-        if (v > maxVar) { maxVar = v; thresh = t; }
-      }
-      const otsuBuf = Buffer.alloc(rawBuf.length);
-      for (let i = 0, j = 0; i < rawBuf.length; i += 4, j++) {
-        const v = luma[j] <= thresh ? 0 : 255;
-        otsuBuf[i] = v; otsuBuf[i+1] = v; otsuBuf[i+2] = v; otsuBuf[i+3] = 255;
-      }
-      tryScan(otsuBuf, 'otsu');
-
-      // 3. Inverted Otsu (catches white-on-dark QRs)
-      const invBuf = Buffer.alloc(rawBuf.length);
-      for (let i = 0; i < otsuBuf.length; i += 4) {
-        invBuf[i] = 255 - otsuBuf[i]; invBuf[i+1] = 255 - otsuBuf[i+1];
-        invBuf[i+2] = 255 - otsuBuf[i+2]; invBuf[i+3] = 255;
-      }
-      tryScan(invBuf, 'otsu-inv');
-
-      // 4. Centre-logo erased (22% wipe defeats centred logo QRs)
-      if (results.length < 4) {
-        const erased = Buffer.from(whiteBg);
-        const cx = Math.floor(workW / 2), cy = Math.floor(workH / 2);
-        const rx = Math.floor(workW * 0.22 / 2), ry = Math.floor(workH * 0.22 / 2);
-        for (let y = cy - ry; y < cy + ry; y++) {
-          for (let x = cx - rx; x < cx + rx; x++) {
-            if (x < 0 || x >= workW || y < 0 || y >= workH) continue;
-            const idx = (y * workW + x) * 4;
-            erased[idx] = 255; erased[idx+1] = 255; erased[idx+2] = 255; erased[idx+3] = 255;
-          }
+      // Erase a centred rectangle to white (handles logo overlap)
+      function eraseCentre(rgba: Uint8ClampedArray, w: number, h: number, frac: number): Uint8ClampedArray {
+        const out = new Uint8ClampedArray(rgba);
+        const rw=Math.round(w*frac), rh=Math.round(h*frac);
+        const x0=Math.round((w-rw)/2), y0=Math.round((h-rh)/2);
+        for (let y=y0;y<y0+rh;y++) for (let x=x0;x<x0+rw;x++) {
+          const i=(y*w+x)*4; out[i]=255;out[i+1]=255;out[i+2]=255;out[i+3]=255;
         }
-        tryScan(erased, 'logo-erased');
+        return out;
       }
 
-      console.log(`[QR server] Detected ${results.length} QR(s) in ${workW}×${workH} work image`);
+      // Rotate RGBA buffer 90° CW
+      function rotate90(rgba: Uint8ClampedArray, w: number, h: number): { data:Uint8ClampedArray; w:number; h:number } {
+        const out = new Uint8ClampedArray(w*h*4);
+        for (let y=0;y<h;y++) for (let x=0;x<w;x++) {
+          const si=(y*w+x)*4, di=((x)*h+(h-1-y))*4;
+          out[di]=rgba[si];out[di+1]=rgba[si+1];out[di+2]=rgba[si+2];out[di+3]=rgba[si+3];
+        }
+        return { data:out, w:h, h:w };
+      }
+
+      // ── Main pipeline ────────────────────────────────────────────────────
+
+      // Run at two work scales: native (up to 1500px longest) and 2× upscale
+      // (helps small QRs where modules < 5px at native resolution).
+      const scales: Array<{ label: string; maxPx: number }> = [
+        { label: 'native', maxPx: 1500 },
+        { label: '2x',     maxPx: 2400 },
+      ];
+
+      for (const { label: scaleLabel, maxPx } of scales) {
+        if (results.length >= 4) break;
+
+        const sc = Math.min(maxPx / Math.max(srcW, srcH), scaleLabel === '2x' ? 2.0 : 1.0);
+        const wW = Math.round(srcW * sc), wH = Math.round(srcH * sc);
+        const upscale = 1 / sc; // factor to map work-coords → source-coords
+
+        const rawBuf = await sharp(req.file.buffer)
+          .resize(wW, wH, { kernel: sharp.kernel.lanczos3 })
+          .ensureAlpha().raw().toBuffer();
+
+        const base = compositeWhite(rawBuf);
+        const luma = toLuma(base);
+        const otsuT = otsuThreshold(luma);
+
+        // 1. Raw
+        await runEngines(base, wW, wH, upscale, `${scaleLabel}:raw`);
+        if (results.length >= 4) break;
+
+        // 2. Otsu threshold
+        await runEngines(applyFixed(luma, otsuT), wW, wH, upscale, `${scaleLabel}:otsu`);
+        if (results.length >= 4) break;
+
+        // 3. Inverted Otsu (white-on-dark QRs)
+        await runEngines(applyFixed(luma, otsuT, true), wW, wH, upscale, `${scaleLabel}:otsu-inv`);
+        if (results.length >= 4) break;
+
+        // 4-6. Per-channel isolation (coloured QR modules)
+        for (const [ch, name] of [[0,'R'],[1,'G'],[2,'B']] as [0|1|2,string][]) {
+          if (results.length >= 4) break;
+          const chBuf = extractChannel(base, ch);
+          const chLuma = toLuma(chBuf);
+          await runEngines(applyFixed(chLuma, otsuThreshold(chLuma)), wW, wH, upscale, `${scaleLabel}:ch${name}`);
+        }
+        if (results.length >= 4) break;
+
+        // 7. Local adaptive threshold (uneven lighting / busy backgrounds)
+        await runEngines(localAdaptive(base, wW, wH, 48), wW, wH, upscale, `${scaleLabel}:local-adapt`);
+        if (results.length >= 4) break;
+
+        // 8-10. Multiple fixed thresholds (when Otsu picks wrong split)
+        for (const t of [80, 128, 180]) {
+          if (results.length >= 4) break;
+          await runEngines(applyFixed(luma, t), wW, wH, upscale, `${scaleLabel}:t${t}`);
+          await runEngines(applyFixed(luma, t, true), wW, wH, upscale, `${scaleLabel}:t${t}-inv`);
+        }
+        if (results.length >= 4) break;
+
+        // 11-13. Logo-erase variants (design element overlapping QR centre)
+        for (const frac of [0.22, 0.30, 0.40, 0.50]) {
+          if (results.length >= 4) break;
+          const erased = eraseCentre(applyFixed(luma, otsuT), wW, wH, frac);
+          await runEngines(erased, wW, wH, upscale, `${scaleLabel}:erase${Math.round(frac*100)}`);
+          await runEngines(eraseCentre(base, wW, wH, frac), wW, wH, upscale, `${scaleLabel}:erase${Math.round(frac*100)}-raw`);
+        }
+        if (results.length >= 4) break;
+
+        // 14-16. Rotations (jsQR doesn't auto-rotate; ZBar does but not always)
+        let rotData = { data: applyFixed(luma, otsuT), w: wW, h: wH };
+        for (let r=1;r<=3;r++) {
+          if (results.length >= 4) break;
+          const rot = rotate90(rotData.data, rotData.w, rotData.h);
+          rotData = rot;
+          await runEngines(rot.data, rot.w, rot.h, upscale, `${scaleLabel}:rot${r*90}`);
+        }
+
+        // Only run 2x scale if native found nothing
+        if (scaleLabel === 'native' && results.length > 0) break;
+      }
+
+      console.log(`[QR server] Detected ${results.length} QR(s) — variants exhausted`);
       res.json({ qrCodes: results });
     } catch (err) {
       console.error("[QR server] Detection error:", err);
