@@ -94,69 +94,79 @@ function traceColorRegionsAsync(
     }
 
     let imageData: ImageData;
-
-    // Always draw the actual image at export resolution — needed for real pixel color validation.
-    const canvas = document.createElement('canvas');
-    canvas.width = cW;
-    canvas.height = cH;
-    const ctx = canvas.getContext('2d');
-    if (!ctx) { console.warn('[SpotColor] Canvas context creation failed'); resolve([]); return; }
-    ctx.drawImage(image, 0, 0, cW, cH);
-    const actualImageData = ctx.getImageData(0, 0, cW, cH);
+    let inclusionMasks: { whiteMask: Uint8Array; glossMask: Uint8Array } | null = null;
 
     if (spotPixelMap && spotPixelMap.pixelMap.length > 0) {
-      // Dual-verification approach:
-      // 1. Use the pixelMap to determine which color owns each pixel (exact preview match)
-      // 2. Also check the actual image pixel is genuinely close to that color
-      //    This filters out dark "bridge" pixels that the color extractor loosely classified
-      //    as a spot color but that are visually hidden behind other design elements.
+      // Build the export imageData directly from pixelMap + regionMap + per-region selection
+      // flags — the same data the preview uses to draw the orange overlay. This guarantees
+      // the exported spot color regions exactly match what the user sees, with no color-
+      // tolerance math that can under- or over-include pixels.
+      //
+      // Selected pixels → painted with exact extracted color RGB (worker distance = 0).
+      // Everything else → left transparent (worker skips alpha < 240).
+      // No inclusion masks needed: selection is encoded directly in the imageData.
       const { pixelMap, mapWidth, mapHeight } = spotPixelMap;
-      const rawData = new Uint8ClampedArray(cW * cH * 4);
-      // Tight Euclidean threshold: must be genuinely close to the extracted color,
-      // not just the closest of many distant options. sqrt(3)*45 ≈ 78; use 65 for safety.
-      const TIGHT_TOL_SQ = 65 * 65;
+      const rawData = new Uint8ClampedArray(cW * cH * 4); // all transparent
 
       for (let y = 0; y < cH; y++) {
-        const srcY = Math.min(Math.floor(y * mapHeight / cH), mapHeight - 1);
+        const mapY = Math.min(Math.floor(y * mapHeight / cH), mapHeight - 1);
         for (let x = 0; x < cW; x++) {
-          const srcX = Math.min(Math.floor(x * mapWidth / cW), mapWidth - 1);
-          const colorIdx = pixelMap[srcY * mapWidth + srcX];
-          const di = (y * cW + x) * 4;
+          const mapX = Math.min(Math.floor(x * mapWidth / cW), mapWidth - 1);
+          const mapIdx = mapY * mapWidth + mapX;
+          const colorIdx = pixelMap[mapIdx];
           if (colorIdx < 0 || colorIdx >= spotColors.length) continue;
 
-          // Check actual image pixel is genuinely close to the extracted color
-          const aR = actualImageData.data[di];
-          const aG = actualImageData.data[di + 1];
-          const aB = actualImageData.data[di + 2];
-          const aA = actualImageData.data[di + 3];
-          if (aA < 128) continue; // transparent pixel — skip
-
           const color = spotColors[colorIdx];
-          const dr = aR - color.rgb.r;
-          const dg = aG - color.rgb.g;
-          const db = aB - color.rgb.b;
-          if (dr * dr + dg * dg + db * db > TIGHT_TOL_SQ) continue; // too dark/different — skip bridge pixel
+          let include = false;
 
-          // Paint with exact extracted color RGB so worker distance = 0 → clean mask
-          rawData[di]     = color.rgb.r;
-          rawData[di + 1] = color.rgb.g;
-          rawData[di + 2] = color.rgb.b;
-          rawData[di + 3] = 255;
+          if (color.regionMap && color.regions && color.regions.length > 0) {
+            // Per-region white/gloss selection.
+            // Fluorescent is always color-level (no per-region fluor flags exist).
+            if (color.spotFluorY || color.spotFluorM || color.spotFluorG || color.spotFluorOrange) {
+              include = true;
+            } else {
+              // regionMap is in the same coordinate space as pixelMap (mapWidth × mapHeight).
+              const regionId = color.regionMap[mapIdx];
+              if (regionId >= 0) {
+                const region = color.regions.find(r => r.id === regionId);
+                if (region) include = !!(region.spotWhite || region.spotGloss);
+              }
+              // regionId < 0 = orphan pixel → leave transparent (include stays false)
+            }
+          } else {
+            // No per-region data — use color-level flags directly.
+            include = !!(
+              color.spotWhite || color.spotGloss ||
+              color.spotFluorY || color.spotFluorM || color.spotFluorG || color.spotFluorOrange
+            );
+          }
+
+          if (include) {
+            const di = (y * cW + x) * 4;
+            rawData[di]     = color.rgb.r;
+            rawData[di + 1] = color.rgb.g;
+            rawData[di + 2] = color.rgb.b;
+            rawData[di + 3] = 255;
+          }
         }
       }
+
       imageData = new ImageData(rawData, cW, cH);
-      console.log(`[SpotColor] Built ${cW}x${cH} canvas from pixelMap + actual image validation`);
+      // inclusionMasks stays null — the imageData already encodes the exact selection.
+      console.log(`[SpotColor] Built ${cW}x${cH} canvas from pixelMap + region selection (exact preview match)`);
     } else {
-      // No pixelMap: use actual image data directly
-      imageData = actualImageData;
+      // No pixelMap available — draw actual image and let the worker do color matching.
+      const canvas = document.createElement('canvas');
+      canvas.width = cW;
+      canvas.height = cH;
+      const ctx = canvas.getContext('2d');
+      if (!ctx) { console.warn('[SpotColor] Canvas context creation failed'); resolve([]); return; }
+      ctx.drawImage(image, 0, 0, cW, cH);
+      imageData = ctx.getImageData(0, 0, cW, cH);
+      // buildRegionInclusionMasks requires pixelMap coordinates which we don't have here,
+      // so skip it — color-level selection still works via worker color matching.
       console.log(`[SpotColor] Drew image at ${cW}x${cH} (no pixelMap — fallback mode)`);
     }
-
-    const srcW = image.naturalWidth;
-    const srcH = image.naturalHeight;
-    const inclusionMasks = buildRegionInclusionMasks(
-      spotColors, cW, cH, srcW, srcH
-    );
 
     const workerColors = spotColors.map(c => ({
       hex: c.hex,
