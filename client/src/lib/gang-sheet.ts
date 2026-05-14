@@ -835,29 +835,68 @@ export async function downloadGangSheetPDF(
   }
 
   // --- Spot color vector layers (RDG_WHITE / RDG_GLOSS / fluorescent) ---
-  // For each item with active spot color flags, trace its regions ONCE and
-  // tile them across every placement on the sheet. All separations land on
-  // the same page (singleArtboard semantics), color spaces deduped by name.
+  // Build per-item spot data using the SAME image draw dims & offsets as
+  // the design draw loop above (lines 619-688) — otherwise the spot color
+  // paths get scaled to the contour bounds (typically larger than the
+  // image) and offset to the contour origin instead of the image origin.
+  //
+  // When any spot colors are present we default to multi-page emission:
+  // page 1 stays the design layout (raster + cuts), and we add one new
+  // page per separation label (RDG_WHITE / RDG_GLOSS / fluor*) containing
+  // just that separation's tiled paths. Matches the single-design
+  // `singleArtboard=false` convention so RIP/cutter software gets a
+  // familiar one-separation-per-page layout.
   const spotItems = items
     .filter(item => item.spotColors && item.spotColors.length > 0)
     .map(item => {
       const itemPlacements = placements
         .filter(p => p.itemId === item.id)
         .map(p => ({ x: p.x, y: p.y, rotated: !!p.rotated }));
+      if (itemPlacements.length === 0) return null;
+
+      // Recompute the same image draw dims used by the design draw loop.
+      // Shape mode uses resizeSettings directly; contour mode preserves
+      // aspect ratio inside the resizeSettings bounds.
+      const imgNatW = item.imageElement.naturalWidth || item.imageElement.width;
+      const imgNatH = item.imageElement.naturalHeight || item.imageElement.height;
+      const isShapeMode = !!item.shapeSettings?.enabled
+        || (item.contourData.minPathX === 0 && item.contourData.minPathY === 0
+           && item.contourData.effectiveDPI === 300);
+      let imageWidthInches: number;
+      let imageHeightInches: number;
+      if (isShapeMode) {
+        imageWidthInches = item.resizeSettings.widthInches;
+        imageHeightInches = item.resizeSettings.heightInches;
+      } else {
+        const safeNatH = imgNatH || 1;
+        const safeResH = item.resizeSettings.heightInches || 1;
+        const natAR = imgNatW / safeNatH;
+        const resAR = item.resizeSettings.widthInches / safeResH;
+        if (natAR <= resAR) {
+          imageWidthInches = item.resizeSettings.widthInches;
+          imageHeightInches = natAR > 0 ? item.resizeSettings.widthInches / natAR : item.resizeSettings.heightInches;
+        } else {
+          imageHeightInches = item.resizeSettings.heightInches;
+          imageWidthInches = item.resizeSettings.heightInches * natAR;
+        }
+      }
+
       return {
         imageElement: item.imageElement,
         spotColors: item.spotColors!,
         spotPixelMap: item.spotPixelMap,
-        widthInches: item.contourData.widthInches,
-        heightInches: item.contourData.heightInches,
+        imageWidthInches,
+        imageHeightInches,
+        imageOffsetX: item.contourData.imageOffsetX || 0,
+        imageOffsetY: item.contourData.imageOffsetY || 0,
         placements: itemPlacements,
       };
     })
-    .filter(it => it.placements.length > 0);
+    .filter((it): it is NonNullable<typeof it> => it !== null);
 
   if (spotItems.length > 0) {
     try {
-      await addGangSheetSpotColorsToPDF(pdfDoc, page, spotItems, sheetHeight);
+      await addGangSheetSpotColorsToPDF(pdfDoc, page, spotItems, sheetWidth, sheetHeight, true);
     } catch (err) {
       // Don't fail the whole PDF if spot color tracing throws — log and skip.
       console.error('[GangSheet] Spot color emission failed:', err);
