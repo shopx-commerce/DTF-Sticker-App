@@ -607,8 +607,8 @@ export function detectQRAppearance(
   // Both checks are grid-independent and work for any QR encoder.
   const cxQR = bbox.x + bbox.width / 2;
   const cyQR = bbox.y + bbox.height / 2;
-  const halfSampleW = bbox.width * 0.30; // central 60% on X
-  const halfSampleH = bbox.height * 0.30; // central 60% on Y
+  const halfSampleW = bbox.width * 0.40; // central 80% on X — catch large logos
+  const halfSampleH = bbox.height * 0.40; // central 80% on Y
   const sampleX0 = Math.max(0, Math.floor(cxQR - halfSampleW));
   const sampleY0 = Math.max(0, Math.floor(cyQR - halfSampleH));
   const sampleX1 = Math.min(w, Math.ceil(cxQR + halfSampleW));
@@ -671,13 +671,14 @@ export function detectQRAppearance(
       const logoW = (maxX - minX + step) + 2 * padX;
       const logoH = (maxY - minY + step) + 2 * padY;
 
-      // Defensive cap: a real logo never covers > 35% of a QR's
-      // dimension (otherwise the QR couldn't decode even at H, which
-      // tops out at 30% recovery). If we somehow got a giant box, the
-      // detector's confused — better to skip the carve-out and let the
-      // wipe + module pass run normally over the whole bbox.
-      const maxLogoW = bbox.width * 0.35;
-      const maxLogoH = bbox.height * 0.35;
+      // Defensive cap: logos up to 68% of the QR's dimension are accepted.
+      // Standard guidance is ≤30% of QR area (≈54% of dimension) at H EC
+      // level, but real phones are forgiving well beyond that — if the user's
+      // phone can scan it, we should preserve the logo rather than wipe it.
+      // Anything larger than 68% of a side is almost certainly a detector
+      // false-positive (the whole central zone flagged), not a real logo.
+      const maxLogoW = bbox.width * 0.68;
+      const maxLogoH = bbox.height * 0.68;
       if (logoW <= maxLogoW && logoH <= maxLogoH) {
         logoBox = { x: logoX, y: logoY, width: logoW, height: logoH };
       } else {
