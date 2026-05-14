@@ -7,6 +7,7 @@ import fs from "fs";
 import Replicate from "replicate";
 import jsQR from "jsqr";
 import { scanImageData as zbarScanImageData, ZBarSymbolType } from "@undecaf/zbar-wasm";
+import { readBarcodes } from "zxing-wasm";
 
 import sgMail from "@sendgrid/mail";
 
@@ -697,7 +698,6 @@ ${pdfData ? '<p><strong>PDF design with CutContour is attached.</strong></p>' : 
             const payload = sym.decode();
             const pts = sym.points;
             if (pts.length < 4) continue;
-            // Build a minimal loc object compatible with addResult
             const sorted = [...pts].sort((a,b) => a.y - b.y);
             const top = sorted.slice(0,2).sort((a,b) => a.x-b.x);
             const bot = sorted.slice(2,4).sort((a,b) => a.x-b.x);
@@ -705,14 +705,44 @@ ${pdfData ? '<p><strong>PDF design with CutContour is attached.</strong></p>' : 
               topLeftCorner: top[0], topRightCorner: top[1],
               bottomLeftCorner: bot[0], bottomRightCorner: bot[1],
             }, upscale, `server-zbar:${label}`);
+            console.log(`[QR server] ZBar HIT on variant "${label}" — payload: ${payload.slice(0,60)}`);
           }
-        } catch { /* ZBar failed for this variant — continue */ }
+        } catch(e) {
+          console.warn(`[QR server] ZBar threw on "${label}":`, String(e).slice(0,120));
+        }
       }
 
-      // Run both engines on one buffer
+      // ZXing — the same C++ engine phone cameras use; strongest on stylised/
+      // logo-embedded QRs with heavy occlusion or non-standard module shapes.
+      async function scanWithZXing(rgba: Uint8ClampedArray, w: number, h: number, upscale: number, label: string) {
+        try {
+          const results = await readBarcodes(
+            { data: rgba, width: w, height: h },
+            { formats: ['QRCode'], tryHarder: true, tryInvert: true, maxNumberOfSymbols: 8 }
+          );
+          for (const r of results) {
+            if (!r.text) continue;
+            const p = r.position;
+            if (!p) continue;
+            addResult(r.text, {
+              topLeftCorner:     { x: p.topLeft.x,     y: p.topLeft.y },
+              topRightCorner:    { x: p.topRight.x,    y: p.topRight.y },
+              bottomLeftCorner:  { x: p.bottomLeft.x,  y: p.bottomLeft.y },
+              bottomRightCorner: { x: p.bottomRight.x, y: p.bottomRight.y },
+            }, upscale, `server-zxing:${label}`);
+            console.log(`[QR server] ZXing HIT on variant "${label}" — payload: ${r.text.slice(0,60)}`);
+          }
+        } catch(e) {
+          console.warn(`[QR server] ZXing threw on "${label}":`, String(e).slice(0,120));
+        }
+      }
+
+      // Run all three engines on one buffer and log the attempt
       async function runEngines(rgba: Uint8ClampedArray, w: number, h: number, upscale: number, label: string) {
+        console.log(`[QR server] Trying variant "${label}" (${w}×${h})`);
         scanWithJsQR(rgba, w, h, upscale, label);
         await scanWithZBar(rgba, w, h, upscale, label);
+        await scanWithZXing(rgba, w, h, upscale, label);
       }
 
       // ── Preprocessing helpers ────────────────────────────────────────────
@@ -724,6 +754,36 @@ ${pdfData ? '<p><strong>PDF design with CutContour is attached.</strong></p>' : 
           out[i]   = (raw[i]   * a + 255 * (1-a)) | 0;
           out[i+1] = (raw[i+1] * a + 255 * (1-a)) | 0;
           out[i+2] = (raw[i+2] * a + 255 * (1-a)) | 0;
+          out[i+3] = 255;
+        }
+        return out;
+      }
+
+      // Black background composite — essential when the design has a dark/black
+      // background (like this sticker: bg=rgb(4,5,4)). Compositing against white
+      // turns transparent dark pixels bright and can destroy dark-module contrast.
+      function compositeBlack(raw: Buffer): Uint8ClampedArray {
+        const out = new Uint8ClampedArray(raw.length);
+        for (let i = 0; i < raw.length; i += 4) {
+          const a = raw[i+3] / 255;
+          out[i]   = (raw[i]   * a) | 0;
+          out[i+1] = (raw[i+1] * a) | 0;
+          out[i+2] = (raw[i+2] * a) | 0;
+          out[i+3] = 255;
+        }
+        return out;
+      }
+
+      // Gamma boost — raises dark midtones so low-contrast QR modules
+      // (e.g. dark maroon on near-black background) become clearly visible.
+      function gammaBoost(rgba: Uint8ClampedArray, gamma: number): Uint8ClampedArray {
+        const lut = new Uint8Array(256);
+        for (let i = 0; i < 256; i++) lut[i] = (Math.pow(i/255, gamma) * 255 + 0.5) | 0;
+        const out = new Uint8ClampedArray(rgba.length);
+        for (let i = 0; i < rgba.length; i += 4) {
+          out[i]   = lut[rgba[i]];
+          out[i+1] = lut[rgba[i+1]];
+          out[i+2] = lut[rgba[i+2]];
           out[i+3] = 255;
         }
         return out;
@@ -839,54 +899,82 @@ ${pdfData ? '<p><strong>PDF design with CutContour is attached.</strong></p>' : 
           .resize(wW, wH, { kernel: sharp.kernel.lanczos3 })
           .ensureAlpha().raw().toBuffer();
 
-        const base = compositeWhite(rawBuf);
-        const luma = toLuma(base);
-        const otsuT = otsuThreshold(luma);
+        const base     = compositeWhite(rawBuf);  // transparent → white
+        const baseBlk  = compositeBlack(rawBuf);  // transparent → black (dark-bg designs)
+        const luma     = toLuma(base);
+        const lumaBlk  = toLuma(baseBlk);
+        const otsuT    = otsuThreshold(luma);
+        const otsuTBlk = otsuThreshold(lumaBlk);
 
-        // 1. Raw
+        // 1. Raw (white bg)
         await runEngines(base, wW, wH, upscale, `${scaleLabel}:raw`);
         if (results.length >= 4) break;
 
-        // 2. Otsu threshold
+        // 2. Raw (black bg) — for designs with dark/transparent background
+        await runEngines(baseBlk, wW, wH, upscale, `${scaleLabel}:raw-blk`);
+        if (results.length >= 4) break;
+
+        // 3. Otsu (white bg)
         await runEngines(applyFixed(luma, otsuT), wW, wH, upscale, `${scaleLabel}:otsu`);
         if (results.length >= 4) break;
 
-        // 3. Inverted Otsu (white-on-dark QRs)
+        // 4. Otsu (black bg) — often better for stickers with dark backgrounds
+        await runEngines(applyFixed(lumaBlk, otsuTBlk), wW, wH, upscale, `${scaleLabel}:otsu-blk`);
+        if (results.length >= 4) break;
+
+        // 5. Inverted Otsu (white-on-dark QRs)
         await runEngines(applyFixed(luma, otsuT, true), wW, wH, upscale, `${scaleLabel}:otsu-inv`);
         if (results.length >= 4) break;
 
-        // 4-6. Per-channel isolation (coloured QR modules)
+        // 6. Gamma boost (γ=0.35) on black-bg image — brightens dark modules
+        // against near-black background so any decoder can see the QR pattern.
+        const gamma35 = gammaBoost(baseBlk, 0.35);
+        await runEngines(gamma35, wW, wH, upscale, `${scaleLabel}:gamma35`);
+        if (results.length >= 4) break;
+
+        // 7. Gamma + Otsu after boosting
+        await runEngines(applyFixed(toLuma(gamma35), otsuThreshold(toLuma(gamma35))), wW, wH, upscale, `${scaleLabel}:gamma35-otsu`);
+        if (results.length >= 4) break;
+
+        // 8. Gamma boost (γ=0.5)
+        const gamma50 = gammaBoost(baseBlk, 0.5);
+        await runEngines(applyFixed(toLuma(gamma50), otsuThreshold(toLuma(gamma50))), wW, wH, upscale, `${scaleLabel}:gamma50-otsu`);
+        if (results.length >= 4) break;
+
+        // 9-11. Per-channel isolation (coloured QR modules)
         for (const [ch, name] of [[0,'R'],[1,'G'],[2,'B']] as [0|1|2,string][]) {
           if (results.length >= 4) break;
-          const chBuf = extractChannel(base, ch);
+          const chBuf = extractChannel(baseBlk, ch);
           const chLuma = toLuma(chBuf);
           await runEngines(applyFixed(chLuma, otsuThreshold(chLuma)), wW, wH, upscale, `${scaleLabel}:ch${name}`);
         }
         if (results.length >= 4) break;
 
-        // 7. Local adaptive threshold (uneven lighting / busy backgrounds)
-        await runEngines(localAdaptive(base, wW, wH, 48), wW, wH, upscale, `${scaleLabel}:local-adapt`);
+        // 12. Local adaptive threshold (uneven lighting / busy backgrounds)
+        await runEngines(localAdaptive(baseBlk, wW, wH, 48), wW, wH, upscale, `${scaleLabel}:local-adapt`);
         if (results.length >= 4) break;
 
-        // 8-10. Multiple fixed thresholds (when Otsu picks wrong split)
-        for (const t of [80, 128, 180]) {
+        // 13-15. Multiple fixed thresholds on black-bg luma
+        for (const t of [40, 80, 128]) {
           if (results.length >= 4) break;
-          await runEngines(applyFixed(luma, t), wW, wH, upscale, `${scaleLabel}:t${t}`);
-          await runEngines(applyFixed(luma, t, true), wW, wH, upscale, `${scaleLabel}:t${t}-inv`);
+          await runEngines(applyFixed(lumaBlk, t), wW, wH, upscale, `${scaleLabel}:t${t}-blk`);
+          await runEngines(applyFixed(lumaBlk, t, true), wW, wH, upscale, `${scaleLabel}:t${t}-blk-inv`);
         }
         if (results.length >= 4) break;
 
-        // 11-13. Logo-erase variants (design element overlapping QR centre)
+        // 16-18. Logo-erase variants — try centre wipes of multiple sizes.
+        // Run on BOTH raw-blk and otsu-blk so logos of any colour are defeated.
         for (const frac of [0.22, 0.30, 0.40, 0.50]) {
           if (results.length >= 4) break;
-          const erased = eraseCentre(applyFixed(luma, otsuT), wW, wH, frac);
-          await runEngines(erased, wW, wH, upscale, `${scaleLabel}:erase${Math.round(frac*100)}`);
-          await runEngines(eraseCentre(base, wW, wH, frac), wW, wH, upscale, `${scaleLabel}:erase${Math.round(frac*100)}-raw`);
+          await runEngines(eraseCentre(applyFixed(lumaBlk, otsuTBlk), wW, wH, frac), wW, wH, upscale, `${scaleLabel}:erase${Math.round(frac*100)}`);
+          await runEngines(eraseCentre(baseBlk, wW, wH, frac), wW, wH, upscale, `${scaleLabel}:erase${Math.round(frac*100)}-raw`);
+          // Also try on gamma-boosted for very dark logos
+          await runEngines(eraseCentre(gamma35, wW, wH, frac), wW, wH, upscale, `${scaleLabel}:erase${Math.round(frac*100)}-g35`);
         }
         if (results.length >= 4) break;
 
-        // 14-16. Rotations (jsQR doesn't auto-rotate; ZBar does but not always)
-        let rotData = { data: applyFixed(luma, otsuT), w: wW, h: wH };
+        // 19-21. Rotations — jsQR doesn't auto-rotate
+        let rotData = { data: applyFixed(lumaBlk, otsuTBlk), w: wW, h: wH };
         for (let r=1;r<=3;r++) {
           if (results.length >= 4) break;
           const rot = rotate90(rotData.data, rotData.w, rotData.h);
