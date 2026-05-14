@@ -13,7 +13,7 @@ import { downloadShapePDF, calculateShapeDimensions, generateShapePathPointsInch
 import { useDebouncedValue } from "@/hooks/use-debounce";
 import { removeBackgroundFromImage } from "@/lib/background-removal";
 import { magicWandErase } from "@/lib/magic-wand";
-import { detectQRsInImage, renderImageElementWithCrispQRs, type DetectedQR } from "@/lib/qr";
+import { detectQRsInImage } from "@/lib/qr";
 import type { ParsedPDFData } from "@/lib/pdf-parser";
 import { detectShape, mapDetectedShapeToType } from "@/lib/shape-detection";
 import { useToast } from "@/hooks/use-toast";
@@ -96,10 +96,6 @@ export default function ImageEditor({ onDesignUploaded }: { onDesignUploaded?: (
   const [gangSheetSettings, setGangSheetSettings] = useState<GangSheetSettings>(DEFAULT_GANG_SHEET_SETTINGS);
   const [spotPaintMode, setSpotPaintMode] = useState<'white' | 'gloss' | 'both' | 'clear' | null>(null);
   const [pendingSpotPaint, setPendingSpotPaint] = useState<{ colorIndex: number; regionId: number | null; mode: string; id: number } | null>(null);
-  const [detectedQRs, setDetectedQRs] = useState<DetectedQR[]>([]);
-  const [isDetectingQR, setIsDetectingQR] = useState(false);
-  const [qrScanDone, setQrScanDone] = useState(false);
-  const qrScanDoneTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   
   const canvasRef = useRef<HTMLCanvasElement>(null);
 
@@ -464,6 +460,8 @@ export default function ImageEditor({ onDesignUploaded }: { onDesignUploaded?: (
       shapeSettings: shapeSettings.enabled ? { ...shapeSettings } : undefined,
       cutContourLabel,
       quantity: 1,
+      qrCodes: imageInfo.qrCodes,
+      qrRerenderEnabled: imageInfo.qrRerenderEnabled,
     };
 
     setGangSheetItems(prev => [...prev, newItem]);
@@ -493,10 +491,6 @@ export default function ImageEditor({ onDesignUploaded }: { onDesignUploaded?: (
     setCadCutBounds(null);
     setDetectedShapeType(null);
     setDetectedShapeInfo(null);
-    setDetectedQRs([]);
-    setIsDetectingQR(false);
-    setQrScanDone(false);
-    if (qrScanDoneTimerRef.current) clearTimeout(qrScanDoneTimerRef.current);
     const workerManager = getContourWorkerManager();
     // Important: cancel + clear, in that order. Otherwise any in-flight
     // contour trace would resolve into a now-empty cache slot and
@@ -544,6 +538,58 @@ export default function ImageEditor({ onDesignUploaded }: { onDesignUploaded?: (
       detectedType ? detectionResult.boundingBox : null,
     );
   }, []);
+
+  // Tracks the last image we ran QR detection on. Used by the
+  // image-change effect to decide whether to re-detect.
+  const lastQRDetectedImageRef = useRef<HTMLImageElement | null>(null);
+
+  // Off-thread QR detection. Fires after imageInfo is set; merges results
+  // back into state via a functional update that bails if the image has
+  // since been replaced (avoids clobbering a newer upload's metadata).
+  const runQRDetection = useCallback((image: HTMLImageElement, options: { force?: boolean; toastOnEmpty?: boolean } = {}) => {
+    // Idempotency guard: skip if we've already detected on this exact image
+    // reference. `force: true` bypasses (used by the toolbar "Re-scan" button
+    // when the user wants to retry after the upload-time detection missed).
+    if (!options.force && lastQRDetectedImageRef.current === image) return;
+    lastQRDetectedImageRef.current = image;
+
+    detectQRsInImage(image).then((qrCodes) => {
+      setImageInfo((current) => {
+        if (!current || current.image !== image) return current;
+        return { ...current, qrCodes, qrDetectionRan: true };
+      });
+      if (qrCodes.length > 0) {
+        const payloads = qrCodes.map((q) => q.payload).join(', ');
+        console.log(`[QR] Detected ${qrCodes.length} QR code(s): ${payloads}`);
+        toast({
+          title: `${qrCodes.length} QR code${qrCodes.length === 1 ? '' : 's'} detected`,
+          description: `Will be re-rendered as crisp vectors in PDF exports. Payload${qrCodes.length === 1 ? '' : 's'}: ${payloads.length > 60 ? payloads.slice(0, 60) + '…' : payloads}`,
+        });
+      } else {
+        console.log('[QR] No QR codes detected in this design');
+        if (options.toastOnEmpty) {
+          toast({
+            title: 'No QR codes found',
+            description: 'Detection ran but found nothing scannable. If your design contains a QR (centre logos, stylised dots, low contrast can defeat detection), the export will still work — just without the crisp vector re-render.',
+            variant: 'destructive',
+          });
+        }
+      }
+    }).catch((err) => {
+      console.warn('[QR] Detection failed:', err);
+      // Detection is best-effort — failure is silent. Export still works,
+      // QRs just won't get the crisp re-render treatment.
+    });
+  }, [toast]);
+
+  // Re-run QR detection whenever the underlying image reference changes
+  // (uploads, background removal, magic wand, AI enhance — anything that
+  // swaps `imageInfo.image`). `runQRDetection` itself bails if it's already
+  // run on this image, so this effect is idempotent.
+  useEffect(() => {
+    if (!imageInfo?.image) return;
+    runQRDetection(imageInfo.image);
+  }, [imageInfo?.image, runQRDetection]);
 
   const applyNewImage = useCallback((newImageInfo: ImageInfo, widthInches: number, heightInches: number) => {
     // Drop any in-flight trace from the previous design before we swap.
@@ -682,29 +728,6 @@ export default function ImageEditor({ onDesignUploaded }: { onDesignUploaded?: (
       const { widthInches, heightInches } = calculateImageDimensions(origW, origH, dpi);
 
       applyNewImage(newImageInfo, widthInches, heightInches);
-
-      // Run QR detection in background — non-blocking
-      setDetectedQRs([]);
-      setQrScanDone(false);
-      setIsDetectingQR(true);
-      if (qrScanDoneTimerRef.current) clearTimeout(qrScanDoneTimerRef.current);
-      detectQRsInImage(finalImage)
-        .then(qrCodes => {
-          setDetectedQRs(qrCodes);
-          setQrScanDone(true);
-          if (qrCodes.length > 0) {
-            console.log(`[QR] Detected ${qrCodes.length} QR code(s) in design`);
-          } else {
-            // Auto-dismiss "No QR" badge after 4 seconds
-            qrScanDoneTimerRef.current = setTimeout(() => setQrScanDone(false), 4000);
-          }
-        })
-        .catch(err => {
-          console.warn('[QR] Detection failed:', err);
-          setQrScanDone(true);
-          qrScanDoneTimerRef.current = setTimeout(() => setQrScanDone(false), 4000);
-        })
-        .finally(() => setIsDetectingQR(false));
     } catch (error) {
       console.error('Error processing uploaded image:', error);
       handleFallbackImage(file, image);
@@ -1391,24 +1414,6 @@ export default function ImageEditor({ onDesignUploaded }: { onDesignUploaded?: (
       } else {
         // Standard download - shape background or contour outline
         const nameWithoutExt = imageInfo.file.name.replace(/\.[^/.]+$/, '');
-
-        // If QR codes were detected, replace the raster layer with a crisp re-render
-        // at the target print resolution so modules stay sharp in the PDF output.
-        let exportImage = imageInfo.image;
-        if (detectedQRs.length > 0) {
-          const targetW = Math.round(resizeSettings.widthInches * 300);
-          const targetH = Math.round(resizeSettings.heightInches * 300);
-          try {
-            exportImage = await renderImageElementWithCrispQRs(imageInfo.image, {
-              destWidth: targetW,
-              destHeight: targetH,
-              qrCodes: detectedQRs,
-            });
-            console.log(`[QR] Replaced ${detectedQRs.length} QR region(s) with crisp render at ${targetW}x${targetH}`);
-          } catch (e) {
-            console.warn('[QR] QR-safe render failed, using original:', e);
-          }
-        }
         
         if (strokeSettings.enabled) {
           // Contour mode: Download PDF with raster image + vector contour
@@ -1419,7 +1424,7 @@ export default function ImageEditor({ onDesignUploaded }: { onDesignUploaded?: (
           const cachedData = workerManager.getCachedContourData() as CachedContourData | undefined;
           
           await downloadContourPDF(
-            exportImage,
+            imageInfo.image,
             strokeSettings,
             resizeSettings,
             filename,
@@ -1427,13 +1432,14 @@ export default function ImageEditor({ onDesignUploaded }: { onDesignUploaded?: (
             spotColors,
             singleArtboard,
             cutContourLabel,
-            lockedContour ? { label: lockedContour.label, pathPoints: lockedContour.pathPoints, allPathPoints: lockedContour.allPathPoints, widthInches: lockedContour.widthInches, heightInches: lockedContour.heightInches } : null
+            lockedContour ? { label: lockedContour.label, pathPoints: lockedContour.pathPoints, allPathPoints: lockedContour.allPathPoints, widthInches: lockedContour.widthInches, heightInches: lockedContour.heightInches } : null,
+            { qrCodes: imageInfo.qrCodes, enabled: imageInfo.qrRerenderEnabled === true }
           );
         } else if (shapeSettings.enabled) {
           // Shape background mode: Download PDF with shape + CutContour spot color
           const filename = `${nameWithoutExt}_with_shape.pdf`;
           await downloadShapePDF(
-            exportImage,
+            imageInfo.image,
             shapeSettings,
             resizeSettings,
             filename,
@@ -1597,37 +1603,72 @@ export default function ImageEditor({ onDesignUploaded }: { onDesignUploaded?: (
               </div>
             )}
 
-            {imageInfo && (isDetectingQR || detectedQRs.length > 0 || qrScanDone) && (
-              <div className={`flex items-center gap-1.5 px-2.5 py-1.5 rounded-lg border text-[10px] font-medium transition-all ${
-                isDetectingQR
-                  ? 'bg-amber-50 border-amber-200 text-amber-700'
-                  : detectedQRs.length > 0
-                    ? 'bg-emerald-50 border-emerald-200 text-emerald-700'
-                    : 'bg-gray-50 border-gray-200 text-gray-500'
-              }`}>
-                {isDetectingQR ? (
-                  <>
-                    <svg className="w-3.5 h-3.5 animate-spin" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><path d="M12 2v4M12 18v4M4.93 4.93l2.83 2.83M16.24 16.24l2.83 2.83M2 12h4M18 12h4M4.93 19.07l2.83-2.83M16.24 7.76l2.83-2.83"/></svg>
-                    <span>Scanning QR…</span>
-                  </>
-                ) : detectedQRs.length > 0 ? (
-                  <>
-                    <svg className="w-3.5 h-3.5" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
-                      <rect x="3" y="3" width="7" height="7" rx="1"/><rect x="14" y="3" width="7" height="7" rx="1"/>
-                      <rect x="3" y="14" width="7" height="7" rx="1"/><rect x="14" y="14" width="7" height="7" rx="1"/>
+            {imageInfo && (
+              /*
+                QR badge — three states:
+                  1. Detection hasn't completed yet → subtle gray "Scanning…"
+                  2. Detection done, 0 codes found    → amber "0 QRs · Re-scan" (clickable, force-rescans)
+                  3. Detection done, 1+ codes found   → grey "N QRs · raw · click to fix"
+                     (default OFF). Click toggles to green "N QRs · crisp · click to undo".
+                Re-render is OPT-IN per user request: detection runs
+                automatically, but the QR is only replaced when the user
+                clicks the badge. Avoids quietly altering a clean QR.
+              */
+              imageInfo.qrDetectionRan ? (
+                imageInfo.qrCodes && imageInfo.qrCodes.length > 0 ? (
+                  <button
+                    type="button"
+                    onClick={() => setImageInfo((cur) => cur ? { ...cur, qrRerenderEnabled: !cur.qrRerenderEnabled } : cur)}
+                    title={
+                      imageInfo.qrRerenderEnabled
+                        ? `Crisp QR re-render is ON for ${imageInfo.qrCodes.length} QR code${imageInfo.qrCodes.length === 1 ? '' : 's'}.\nThe preview and PDF export will replace the source QR pixels with fresh, scanner-optimised vector modules at print resolution. Any centred logo is preserved by carving it out of the wipe.\nClick to undo (use the original QR pixels as-is).\n\nPayload${imageInfo.qrCodes.length === 1 ? '' : 's'}:\n${imageInfo.qrCodes.map((q) => '• ' + q.payload).join('\n')}`
+                        : `${imageInfo.qrCodes.length} QR code${imageInfo.qrCodes.length === 1 ? '' : 's'} detected — currently NOT being re-rendered (the source pixels will print as-is and may be blurry at small sizes).\nClick to enable crisp vector re-render: forces square modules + horizontal run-merge for clean ink prints, preserves any centred logo.\n\nPayload${imageInfo.qrCodes.length === 1 ? '' : 's'}:\n${imageInfo.qrCodes.map((q) => '• ' + q.payload).join('\n')}`
+                    }
+                    className={`flex items-center gap-1.5 px-2 py-1 rounded-md border text-[10px] font-medium transition-colors ${
+                      imageInfo.qrRerenderEnabled
+                        ? 'bg-emerald-50 border-emerald-200 text-emerald-700 hover:bg-emerald-100'
+                        : 'bg-slate-50 border-slate-200 text-slate-600 hover:bg-slate-100'
+                    }`}
+                  >
+                    <svg className="w-3 h-3" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                      <rect x="3" y="3" width="7" height="7"/>
+                      <rect x="14" y="3" width="7" height="7"/>
+                      <rect x="3" y="14" width="7" height="7"/>
+                      <rect x="14" y="14" width="3" height="3"/>
+                      <rect x="18" y="18" width="3" height="3"/>
                     </svg>
-                    <span>QR Safe ({detectedQRs.length})</span>
-                  </>
+                    <span>
+                      {imageInfo.qrCodes.length} QR{imageInfo.qrCodes.length === 1 ? '' : 's'}
+                      {imageInfo.qrRerenderEnabled ? ' · crisp · click to undo' : ' · click to fix'}
+                    </span>
+                  </button>
                 ) : (
-                  <>
-                    <svg className="w-3.5 h-3.5" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
-                      <rect x="3" y="3" width="7" height="7" rx="1"/><rect x="14" y="3" width="7" height="7" rx="1"/>
-                      <rect x="3" y="14" width="7" height="7" rx="1"/><rect x="14" y="14" width="7" height="7" rx="1"/>
+                  <button
+                    type="button"
+                    onClick={() => imageInfo.image && runQRDetection(imageInfo.image, { force: true, toastOnEmpty: true })}
+                    title="No QR codes found in this design. Click to re-scan — useful if a centre logo, low contrast, or stylised dots defeated the first pass. Vector QR re-render in PDF exports kicks in only when at least one QR is detected."
+                    className="flex items-center gap-1.5 px-2 py-1 rounded-md border border-amber-200 bg-amber-50 text-amber-700 text-[10px] font-medium hover:bg-amber-100 transition-colors"
+                  >
+                    <svg className="w-3 h-3" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                      <rect x="3" y="3" width="7" height="7"/>
+                      <rect x="14" y="3" width="7" height="7"/>
+                      <rect x="3" y="14" width="7" height="7"/>
+                      <line x1="14" y1="14" x2="21" y2="21"/>
                     </svg>
-                    <span>No QR found</span>
-                  </>
-                )}
-              </div>
+                    <span>0 QRs · Re-scan</span>
+                  </button>
+                )
+              ) : (
+                <div
+                  className="flex items-center gap-1.5 px-2 py-1 rounded-md border border-gray-200 bg-gray-50 text-gray-500 text-[10px] font-medium"
+                  title="Scanning the design for QR codes…"
+                >
+                  <svg className="w-3 h-3 animate-spin" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+                    <path d="M12 2v4M12 18v4M4.93 4.93l2.83 2.83M16.24 16.24l2.83 2.83M2 12h4M18 12h4M4.93 19.07l2.83-2.83M16.24 7.76l2.83-2.83" />
+                  </svg>
+                  <span>Scanning QRs…</span>
+                </div>
+              )
             )}
 
             <div className="flex-1"></div>
@@ -1795,7 +1836,8 @@ export default function ImageEditor({ onDesignUploaded }: { onDesignUploaded?: (
                         resizeSettings,
                         `${nameWithoutExt}.pdf`,
                         args.spotColors,
-                        args.singleArtboard
+                        args.singleArtboard,
+                        { qrCodes: imageInfo.qrCodes, enabled: imageInfo.qrRerenderEnabled === true }
                       );
                     } else {
                       const dpi = 300;

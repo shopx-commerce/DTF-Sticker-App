@@ -10,6 +10,7 @@ import { processContourInWorker, type DetectedAlgorithm, type DetectedShapeInfo 
 import { calculateShapeDimensions } from "@/lib/shape-outline";
 import { cropImageToContent, getImageBounds } from "@/lib/image-crop";
 import { convertPolygonToCurves, gaussianSmoothContour } from "@/lib/clipper-path";
+import { drawVectorQRsOnCanvas2D } from "@/lib/qr";
 
 interface PreviewSectionProps {
   imageInfo: ImageInfo | null;
@@ -1335,6 +1336,35 @@ const PreviewSection = forwardRef<HTMLCanvasElement, PreviewSectionProps>(
       lastSettingsRef.current = settingsKey;
     }, [imageInfo, strokeSettings.enabled, strokeSettings.width, shapeSettings.enabled, shapeSettings.type, resizeSettings.widthInches]);
 
+    // Overlay crisp vector QRs onto a canvas region so the preview matches
+    // the exported PDF. Skipped silently when QR codes haven't been
+    // detected, when the user hasn't opted in (`qrRerenderEnabled`), or
+    // when the image rect is degenerate. Same source-aware appearance
+    // pipeline as `drawVectorQRsOnPage` (PDF side) — module shape,
+    // dark/light colours, and any centred-logo region are sampled from
+    // the source raster and respected.
+    const overlayQRsOnCanvasRect = (
+      ctx: CanvasRenderingContext2D,
+      sourceImage: HTMLImageElement | HTMLCanvasElement,
+      imageRect: { x: number; y: number; width: number; height: number },
+    ) => {
+      if (!imageInfo?.qrCodes || imageInfo.qrCodes.length === 0) return;
+      if (imageInfo.qrRerenderEnabled !== true) return;
+      if (imageRect.width <= 0 || imageRect.height <= 0) return;
+      const srcW = (sourceImage as HTMLImageElement).naturalWidth || sourceImage.width;
+      const srcH = (sourceImage as HTMLImageElement).naturalHeight || sourceImage.height;
+      if (srcW <= 0 || srcH <= 0) return;
+      drawVectorQRsOnCanvas2D(
+        ctx,
+        imageInfo.qrCodes,
+        imageRect,
+        srcW,
+        srcH,
+        sourceImage,
+        { errorCorrectionLevel: 'H' },
+      );
+    };
+
     const drawShapePreview = (ctx: CanvasRenderingContext2D, canvasWidth: number, canvasHeight: number) => {
       if (!imageInfo) return;
 
@@ -1460,6 +1490,9 @@ const PreviewSection = forwardRef<HTMLCanvasElement, PreviewSectionProps>(
       buildPath(ctx, shapeWidth, shapeHeight, shapeX, shapeY, cornerRadiusPx);
       ctx.clip();
       ctx.drawImage(sourceImage, imageX, imageY, imageWidth, imageHeight);
+      // Overlay crisp vector QRs *inside* the clip + rotation transform so
+      // they follow the cropped/rotated raster. Matches the PDF export.
+      overlayQRsOnCanvasRect(ctx, sourceImage, { x: imageX, y: imageY, width: imageWidth, height: imageHeight });
       lastImageRenderRef.current = { x: imageX, y: imageY, width: imageWidth, height: imageHeight };
 
       if (segmentationData?.mode === 'items') {
@@ -1568,12 +1601,17 @@ const PreviewSection = forwardRef<HTMLCanvasElement, PreviewSectionProps>(
           const _imgY = contourCacheRef.current?.imageCanvasY ?? 0;
           const _scaleX = contourWidth / contourCanvas.width;
           const _scaleY = contourHeight / contourCanvas.height;
-          lastImageRenderRef.current = {
+          const imageRectOnCanvas = {
             x: contourX + (_imgX * _scaleX),
             y: contourY + (_imgY * _scaleY),
             width: dsWidth * _scaleX,
             height: dsHeight * _scaleY,
           };
+          lastImageRenderRef.current = imageRectOnCanvas;
+          // Overlay crisp vector QRs *over* the worker's rasterised
+          // contour preview at the same image rect so the on-screen QRs
+          // match what the PDF export bakes in.
+          overlayQRsOnCanvasRect(ctx, imageInfo.image, imageRectOnCanvas);
         }
         
         if (segmentationData?.mode === 'items') {
@@ -1631,6 +1669,12 @@ const PreviewSection = forwardRef<HTMLCanvasElement, PreviewSectionProps>(
         
         const previewImg = getPreviewImage();
         ctx.drawImage(previewImg, displayX, displayY, displayWidth, displayHeight);
+        // Crisp vector QR overlay matching PDF export. We use the live
+        // `imageInfo.image` (not `previewImg`) for appearance sampling
+        // because the QR bbox coords are in the source-image pixel space,
+        // and `imageInfo.image` is the canonical source the QR detector
+        // ran against.
+        overlayQRsOnCanvasRect(ctx, imageInfo.image, { x: displayX, y: displayY, width: displayWidth, height: displayHeight });
         lastImageRenderRef.current = { x: displayX, y: displayY, width: displayWidth, height: displayHeight };
 
         if (segmentationData?.mode === 'items') {
