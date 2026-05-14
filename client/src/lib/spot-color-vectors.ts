@@ -89,40 +89,60 @@ function traceColorRegionsAsync(
 
     let imageData: ImageData;
 
+    // Always draw the actual image at export resolution — needed for real pixel color validation.
+    const canvas = document.createElement('canvas');
+    canvas.width = cW;
+    canvas.height = cH;
+    const ctx = canvas.getContext('2d');
+    if (!ctx) { console.warn('[SpotColor] Canvas context creation failed'); resolve([]); return; }
+    ctx.drawImage(image, 0, 0, cW, cH);
+    const actualImageData = ctx.getImageData(0, 0, cW, cH);
+
     if (spotPixelMap && spotPixelMap.pixelMap.length > 0) {
-      // Build pixel data from the color-extractor's pixelMap for exact preview matching.
-      // Each export pixel is painted with its extracted color's exact RGB via nearest-neighbor
-      // lookup — no bilinear interpolation, no blended edge pixels.
-      // The worker's Euclidean distance then gets dist=0 for every assigned pixel → perfect match.
+      // Dual-verification approach:
+      // 1. Use the pixelMap to determine which color owns each pixel (exact preview match)
+      // 2. Also check the actual image pixel is genuinely close to that color
+      //    This filters out dark "bridge" pixels that the color extractor loosely classified
+      //    as a spot color but that are visually hidden behind other design elements.
       const { pixelMap, mapWidth, mapHeight } = spotPixelMap;
       const rawData = new Uint8ClampedArray(cW * cH * 4);
+      // Tight Euclidean threshold: must be genuinely close to the extracted color,
+      // not just the closest of many distant options. sqrt(3)*45 ≈ 78; use 65 for safety.
+      const TIGHT_TOL_SQ = 65 * 65;
+
       for (let y = 0; y < cH; y++) {
         const srcY = Math.min(Math.floor(y * mapHeight / cH), mapHeight - 1);
         for (let x = 0; x < cW; x++) {
           const srcX = Math.min(Math.floor(x * mapWidth / cW), mapWidth - 1);
           const colorIdx = pixelMap[srcY * mapWidth + srcX];
           const di = (y * cW + x) * 4;
-          if (colorIdx >= 0 && colorIdx < spotColors.length) {
-            const color = spotColors[colorIdx];
-            rawData[di]     = color.rgb.r;
-            rawData[di + 1] = color.rgb.g;
-            rawData[di + 2] = color.rgb.b;
-            rawData[di + 3] = 255;
-          }
-          // else: transparent / unassigned — alpha stays 0, worker skips (alpha < alphaThreshold)
+          if (colorIdx < 0 || colorIdx >= spotColors.length) continue;
+
+          // Check actual image pixel is genuinely close to the extracted color
+          const aR = actualImageData.data[di];
+          const aG = actualImageData.data[di + 1];
+          const aB = actualImageData.data[di + 2];
+          const aA = actualImageData.data[di + 3];
+          if (aA < 128) continue; // transparent pixel — skip
+
+          const color = spotColors[colorIdx];
+          const dr = aR - color.rgb.r;
+          const dg = aG - color.rgb.g;
+          const db = aB - color.rgb.b;
+          if (dr * dr + dg * dg + db * db > TIGHT_TOL_SQ) continue; // too dark/different — skip bridge pixel
+
+          // Paint with exact extracted color RGB so worker distance = 0 → clean mask
+          rawData[di]     = color.rgb.r;
+          rawData[di + 1] = color.rgb.g;
+          rawData[di + 2] = color.rgb.b;
+          rawData[di + 3] = 255;
         }
       }
       imageData = new ImageData(rawData, cW, cH);
-      console.log(`[SpotColor] Built ${cW}x${cH} canvas from pixelMap (exact preview match)`);
+      console.log(`[SpotColor] Built ${cW}x${cH} canvas from pixelMap + actual image validation`);
     } else {
-      // Fallback: draw image at export resolution when no pixelMap is available
-      const canvas = document.createElement('canvas');
-      canvas.width = cW;
-      canvas.height = cH;
-      const ctx = canvas.getContext('2d');
-      if (!ctx) { console.warn('[SpotColor] Canvas context creation failed'); resolve([]); return; }
-      ctx.drawImage(image, 0, 0, cW, cH);
-      imageData = ctx.getImageData(0, 0, cW, cH);
+      // No pixelMap: use actual image data directly
+      imageData = actualImageData;
       console.log(`[SpotColor] Drew image at ${cW}x${cH} (no pixelMap — fallback mode)`);
     }
 
