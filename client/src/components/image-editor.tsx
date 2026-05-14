@@ -13,6 +13,7 @@ import { downloadShapePDF, calculateShapeDimensions, generateShapePathPointsInch
 import { useDebouncedValue } from "@/hooks/use-debounce";
 import { removeBackgroundFromImage } from "@/lib/background-removal";
 import { magicWandErase } from "@/lib/magic-wand";
+import { detectQRsInImage, renderImageElementWithCrispQRs, type DetectedQR } from "@/lib/qr";
 import type { ParsedPDFData } from "@/lib/pdf-parser";
 import { detectShape, mapDetectedShapeToType } from "@/lib/shape-detection";
 import { useToast } from "@/hooks/use-toast";
@@ -95,6 +96,8 @@ export default function ImageEditor({ onDesignUploaded }: { onDesignUploaded?: (
   const [gangSheetSettings, setGangSheetSettings] = useState<GangSheetSettings>(DEFAULT_GANG_SHEET_SETTINGS);
   const [spotPaintMode, setSpotPaintMode] = useState<'white' | 'gloss' | 'both' | 'clear' | null>(null);
   const [pendingSpotPaint, setPendingSpotPaint] = useState<{ colorIndex: number; regionId: number | null; mode: string; id: number } | null>(null);
+  const [detectedQRs, setDetectedQRs] = useState<DetectedQR[]>([]);
+  const [isDetectingQR, setIsDetectingQR] = useState(false);
   
   const canvasRef = useRef<HTMLCanvasElement>(null);
 
