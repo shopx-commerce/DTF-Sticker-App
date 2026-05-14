@@ -801,8 +801,8 @@ export function drawVectorQRsOnCanvas2D(
     // Defaults are tighter than QR spec (4 modules) — most scanners decode
     // fine at 1 module of quiet zone, and a smaller halo keeps the QR from
     // bleeding visible white into the surrounding design.
-    const quietZoneModules = options.quietZoneModules ?? 1;
-    const quietZoneFraction = options.quietZoneFraction ?? 0.02;
+    const quietZoneModules = options.quietZoneModules ?? 0;
+    const quietZoneFraction = options.quietZoneFraction ?? 0;
     const haloPx = Math.max(
       quietZoneModules * Math.min(moduleW, moduleH),
       quietZoneFraction * Math.min(destW, destH),
