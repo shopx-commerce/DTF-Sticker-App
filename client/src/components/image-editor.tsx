@@ -1547,7 +1547,10 @@ export default function ImageEditor({ onDesignUploaded }: { onDesignUploaded?: (
             setHighlightWithTimer({ colorIndex, regionId });
           }}
           spotPaintMode={spotPaintMode}
-          onSpotPaintModeChange={setSpotPaintMode}
+          onSpotPaintModeChange={(mode) => {
+            setSpotPaintMode(mode);
+            if (mode) setMagicWandMode(false);
+          }}
           pendingSpotPaint={pendingSpotPaint}
           onSpotPaintApplied={() => setPendingSpotPaint(null)}
           spotColorRestore={spotColorRestore}
@@ -1577,7 +1580,11 @@ export default function ImageEditor({ onDesignUploaded }: { onDesignUploaded?: (
 
             {imageInfo && (
               <button
-                onClick={() => setMagicWandMode(prev => !prev)}
+                onClick={() => {
+                  const next = !magicWandMode;
+                  setMagicWandMode(next);
+                  if (next) setSpotPaintMode(null);
+                }}
                 disabled={isRemovingBackground || isMagicWandRunning}
                 className={`group relative flex items-center gap-2 px-4 py-2 rounded-lg text-xs font-semibold whitespace-nowrap text-white shadow-md disabled:opacity-50 overflow-hidden transition-all duration-200 active:scale-[0.95] active:shadow-sm ${magicWandMode
                   ? 'bg-gradient-to-r from-fuchsia-600 to-pink-600 hover:from-fuchsia-700 hover:to-pink-700 ring-2 ring-fuchsia-300'
