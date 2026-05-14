@@ -493,6 +493,10 @@ export default function GangSheetPanel({
         }
 
         // -- Magenta cut-line stroke (matches PDF spot color visually) -------
+        // Spot-color-only items have no cut path in the PDF, so we must
+        // not draw one in the preview either — otherwise users see a
+        // magenta rectangle that won't actually be cut.
+        if (!item.noCutPath) {
         ctx.strokeStyle = "#FF00FF";
         ctx.lineWidth = 1;
         ctx.lineJoin = "round";
@@ -517,6 +521,7 @@ export default function GangSheetPanel({
           }
         } else {
           ctx.strokeRect(rx, ry, rw, rh);
+        }
         }
       }
 
