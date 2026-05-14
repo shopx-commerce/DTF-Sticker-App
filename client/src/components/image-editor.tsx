@@ -1624,22 +1624,23 @@ export default function ImageEditor({ onDesignUploaded }: { onDesignUploaded?: (
                         ? `Crisp QR re-render is ON for ${imageInfo.qrCodes.length} QR code${imageInfo.qrCodes.length === 1 ? '' : 's'}.\nThe preview and PDF export will replace the source QR pixels with fresh, scanner-optimised vector modules at print resolution. Any centred logo is preserved by carving it out of the wipe.\nClick to undo (use the original QR pixels as-is).\n\nPayload${imageInfo.qrCodes.length === 1 ? '' : 's'}:\n${imageInfo.qrCodes.map((q) => '• ' + q.payload).join('\n')}`
                         : `${imageInfo.qrCodes.length} QR code${imageInfo.qrCodes.length === 1 ? '' : 's'} detected — currently NOT being re-rendered (the source pixels will print as-is and may be blurry at small sizes).\nClick to enable crisp vector re-render: forces square modules + horizontal run-merge for clean ink prints, preserves any centred logo.\n\nPayload${imageInfo.qrCodes.length === 1 ? '' : 's'}:\n${imageInfo.qrCodes.map((q) => '• ' + q.payload).join('\n')}`
                     }
-                    className={`flex items-center gap-1.5 px-2 py-1 rounded-md border text-[10px] font-medium transition-colors ${
+                    className={`group relative flex items-center gap-2 px-4 py-2 rounded-lg text-xs font-semibold whitespace-nowrap text-white shadow-md overflow-hidden transition-all duration-200 active:scale-[0.95] active:shadow-sm ${
                       imageInfo.qrRerenderEnabled
-                        ? 'bg-emerald-50 border-emerald-200 text-emerald-700 hover:bg-emerald-100'
-                        : 'bg-slate-50 border-slate-200 text-slate-600 hover:bg-slate-100'
+                        ? 'bg-gradient-to-r from-emerald-500 to-teal-500 hover:from-emerald-600 hover:to-teal-600 hover:shadow-lg hover:shadow-emerald-200 ring-2 ring-emerald-300'
+                        : 'bg-gradient-to-r from-indigo-500 to-violet-500 hover:from-indigo-600 hover:to-violet-600 hover:shadow-lg hover:shadow-indigo-200'
                     }`}
                   >
-                    <svg className="w-3 h-3" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                    <span className="absolute inset-0 bg-white/20 translate-y-full group-hover:translate-y-0 transition-transform duration-300 ease-out rounded-lg"></span>
+                    <svg className="relative w-4 h-4 transition-transform duration-200 group-hover:scale-110" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
                       <rect x="3" y="3" width="7" height="7"/>
                       <rect x="14" y="3" width="7" height="7"/>
                       <rect x="3" y="14" width="7" height="7"/>
                       <rect x="14" y="14" width="3" height="3"/>
                       <rect x="18" y="18" width="3" height="3"/>
                     </svg>
-                    <span>
+                    <span className="relative">
                       {imageInfo.qrCodes.length} QR{imageInfo.qrCodes.length === 1 ? '' : 's'}
-                      {imageInfo.qrRerenderEnabled ? ' · crisp · click to undo' : ' · click to fix'}
+                      {imageInfo.qrRerenderEnabled ? ' · Crisp ✓' : ' · Fix QR'}
                     </span>
                   </button>
                 ) : (
@@ -1647,23 +1648,24 @@ export default function ImageEditor({ onDesignUploaded }: { onDesignUploaded?: (
                     type="button"
                     onClick={() => imageInfo.image && runQRDetection(imageInfo.image, { force: true, toastOnEmpty: true })}
                     title="No QR codes found in this design. Click to re-scan — useful if a centre logo, low contrast, or stylised dots defeated the first pass. Vector QR re-render in PDF exports kicks in only when at least one QR is detected."
-                    className="flex items-center gap-1.5 px-2 py-1 rounded-md border border-amber-200 bg-amber-50 text-amber-700 text-[10px] font-medium hover:bg-amber-100 transition-colors"
+                    className="group relative flex items-center gap-2 px-4 py-2 rounded-lg text-xs font-semibold whitespace-nowrap text-white shadow-md overflow-hidden transition-all duration-200 bg-gradient-to-r from-amber-500 to-orange-500 hover:from-amber-600 hover:to-orange-600 hover:shadow-lg hover:shadow-amber-200 active:scale-[0.95] active:shadow-sm"
                   >
-                    <svg className="w-3 h-3" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                    <span className="absolute inset-0 bg-white/20 translate-y-full group-hover:translate-y-0 transition-transform duration-300 ease-out rounded-lg"></span>
+                    <svg className="relative w-4 h-4 transition-transform duration-200 group-hover:scale-110" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
                       <rect x="3" y="3" width="7" height="7"/>
                       <rect x="14" y="3" width="7" height="7"/>
                       <rect x="3" y="14" width="7" height="7"/>
                       <line x1="14" y1="14" x2="21" y2="21"/>
                     </svg>
-                    <span>0 QRs · Re-scan</span>
+                    <span className="relative">Re-scan QR</span>
                   </button>
                 )
               ) : (
                 <div
-                  className="flex items-center gap-1.5 px-2 py-1 rounded-md border border-gray-200 bg-gray-50 text-gray-500 text-[10px] font-medium"
+                  className="flex items-center gap-2 px-4 py-2 rounded-lg text-xs font-semibold whitespace-nowrap text-white/80 shadow-md bg-gradient-to-r from-slate-400 to-slate-500 opacity-70"
                   title="Scanning the design for QR codes…"
                 >
-                  <svg className="w-3 h-3 animate-spin" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+                  <svg className="w-4 h-4 animate-spin" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
                     <path d="M12 2v4M12 18v4M4.93 4.93l2.83 2.83M16.24 16.24l2.83 2.83M2 12h4M18 12h4M4.93 19.07l2.83-2.83M16.24 7.76l2.83-2.83" />
                   </svg>
                   <span>Scanning QRs…</span>
