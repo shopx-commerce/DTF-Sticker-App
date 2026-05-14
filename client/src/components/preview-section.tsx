@@ -1492,7 +1492,11 @@ const PreviewSection = forwardRef<HTMLCanvasElement, PreviewSectionProps>(
       ctx.drawImage(sourceImage, imageX, imageY, imageWidth, imageHeight);
       // Overlay crisp vector QRs *inside* the clip + rotation transform so
       // they follow the cropped/rotated raster. Matches the PDF export.
-      overlayQRsOnCanvasRect(ctx, sourceImage, { x: imageX, y: imageY, width: imageWidth, height: imageHeight });
+      // IMPORTANT: pass the original `imageInfo.image` (not the possibly-downscaled
+      // `sourceImage` from getPreviewImage) — the QR bboxes are stored in original
+      // image pixel coordinates, so the overlay needs the original natural dimensions
+      // to compute the correct scale factor and sample the right pixel colours.
+      overlayQRsOnCanvasRect(ctx, imageInfo.image, { x: imageX, y: imageY, width: imageWidth, height: imageHeight });
       lastImageRenderRef.current = { x: imageX, y: imageY, width: imageWidth, height: imageHeight };
 
       if (segmentationData?.mode === 'items') {
