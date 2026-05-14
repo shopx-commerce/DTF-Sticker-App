@@ -98,6 +98,8 @@ export default function ImageEditor({ onDesignUploaded }: { onDesignUploaded?: (
   const [pendingSpotPaint, setPendingSpotPaint] = useState<{ colorIndex: number; regionId: number | null; mode: string; id: number } | null>(null);
   const [detectedQRs, setDetectedQRs] = useState<DetectedQR[]>([]);
   const [isDetectingQR, setIsDetectingQR] = useState(false);
+  const [qrScanDone, setQrScanDone] = useState(false);
+  const qrScanDoneTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   
   const canvasRef = useRef<HTMLCanvasElement>(null);
 
@@ -493,6 +495,8 @@ export default function ImageEditor({ onDesignUploaded }: { onDesignUploaded?: (
     setDetectedShapeInfo(null);
     setDetectedQRs([]);
     setIsDetectingQR(false);
+    setQrScanDone(false);
+    if (qrScanDoneTimerRef.current) clearTimeout(qrScanDoneTimerRef.current);
     const workerManager = getContourWorkerManager();
     // Important: cancel + clear, in that order. Otherwise any in-flight
     // contour trace would resolve into a now-empty cache slot and
@@ -681,15 +685,25 @@ export default function ImageEditor({ onDesignUploaded }: { onDesignUploaded?: (
 
       // Run QR detection in background — non-blocking
       setDetectedQRs([]);
+      setQrScanDone(false);
       setIsDetectingQR(true);
+      if (qrScanDoneTimerRef.current) clearTimeout(qrScanDoneTimerRef.current);
       detectQRsInImage(finalImage)
         .then(qrCodes => {
           setDetectedQRs(qrCodes);
+          setQrScanDone(true);
           if (qrCodes.length > 0) {
             console.log(`[QR] Detected ${qrCodes.length} QR code(s) in design`);
+          } else {
+            // Auto-dismiss "No QR" badge after 4 seconds
+            qrScanDoneTimerRef.current = setTimeout(() => setQrScanDone(false), 4000);
           }
         })
-        .catch(err => console.warn('[QR] Detection failed:', err))
+        .catch(err => {
+          console.warn('[QR] Detection failed:', err);
+          setQrScanDone(true);
+          qrScanDoneTimerRef.current = setTimeout(() => setQrScanDone(false), 4000);
+        })
         .finally(() => setIsDetectingQR(false));
     } catch (error) {
       console.error('Error processing uploaded image:', error);
@@ -1583,16 +1597,26 @@ export default function ImageEditor({ onDesignUploaded }: { onDesignUploaded?: (
               </div>
             )}
 
-            {imageInfo && (isDetectingQR || detectedQRs.length > 0) && (
-              <div className={`flex items-center gap-1.5 px-2.5 py-1.5 rounded-lg border text-[10px] font-medium transition-colors ${
+            {imageInfo && (isDetectingQR || detectedQRs.length > 0 || qrScanDone) && (
+              <div className={`flex items-center gap-1.5 px-2.5 py-1.5 rounded-lg border text-[10px] font-medium transition-all ${
                 isDetectingQR
                   ? 'bg-amber-50 border-amber-200 text-amber-700'
-                  : 'bg-emerald-50 border-emerald-200 text-emerald-700'
+                  : detectedQRs.length > 0
+                    ? 'bg-emerald-50 border-emerald-200 text-emerald-700'
+                    : 'bg-gray-50 border-gray-200 text-gray-500'
               }`}>
                 {isDetectingQR ? (
                   <>
                     <svg className="w-3.5 h-3.5 animate-spin" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><path d="M12 2v4M12 18v4M4.93 4.93l2.83 2.83M16.24 16.24l2.83 2.83M2 12h4M18 12h4M4.93 19.07l2.83-2.83M16.24 7.76l2.83-2.83"/></svg>
                     <span>Scanning QR…</span>
+                  </>
+                ) : detectedQRs.length > 0 ? (
+                  <>
+                    <svg className="w-3.5 h-3.5" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                      <rect x="3" y="3" width="7" height="7" rx="1"/><rect x="14" y="3" width="7" height="7" rx="1"/>
+                      <rect x="3" y="14" width="7" height="7" rx="1"/><rect x="14" y="14" width="7" height="7" rx="1"/>
+                    </svg>
+                    <span>QR Safe ({detectedQRs.length})</span>
                   </>
                 ) : (
                   <>
@@ -1600,7 +1624,7 @@ export default function ImageEditor({ onDesignUploaded }: { onDesignUploaded?: (
                       <rect x="3" y="3" width="7" height="7" rx="1"/><rect x="14" y="3" width="7" height="7" rx="1"/>
                       <rect x="3" y="14" width="7" height="7" rx="1"/><rect x="14" y="14" width="7" height="7" rx="1"/>
                     </svg>
-                    <span>QR Safe ({detectedQRs.length})</span>
+                    <span>No QR found</span>
                   </>
                 )}
               </div>
