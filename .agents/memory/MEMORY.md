@@ -1,0 +1,1 @@
+- [PDF CutContour grouping](pdf-cutcontour-grouping.md) — contour PDF wraps bg+art+cut into one Form XObject (= Illustrator group); spot CS now nested in form, white/gloss stay separate.

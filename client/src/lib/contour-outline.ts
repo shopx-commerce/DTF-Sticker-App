@@ -1,5 +1,5 @@
 import type { StrokeSettings, ResizeSettings } from "@/lib/types";
-import { PDFDocument, PDFName, PDFArray, PDFDict, PDFPage, rgb, degrees } from 'pdf-lib';
+import { PDFDocument, PDFName, PDFArray, PDFDict, PDFPage, PDFRef, rgb, degrees } from 'pdf-lib';
 import { removeLoopsWithClipper, ensureClockwise, detectSelfIntersections, gaussianSmoothContour, subsamplePolygon, polygonToSplinePath } from "@/lib/clipper-path";
 import { getContourWorkerManager, type BezierPath } from "@/lib/contour-worker-manager";
 import { addSpotColorVectorsToPDF, type SpotPixelMapData } from "@/lib/spot-color-vectors";
@@ -2469,13 +2469,9 @@ export async function downloadContourPDF(
     // Embed images in PDF as PNG for better quality
     const bgPngImage = await pdfDoc.embedPng(bgPngBytes);
     
-    // Draw the background raster image first
-    page.drawImage(bgPngImage, {
-      x: 0,
-      y: 0,
-      width: widthPts,
-      height: heightPts,
-    });
+    // (The background raster is no longer drawn directly on the page — it is
+    // drawn inside the group Form XObject below so the bleed backing, artwork,
+    // and cut line all import as ONE selectable Illustrator group.)
   
   const pngImage = await pdfDoc.embedPng(pngBytes);
 
@@ -2500,38 +2496,31 @@ export async function downloadContourPDF(
   const imageHeightPts = contourImageH * 72;
   const imageYPts = heightPts - (imageOffsetY * 72) - imageHeightPts;
   
-  page.drawImage(pngImage, {
-    x: imageXPts,
-    y: imageYPts,
-    width: imageWidthPts,
-    height: imageHeightPts,
-  });
-
-  // Paint vector QR modules on top of the embedded design raster.
-  // The raster has the QR area wiped to white (see `createDesignBlob`),
-  // so the vectors land on a clean canvas with no aliasing fight. Modules
-  // are real PDF geometry → crisp at any DPI / zoom / print size, which
-  // is what makes them reliably scannable from small stickers.
-  if (useQRFix) {
-    const result = drawVectorQRsOnPage(
-      page,
-      qrOptions!.qrCodes,
-      { x: imageXPts, y: imageYPts, width: imageWidthPts, height: imageHeightPts },
-      image.naturalWidth || image.width,
-      image.naturalHeight || image.height,
-      image,
-      { errorCorrectionLevel: 'H' }
-    );
-    const styleSummary = result.appearances
-      .map((a) => `${a.shape}${a.logo ? '+logo-preserved' : ''}`)
-      .join(', ');
-    console.log(
-      `[downloadContourPDF] Vector QR overlay: drew ${result.drawn} crisp QR(s) [${styleSummary}]` +
-        (result.skipped > 0 ? `, skipped ${result.skipped} (rotation/aspect/encoding)` : '')
-    );
-  }
-
+  // ── Group bleed backing + design image + cut contour(s) into ONE group ──
+  // Everything visual is accumulated into a single PDF Form XObject. Adobe
+  // Illustrator imports a Form XObject as a Group, so the artwork and the
+  // CutContour cut line(s) import selected/moved together. Spot-color
+  // white/gloss separations are still added separately afterwards (they are
+  // production layers, not part of the art group).
   const context = pdfDoc.context;
+
+  let groupContent = '';
+  const groupXObjects: Record<string, PDFRef> = {};
+  const groupColorSpaces: Record<string, PDFRef> = {};
+
+  // Bleed background (full page), drawn first so it sits behind the art.
+  const bgImgName = 'ImBg';
+  groupXObjects[bgImgName] = bgPngImage.ref;
+  groupContent +=
+    `q\n${widthPts.toFixed(4)} 0 0 ${heightPts.toFixed(4)} 0 0 cm\n/${bgImgName} Do\nQ\n`;
+
+  // Design raster. Matches pdf-lib's drawImage transform:
+  //   `width 0 0 height x y cm  /Name Do`.
+  const designImgName = 'ImDesign';
+  groupXObjects[designImgName] = pngImage.ref;
+  groupContent +=
+    `q\n${imageWidthPts.toFixed(4)} 0 0 ${imageHeightPts.toFixed(4)} ` +
+    `${imageXPts.toFixed(4)} ${imageYPts.toFixed(4)} cm\n/${designImgName} Do\nQ\n`;
   
   if (pathPoints.length > 2) {
     
@@ -2551,16 +2540,7 @@ export async function downloadContourPDF(
       tintFunctionRef,
     ]);
     const separationRef = context.register(separationColorSpace);
-    
-    const resources = page.node.Resources();
-    if (resources) {
-      let colorSpaceDict = resources.get(PDFName.of('ColorSpace'));
-      if (!colorSpaceDict) {
-        colorSpaceDict = context.obj({});
-        resources.set(PDFName.of('ColorSpace'), colorSpaceDict);
-      }
-      (colorSpaceDict as PDFDict).set(PDFName.of(cutContourLabel), separationRef);
-    }
+    groupColorSpaces[cutContourLabel] = separationRef;
     
     // Generate CutContour path operations — multiple paths for zero hero mode.
     // For Zero Hero (strokeSettings.width === 0) the contour is already a
@@ -2592,24 +2572,11 @@ export async function downloadContourPDF(
     }
     void emitMode;
 
-    if (combinedPathOps.length > 0) {
-      const existingContents = page.node.Contents();
-      if (existingContents) {
-        const contentStream = context.stream(combinedPathOps);
-        const contentStreamRef = context.register(contentStream);
-        
-        if (existingContents instanceof PDFArray) {
-          existingContents.push(contentStreamRef);
-        } else {
-          const newContents = context.obj([existingContents, contentStreamRef]);
-          page.node.set(PDFName.of('Contents'), newContents);
-        }
-      }
-    }
+    groupContent += combinedPathOps;
   }
   
   if (lockedContour && lockedContour.pathPoints.length > 2) {
-    if (lockedContour.label !== cutContourLabel) {
+    if (!groupColorSpaces[lockedContour.label]) {
       const lockedTintFunction = context.obj({
         FunctionType: 2,
         Domain: [0, 1],
@@ -2625,17 +2592,7 @@ export async function downloadContourPDF(
         PDFName.of('DeviceCMYK'),
         lockedTintRef,
       ]);
-      const lockedSepRef = context.register(lockedSepCS);
-      
-      const resources = page.node.Resources();
-      if (resources) {
-        let colorSpaceDict = resources.get(PDFName.of('ColorSpace'));
-        if (!colorSpaceDict) {
-          colorSpaceDict = context.obj({});
-          resources.set(PDFName.of('ColorSpace'), colorSpaceDict);
-        }
-        (colorSpaceDict as PDFDict).set(PDFName.of(lockedContour.label), lockedSepRef);
-      }
+      groupColorSpaces[lockedContour.label] = context.register(lockedSepCS);
     }
     
     const lockedPathsToEmit = lockedContour.allPathPoints && lockedContour.allPathPoints.length > 0
@@ -2644,21 +2601,71 @@ export async function downloadContourPDF(
     for (const lp of lockedPathsToEmit) {
       lockedPathOps += contourPointsToPDFPathOps(lp, heightInches, lockedContour.label);
     }
+    groupContent += lockedPathOps;
+  }
 
-    if (lockedPathOps.length > 0) {
-      const existingContents = page.node.Contents();
-      if (existingContents) {
-        const contentStream = context.stream(lockedPathOps);
-        const contentStreamRef = context.register(contentStream);
-        
-        if (existingContents instanceof PDFArray) {
-          existingContents.push(contentStreamRef);
-        } else {
-          const newContents = context.obj([existingContents, contentStreamRef]);
-          page.node.set(PDFName.of('Contents'), newContents);
-        }
-      }
+  // ── Wrap everything accumulated into a single Form XObject, draw it once ──
+  // The Form XObject imports into Illustrator as one selectable group holding
+  // the bleed backing, the design raster, and the cut contour(s).
+  {
+    let pageResources = page.node.Resources();
+    if (!pageResources) {
+      pageResources = context.obj({}) as PDFDict;
+      page.node.set(PDFName.of('Resources'), pageResources);
     }
+
+    const formResources = context.obj({
+      XObject: groupXObjects,
+      ColorSpace: groupColorSpaces,
+    });
+    const formXObject = context.stream(groupContent, {
+      Type: PDFName.of('XObject'),
+      Subtype: PDFName.of('Form'),
+      FormType: 1,
+      BBox: context.obj([0, 0, widthPts, heightPts]),
+      Resources: formResources,
+    });
+    const formRef = context.register(formXObject);
+
+    let xobjDict = pageResources.lookup(PDFName.of('XObject'), PDFDict) as PDFDict | undefined;
+    if (!xobjDict) {
+      xobjDict = context.obj({}) as PDFDict;
+      pageResources.set(PDFName.of('XObject'), xobjDict);
+    }
+    xobjDict.set(PDFName.of('ArtCutGroup'), formRef);
+
+    const drawFormStream = context.stream('q\n/ArtCutGroup Do\nQ\n');
+    const drawFormRef = context.register(drawFormStream);
+    const existingContents = page.node.Contents();
+    if (existingContents instanceof PDFArray) {
+      existingContents.push(drawFormRef);
+    } else if (existingContents) {
+      page.node.set(PDFName.of('Contents'), context.obj([existingContents, drawFormRef]));
+    } else {
+      page.node.set(PDFName.of('Contents'), context.obj([drawFormRef]));
+    }
+  }
+
+  // Vector QR overlay — drawn on the page ABOVE the group so crisp QR modules
+  // sit on top of the design raster. (Same behaviour as before; ordered after
+  // the group so the z-order is preserved.)
+  if (useQRFix) {
+    const result = drawVectorQRsOnPage(
+      page,
+      qrOptions!.qrCodes,
+      { x: imageXPts, y: imageYPts, width: imageWidthPts, height: imageHeightPts },
+      image.naturalWidth || image.width,
+      image.naturalHeight || image.height,
+      image,
+      { errorCorrectionLevel: 'H' }
+    );
+    const styleSummary = result.appearances
+      .map((a) => `${a.shape}${a.logo ? '+logo-preserved' : ''}`)
+      .join(', ');
+    console.log(
+      `[downloadContourPDF] Vector QR overlay: drew ${result.drawn} crisp QR(s) [${styleSummary}]` +
+        (result.skipped > 0 ? `, skipped ${result.skipped} (rotation/aspect/encoding)` : '')
+    );
   }
   
   if (spotColors && spotColors.length > 0) {
