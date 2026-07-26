@@ -40,6 +40,14 @@ interface WorkerMessage {
   fullAlphaMask?: ArrayBuffer;
   allTaggedWhite?: boolean;
   allTaggedGloss?: boolean;
+  /**
+   * True when the imageBuffer was painted directly from the pixelMap +
+   * region selection (exact preview match). In that case the pixel data IS
+   * the selection: skip morphological closing (it merges scattered fine
+   * detail into blobs the preview never showed) and use a tiny noise floor
+   * so small selected features survive to the PDF.
+   */
+  exactSelection?: boolean;
 }
 
 interface WorkerResponse {
@@ -426,6 +434,9 @@ function chaikinSmooth(pts: Point[], iterations: number): Point[] {
 // Pre-filter in pixel space before any expensive processing.
 // 200 sq-px ≈ a 14×14 region — anything smaller is noise.
 const MIN_PIXEL_AREA = 200;
+// When the mask is an exact user selection (pixelMap path), tiny contours
+// are intentional detail, not noise — keep nearly everything.
+const MIN_PIXEL_AREA_EXACT = 4;
 // Holes get a much lower floor: dropping a small hole while its outer
 // contour survives would flood the counter solid under even-odd fill
 // (e.g. the inside of a small "o" or "e" at 300 DPI).
@@ -438,8 +449,12 @@ function traceMaskToInchPaths(
   mask: Uint8Array,
   width: number,
   height: number,
-  pixelsPerInch: number
+  pixelsPerInch: number,
+  exactSelection: boolean = false
 ): Point[][] {
+  const minPixelArea = exactSelection ? MIN_PIXEL_AREA_EXACT : MIN_PIXEL_AREA;
+  const minHolePixelArea = exactSelection ? MIN_PIXEL_AREA_EXACT : MIN_HOLE_PIXEL_AREA;
+  const pxToSqIn = 1 / (pixelsPerInch * pixelsPerInch);
   const dpEpsilon = 1.0 / pixelsPerInch; // 1 pixel tolerance in inch space
   const rawPaths = marchingSquaresTrace(mask, width, height);
   const result: Point[][] = [];
@@ -449,7 +464,7 @@ function traceMaskToInchPaths(
     // Pre-filter: discard tiny noise contours before DP/Chaikin.
     // Holes (negative signed area) use a lower threshold — see above.
     const rawSa = signedArea(collapsed);
-    if (Math.abs(rawSa) < (rawSa < 0 ? MIN_HOLE_PIXEL_AREA : MIN_PIXEL_AREA)) continue;
+    if (Math.abs(rawSa) < (rawSa < 0 ? minHolePixelArea : minPixelArea)) continue;
     // Convert pixel coords → inches.
     const inchPts = collapsed.map(p => ({ x: p.x / pixelsPerInch, y: p.y / pixelsPerInch }));
     // Simplify staircase runs into diagonals.
@@ -460,7 +475,9 @@ function traceMaskToInchPaths(
     // shrink them, collapsing the hole and flooding the interior with ink.
     const sa = signedArea(simplified);
     const smoothed = sa > 0 ? chaikinSmooth(simplified, 2) : simplified;
-    const minArea = sa < 0 ? MIN_HOLE_AREA_SQ_IN : MIN_CONTOUR_AREA_SQ_IN;
+    const minArea = exactSelection
+      ? MIN_PIXEL_AREA_EXACT * pxToSqIn
+      : (sa < 0 ? MIN_HOLE_AREA_SQ_IN : MIN_CONTOUR_AREA_SQ_IN);
     if (smoothed.length >= 3 && polygonArea(smoothed) >= minArea) {
       result.push(smoothed);
     }
@@ -478,7 +495,8 @@ function processSpotColors(
   glossInclusionMask?: Uint8Array,
   fullAlphaMask?: Uint8Array,
   allTaggedWhite?: boolean,
-  allTaggedGloss?: boolean
+  allTaggedGloss?: boolean,
+  exactSelection?: boolean
 ): SpotColorRegionWorker[] {
   const whiteColors = spotColors.filter(c => c.spotWhite);
   const glossColors = spotColors.filter(c => c.spotGloss);
@@ -515,9 +533,11 @@ function processSpotColors(
         if (!whiteInclusionMask[i]) mask[i] = 0;
       }
     }
-    // Skip closing when we already have a clean silhouette mask.
-    const closed = useFullAlphaForWhite ? mask : morphologicalClose(mask, width, height, closingRadius);
-    const paths = traceMaskToInchPaths(closed, width, height, dpi);
+    // Skip closing when we already have a clean silhouette mask, or when the
+    // pixel data is an exact user selection — closing would merge scattered
+    // fine detail into blobs the preview never showed.
+    const closed = (useFullAlphaForWhite || exactSelection) ? mask : morphologicalClose(mask, width, height, closingRadius);
+    const paths = traceMaskToInchPaths(closed, width, height, dpi, exactSelection);
     if (paths.length > 0) {
       regions.push({ name: whiteName, paths, tintCMYK: [0, 1, 0, 0] });
     }
@@ -536,8 +556,8 @@ function processSpotColors(
         if (!glossInclusionMask[i]) mask[i] = 0;
       }
     }
-    const closed = useFullAlphaForGloss ? mask : morphologicalClose(mask, width, height, closingRadius);
-    const paths = traceMaskToInchPaths(closed, width, height, dpi);
+    const closed = (useFullAlphaForGloss || exactSelection) ? mask : morphologicalClose(mask, width, height, closingRadius);
+    const paths = traceMaskToInchPaths(closed, width, height, dpi, exactSelection);
     if (paths.length > 0) {
       regions.push({ name: glossName, paths, tintCMYK: [0, 1, 0, 0] });
     }
@@ -555,8 +575,8 @@ function processSpotColors(
     if (matchingColors.length > 0) {
       const fluorName = matchingColors[0][ft.nameField] || ft.defaultName;
       const mask = createClosestColorMask(pixelData, width, height, matchingColors, spotColors, 60, 240);
-      const closed = morphologicalClose(mask, width, height, closingRadius);
-      const paths = traceMaskToInchPaths(closed, width, height, dpi);
+      const closed = exactSelection ? mask : morphologicalClose(mask, width, height, closingRadius);
+      const paths = traceMaskToInchPaths(closed, width, height, dpi, exactSelection);
       if (paths.length > 0) {
         regions.push({ name: fluorName, paths, tintCMYK: [0, 1, 0, 0] });
       }
@@ -569,12 +589,12 @@ function processSpotColors(
 self.onmessage = function(e: MessageEvent<WorkerMessage>) {
   try {
     if (e.data.type === 'trace') {
-      const { imageBuffer, imageWidth, imageHeight, spotColors, dpi, whiteInclusionMask, glossInclusionMask, fullAlphaMask, allTaggedWhite, allTaggedGloss } = e.data;
+      const { imageBuffer, imageWidth, imageHeight, spotColors, dpi, whiteInclusionMask, glossInclusionMask, fullAlphaMask, allTaggedWhite, allTaggedGloss, exactSelection } = e.data;
       const pixelData = new Uint8ClampedArray(imageBuffer);
       const whiteMask = whiteInclusionMask ? new Uint8Array(whiteInclusionMask) : undefined;
       const glossMask = glossInclusionMask ? new Uint8Array(glossInclusionMask) : undefined;
       const alphaMask = fullAlphaMask ? new Uint8Array(fullAlphaMask) : undefined;
-      const regions = processSpotColors(pixelData, imageWidth, imageHeight, spotColors, dpi, whiteMask, glossMask, alphaMask, allTaggedWhite, allTaggedGloss);
+      const regions = processSpotColors(pixelData, imageWidth, imageHeight, spotColors, dpi, whiteMask, glossMask, alphaMask, allTaggedWhite, allTaggedGloss, exactSelection);
       const response: WorkerResponse = { type: 'result', regions };
       self.postMessage(response);
     }

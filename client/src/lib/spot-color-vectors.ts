@@ -95,6 +95,7 @@ function traceColorRegionsAsync(
 
     let imageData: ImageData;
     let inclusionMasks: { whiteMask: Uint8Array; glossMask: Uint8Array } | null = null;
+    let exactSelection = false;
 
     // "All tagged" detection: every extracted color (and every region within
     // each color, when regions exist) carries the separation flag. Only then
@@ -167,7 +168,16 @@ function traceColorRegionsAsync(
               const regionId = color.regionMap[mapIdx];
               if (regionId >= 0) {
                 const region = color.regions.find(r => r.id === regionId);
-                if (region) include = !!(region.spotWhite || region.spotGloss);
+                if (region) {
+                  // Mirror the preview overlay's fallback: when NO region of
+                  // this color carries explicit flags, the user tagged at the
+                  // color level — fall back to color-level flags, exactly as
+                  // preview-section.tsx does. Otherwise trust region flags.
+                  const anyExplicit = color.regions.some(r => r.spotWhite !== undefined || r.spotGloss !== undefined);
+                  include = anyExplicit
+                    ? !!(region.spotWhite || region.spotGloss)
+                    : !!((region.spotWhite ?? color.spotWhite) || (region.spotGloss ?? color.spotGloss));
+                }
               }
               // regionId < 0 = orphan pixel → leave transparent (include stays false)
             }
@@ -190,6 +200,7 @@ function traceColorRegionsAsync(
       }
 
       imageData = new ImageData(rawData, cW, cH);
+      exactSelection = true;
       // inclusionMasks stays null — the imageData already encodes the exact selection.
       console.log(`[SpotColor] Built ${cW}x${cH} canvas from pixelMap + region selection (exact preview match)`);
     } else {
@@ -275,6 +286,7 @@ function traceColorRegionsAsync(
       widthInches,
       heightInches,
       dpi: SPOT_COLOR_DPI,
+      exactSelection,
     };
 
     if (inclusionMasks) {
