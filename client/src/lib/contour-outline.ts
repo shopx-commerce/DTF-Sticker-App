@@ -2662,9 +2662,15 @@ export async function downloadContourPDF(
   }
   
   if (spotColors && spotColors.length > 0) {
+    // CRITICAL ALIGNMENT: the design raster is drawn at contourImageW/H
+    // (aspect-ratio-corrected — larger than resizeSettings on one axis when
+    // the image's natural AR differs from the resize AR, e.g. after
+    // background removal or cropping). The spot layer MUST be traced and
+    // scaled at those SAME dimensions or it lands shifted/squashed relative
+    // to the artwork.
     const spotLabels = await addSpotColorVectorsToPDF(
       pdfDoc, page, image, spotColors,
-      resizeSettings.widthInches, resizeSettings.heightInches,
+      contourImageW, contourImageH,
       heightInches, imageOffsetX, imageOffsetY,
       singleArtboard, widthPts, heightPts, spotPixelMap
     );

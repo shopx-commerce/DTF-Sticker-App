@@ -135,7 +135,30 @@ function traceColorRegionsAsync(
       }
     }
 
-    if (spotPixelMap && spotPixelMap.pixelMap.length > 0) {
+    // STALENESS GUARD: the pixelMap was captured from the image at tagging
+    // time. If the image has since been cropped/resized (different aspect
+    // ratio), stretching the old map over the new geometry would misalign
+    // every spot region. In that case discard the map and fall back to live
+    // color matching on the current image pixels — that path can never drift
+    // from the artwork.
+    let usablePixelMap = spotPixelMap;
+    if (usablePixelMap && usablePixelMap.pixelMap.length > 0) {
+      const imgW = image.naturalWidth || image.width;
+      const imgH = image.naturalHeight || image.height;
+      if (imgW > 0 && imgH > 0) {
+        const mapAR = usablePixelMap.mapWidth / usablePixelMap.mapHeight;
+        const imgAR = imgW / imgH;
+        if (Math.abs(mapAR - imgAR) / imgAR > 0.02) {
+          console.warn(
+            `[SpotColor] STALE pixelMap discarded: map AR ${mapAR.toFixed(4)} (${usablePixelMap.mapWidth}x${usablePixelMap.mapHeight}) ` +
+            `vs image AR ${imgAR.toFixed(4)} (${imgW}x${imgH}). Falling back to live color matching.`
+          );
+          usablePixelMap = undefined;
+        }
+      }
+    }
+
+    if (usablePixelMap && usablePixelMap.pixelMap.length > 0) {
       // Build the export imageData directly from pixelMap + regionMap + per-region selection
       // flags — the same data the preview uses to draw the orange overlay. This guarantees
       // the exported spot color regions exactly match what the user sees, with no color-
@@ -144,7 +167,7 @@ function traceColorRegionsAsync(
       // Selected pixels → painted with exact extracted color RGB (worker distance = 0).
       // Everything else → left transparent (worker skips alpha < 240).
       // No inclusion masks needed: selection is encoded directly in the imageData.
-      const { pixelMap, mapWidth, mapHeight } = spotPixelMap;
+      const { pixelMap, mapWidth, mapHeight } = usablePixelMap;
       const rawData = new Uint8ClampedArray(cW * cH * 4); // all transparent
 
       for (let y = 0; y < cH; y++) {
