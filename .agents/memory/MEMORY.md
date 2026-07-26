@@ -1,1 +1,2 @@
 - [PDF CutContour grouping](pdf-cutcontour-grouping.md) — contour PDF wraps bg+art+cut into one Form XObject (= Illustrator group); spot CS now nested in form, white/gloss stay separate.
+- [Contour component peers](contour-component-selection.md) — components ≥50% of main area are design peers, exempt from orphan area budget; check [ZH:Component] logs when outline drops part of a design.

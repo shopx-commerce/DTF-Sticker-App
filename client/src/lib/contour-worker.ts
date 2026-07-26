@@ -2365,16 +2365,26 @@ function selectMainComponentWithOrphans(
         decisions.push(decision); removed++; continue;
       }
 
-      if (extraAreaKept + c.area > maxExtraArea) {
+      // Peer-component exemption: a component whose area is comparable to
+      // the main component (≥50%) is a co-equal part of the design (e.g. a
+      // logo split into two solid halves by a transparent gap), not an
+      // orphan speck. The maxExtraArea budget exists to shed stray debris /
+      // watermarks; applying it to a near-equal peer amputates half the
+      // artwork. Peers that are near main and dense are always kept and do
+      // not consume the orphan budget.
+      const isPeer = c.area >= 0.5 * main.area;
+
+      if (!isPeer && extraAreaKept + c.area > maxExtraArea) {
         decision.reason = `would exceed maxExtraArea (${extraAreaKept + c.area} > ${maxExtraArea})`;
         decisions.push(decision); removed++; continue;
       }
 
       for (const idx of c.pixels) outMask[idx] = 1;
       kept++;
-      extraAreaKept += c.area;
+      if (!isPeer) extraAreaKept += c.area;
       decision.verdict = 'KEPT';
       const reasons: string[] = [];
+      if (isPeer) reasons.push(`peer component (area ${(100 * c.area / main.area).toFixed(0)}% of main)`);
       if (okIntersect) reasons.push('inside expanded main bbox');
       if (okDist) reasons.push(`dist ${dist}px ≤ ${keepNearMainDistPx}px`);
       if (okCaption) reasons.push('caption-like');
