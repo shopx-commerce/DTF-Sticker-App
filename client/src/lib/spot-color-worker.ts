@@ -233,8 +233,8 @@ function marchingSquaresTrace(mask: Uint8Array, width: number, height: number): 
     for (let x = 0; x < width; x++) {
       const above = getMask(x, y - 1);
       const below = getMask(x, y);
-      if (above !== below) {
-        if (above === 1) {
+      if ((above > 0) !== (below > 0)) {
+        if (above > 0) {
           edges.push({ fromX: x + 1, fromY: y, toX: x, toY: y, dx: -1, dy: 0 });
         } else {
           edges.push({ fromX: x, fromY: y, toX: x + 1, toY: y, dx: 1, dy: 0 });
@@ -247,8 +247,8 @@ function marchingSquaresTrace(mask: Uint8Array, width: number, height: number): 
     for (let y = 0; y < height; y++) {
       const left = getMask(x - 1, y);
       const right = getMask(x, y);
-      if (left !== right) {
-        if (left === 1) {
+      if ((left > 0) !== (right > 0)) {
+        if (left > 0) {
           edges.push({ fromX: x, fromY: y, toX: x, toY: y + 1, dx: 0, dy: 1 });
         } else {
           edges.push({ fromX: x, fromY: y + 1, toX: x, toY: y, dx: 0, dy: -1 });
@@ -351,15 +351,121 @@ function collapseCollinear(contour: Point[]): Point[] {
   return result.length >= 3 ? result : contour;
 }
 
-function traceMaskToInchPaths(mask: Uint8Array, width: number, height: number, pixelsPerInch: number): Point[][] {
+/** Shoelace signed area. Positive = CW winding in Y-down = outer contour.
+ *  Negative = CCW = inner hole contour. Works in any units. */
+function signedArea(pts: Point[]): number {
+  let sum = 0;
+  for (let i = 0; i < pts.length; i++) {
+    const j = (i + 1) % pts.length;
+    sum += pts[i].x * pts[j].y - pts[j].x * pts[i].y;
+  }
+  return sum / 2;
+}
+
+/** Shoelace unsigned area (for filtering). */
+function polygonArea(pts: Point[]): number {
+  return Math.abs(signedArea(pts));
+}
+
+/**
+ * Douglas-Peucker simplification.
+ * Collapses pixel-grid staircase runs into single diagonal segments
+ * before Chaikin, so smoothing has clean corners to work with.
+ */
+function douglasPeucker(pts: Point[], epsilon: number): Point[] {
+  if (pts.length < 3) return pts;
+  const n = pts.length;
+  const keep = new Uint8Array(n);
+  keep[0] = 1;
+  keep[n - 1] = 1;
+  // Iterative (explicit stack) to avoid deep recursion on long jagged contours.
+  const stack: [number, number][] = [[0, n - 1]];
+  while (stack.length > 0) {
+    const [start, end] = stack.pop()!;
+    if (end - start < 2) continue;
+    const ax = pts[start].x, ay = pts[start].y;
+    const bx = pts[end].x, by = pts[end].y;
+    const abLen = Math.sqrt((bx - ax) ** 2 + (by - ay) ** 2);
+    let maxDist = 0, maxIdx = start;
+    for (let i = start + 1; i < end; i++) {
+      const dist = abLen === 0
+        ? Math.sqrt((pts[i].x - ax) ** 2 + (pts[i].y - ay) ** 2)
+        : Math.abs((by - ay) * pts[i].x - (bx - ax) * pts[i].y + bx * ay - by * ax) / abLen;
+      if (dist > maxDist) { maxDist = dist; maxIdx = i; }
+    }
+    if (maxDist > epsilon) {
+      keep[maxIdx] = 1;
+      stack.push([start, maxIdx], [maxIdx, end]);
+    }
+  }
+  const result: Point[] = [];
+  for (let i = 0; i < n; i++) if (keep[i]) result.push(pts[i]);
+  return result;
+}
+
+/**
+ * Chaikin corner-cutting — 2 iterations converges toward a quadratic B-spline.
+ * Only apply to OUTER contours (positive signed area). Never apply to holes —
+ * Chaikin shrinks polygons, which collapses thin ink rings into solid blobs.
+ */
+function chaikinSmooth(pts: Point[], iterations: number): Point[] {
+  let cur = pts;
+  for (let iter = 0; iter < iterations; iter++) {
+    const next: Point[] = [];
+    const n = cur.length;
+    for (let i = 0; i < n; i++) {
+      const a = cur[i], b = cur[(i + 1) % n];
+      next.push({ x: 0.75 * a.x + 0.25 * b.x, y: 0.75 * a.y + 0.25 * b.y });
+      next.push({ x: 0.25 * a.x + 0.75 * b.x, y: 0.25 * a.y + 0.75 * b.y });
+    }
+    cur = next;
+  }
+  return cur;
+}
+
+// Pre-filter in pixel space before any expensive processing.
+// 200 sq-px ≈ a 14×14 region — anything smaller is noise.
+const MIN_PIXEL_AREA = 200;
+// Holes get a much lower floor: dropping a small hole while its outer
+// contour survives would flood the counter solid under even-odd fill
+// (e.g. the inside of a small "o" or "e" at 300 DPI).
+const MIN_HOLE_PIXEL_AREA = 25;
+// Post-filter sanity check in inch space after smoothing.
+const MIN_CONTOUR_AREA_SQ_IN = 2e-4;
+const MIN_HOLE_AREA_SQ_IN = 2.5e-5;
+
+function traceMaskToInchPaths(
+  mask: Uint8Array,
+  width: number,
+  height: number,
+  pixelsPerInch: number
+): Point[][] {
+  const dpEpsilon = 1.0 / pixelsPerInch; // 1 pixel tolerance in inch space
   const rawPaths = marchingSquaresTrace(mask, width, height);
-  return rawPaths.map(rawPath => {
+  const result: Point[][] = [];
+  for (const rawPath of rawPaths) {
     const collapsed = collapseCollinear(rawPath);
-    return collapsed.map(p => ({
-      x: p.x / pixelsPerInch,
-      y: p.y / pixelsPerInch
-    }));
-  }).filter(p => p.length >= 3);
+    if (collapsed.length < 3) continue;
+    // Pre-filter: discard tiny noise contours before DP/Chaikin.
+    // Holes (negative signed area) use a lower threshold — see above.
+    const rawSa = signedArea(collapsed);
+    if (Math.abs(rawSa) < (rawSa < 0 ? MIN_HOLE_PIXEL_AREA : MIN_PIXEL_AREA)) continue;
+    // Convert pixel coords → inches.
+    const inchPts = collapsed.map(p => ({ x: p.x / pixelsPerInch, y: p.y / pixelsPerInch }));
+    // Simplify staircase runs into diagonals.
+    const simplified = douglasPeucker(inchPts, dpEpsilon);
+    if (simplified.length < 3) continue;
+    // Outer contours (CW, positive signed area) get Chaikin smoothing.
+    // Inner/hole contours (CCW, negative) are left as-is — Chaikin would
+    // shrink them, collapsing the hole and flooding the interior with ink.
+    const sa = signedArea(simplified);
+    const smoothed = sa > 0 ? chaikinSmooth(simplified, 2) : simplified;
+    const minArea = sa < 0 ? MIN_HOLE_AREA_SQ_IN : MIN_CONTOUR_AREA_SQ_IN;
+    if (smoothed.length >= 3 && polygonArea(smoothed) >= minArea) {
+      result.push(smoothed);
+    }
+  }
+  return result;
 }
 
 function processSpotColors(
