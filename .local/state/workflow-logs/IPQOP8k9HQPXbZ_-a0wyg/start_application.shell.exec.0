@@ -1,0 +1,1917 @@
+[1G[0K⠙[1G[0K
+> rest-express@1.0.0 dev
+> NODE_ENV=development tsx server/index.ts
+
+[1G[0K⠙[1G[0K3:03:57 PM [express] serving on port 5000
+Browserslist: browsers data (caniuse-lite) is 21 months old. Please run:
+  npx update-browserslist-db@latest
+  Why you should do it regularly: https://github.com/browserslist/update-db#readme
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+[1;1H[0J[2m8:23:46 PM[22m [36m[1m[vite][22m[39m [32mpage reload [39m[2msrc/lib/spot-color-worker.ts[22m
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+[1;1H[0J[2m8:23:47 PM[22m [36m[1m[vite][22m[39m [32mpage reload [39m[2msrc/lib/spot-color-worker.ts[22m [33m(x2)[39m
+
+
+
+
+
+
+
+
+
+
+
+
+[1;1H[0J[2m8:24:03 PM[22m [36m[1m[vite][22m[39m [32mpage reload [39m[2msrc/lib/spot-color-worker.ts[22m [33m(x3)[39m
+
+
+
+
+
+
+
+
+
+
+
+
+
+[1;1H[0J[2m8:24:27 PM[22m [36m[1m[vite][22m[39m [32mpage reload [39m[2msrc/lib/spot-color-worker.ts[22m [33m(x4)[39m
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+[1;1H[0J[2m8:24:37 PM[22m [36m[1m[vite][22m[39m [32mpage reload [39m[2msrc/lib/spot-color-worker.ts[22m [33m(x5)[39m
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+[1;1H[0J[2m8:25:39 PM[22m [36m[1m[vite][22m[39m [32mpage reload [39m[2msrc/lib/spot-color-worker.ts[22m [33m(x6)[39m
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+[1;1H[0J[2m8:25:43 PM[22m [36m[1m[vite][22m[39m [32mpage reload [39m[2msrc/lib/spot-color-worker.ts[22m [33m(x7)[39m
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+[1;1H[0J[2m8:25:45 PM[22m [36m[1m[vite][22m[39m [32mpage reload [39m[2msrc/lib/spot-color-worker.ts[22m [33m(x8)[39m
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+[1;1H[0J[2m8:25:48 PM[22m [36m[1m[vite][22m[39m [32mpage reload [39m[2msrc/lib/spot-color-worker.ts[22m [33m(x9)[39m
+[QR server] Trying variant "native:raw" (925×921)
+[QR server] Trying variant "native:raw-blk" (925×921)
+[QR server] Trying variant "native:otsu" (925×921)
+[QR server] Trying variant "native:otsu-blk" (925×921)
+[QR server] Trying variant "native:otsu-inv" (925×921)
+[QR server] Trying variant "native:gamma35" (925×921)
+[QR server] Trying variant "native:gamma35-otsu" (925×921)
+[QR server] Trying variant "native:gamma50-otsu" (925×921)
+[QR server] Trying variant "native:chR" (925×921)
+[QR server] Trying variant "native:chG" (925×921)
+[QR server] Trying variant "native:chB" (925×921)
+[QR server] Trying variant "native:local-adapt" (925×921)
+[QR server] Trying variant "native:t40-blk" (925×921)
+[QR server] Trying variant "native:t40-blk-inv" (925×921)
+[QR server] Trying variant "native:t80-blk" (925×921)
+[QR server] Trying variant "native:t80-blk-inv" (925×921)
+[QR server] Trying variant "native:t128-blk" (925×921)
+[QR server] Trying variant "native:t128-blk-inv" (925×921)
+[QR server] Trying variant "native:erase22" (925×921)
+[QR server] Trying variant "native:erase22-raw" (925×921)
+[QR server] Trying variant "native:erase22-g35" (925×921)
+[QR server] Trying variant "native:erase30" (925×921)
+[QR server] Trying variant "native:erase30-raw" (925×921)
+[QR server] Trying variant "native:erase30-g35" (925×921)
+[QR server] Trying variant "native:erase40" (925×921)
+[QR server] Trying variant "native:erase40-raw" (925×921)
+[QR server] Trying variant "native:erase40-g35" (925×921)
+[QR server] Trying variant "native:erase50" (925×921)
+[QR server] Trying variant "native:erase50-raw" (925×921)
+[QR server] Trying variant "native:erase50-g35" (925×921)
+[QR server] Trying variant "native:rot90" (921×925)
+[QR server] Trying variant "native:rot180" (925×921)
+[QR server] Trying variant "native:rot270" (921×925)
+[QR server] Trying variant "2x:raw" (1850×1842)
+[QR server] Trying variant "2x:raw-blk" (1850×1842)
+[QR server] Trying variant "2x:otsu" (1850×1842)
+[QR server] Trying variant "2x:otsu-blk" (1850×1842)
+[QR server] Trying variant "2x:otsu-inv" (1850×1842)
+[QR server] Trying variant "2x:gamma35" (1850×1842)
+[QR server] Trying variant "2x:gamma35-otsu" (1850×1842)
+[QR server] Trying variant "2x:gamma50-otsu" (1850×1842)
+[QR server] Trying variant "2x:chR" (1850×1842)
+[QR server] Trying variant "2x:chG" (1850×1842)
+[QR server] Trying variant "2x:chB" (1850×1842)
+[QR server] Trying variant "2x:local-adapt" (1850×1842)
+[QR server] Trying variant "2x:t40-blk" (1850×1842)
+[QR server] Trying variant "2x:t40-blk-inv" (1850×1842)
+[QR server] Trying variant "2x:t80-blk" (1850×1842)
+[QR server] Trying variant "2x:t80-blk-inv" (1850×1842)
+[QR server] Trying variant "2x:t128-blk" (1850×1842)
+[QR server] Trying variant "2x:t128-blk-inv" (1850×1842)
+[QR server] Trying variant "2x:erase22" (1850×1842)
+[QR server] Trying variant "2x:erase22-raw" (1850×1842)
+[QR server] Trying variant "2x:erase22-g35" (1850×1842)
+[QR server] Trying variant "2x:erase30" (1850×1842)
+[QR server] Trying variant "2x:erase30-raw" (1850×1842)
+[QR server] Trying variant "2x:erase30-g35" (1850×1842)
+[QR server] Trying variant "2x:erase40" (1850×1842)
+[QR server] Trying variant "2x:erase40-raw" (1850×1842)
+[QR server] Trying variant "2x:erase40-g35" (1850×1842)
+[QR server] Trying variant "2x:erase50" (1850×1842)
+[QR server] Trying variant "2x:erase50-raw" (1850×1842)
+[QR server] Trying variant "2x:erase50-g35" (1850×1842)
+[QR server] Trying variant "2x:rot90" (1842×1850)
+[QR server] Trying variant "2x:rot180" (1850×1842)
+[QR server] Trying variant "2x:rot270" (1842×1850)
+[QR server] Detected 0 QR(s) — variants exhausted
+8:30:15 PM [express] POST /api/detect-qr 200 in 30450ms :: {"qrCodes":[]}
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+[1;1H[0J[2m8:35:55 PM[22m [36m[1m[vite][22m[39m [32mpage reload [39m[2msrc/lib/spot-color-worker.ts[22m [33m(x10)[39m
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+[1;1H[0J[2m8:35:58 PM[22m [36m[1m[vite][22m[39m [32mpage reload [39m[2msrc/lib/spot-color-worker.ts[22m [33m(x11)[39m
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+[1;1H[0J[2m8:36:04 PM[22m [36m[1m[vite][22m[39m [32mpage reload [39m[2msrc/lib/spot-color-worker.ts[22m [33m(x12)[39m
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+[1;1H[0J[2m8:36:06 PM[22m [36m[1m[vite][22m[39m [32mpage reload [39m[2msrc/lib/spot-color-worker.ts[22m [33m(x13)[39m
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+[1;1H[0J[2m8:36:09 PM[22m [36m[1m[vite][22m[39m [32mpage reload [39m[2msrc/lib/spot-color-worker.ts[22m [33m(x14)[39m
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+[1;1H[0J[2m8:36:18 PM[22m [36m[1m[vite][22m[39m [32mpage reload [39m[2msrc/lib/spot-color-worker.ts[22m [33m(x15)[39m
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+[1;1H[0J[2m8:36:22 PM[22m [36m[1m[vite][22m[39m [32mpage reload [39m[2msrc/lib/spot-color-worker.ts[22m [33m(x16)[39m
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+[1;1H[0J[2m8:36:25 PM[22m [36m[1m[vite][22m[39m [32mpage reload [39m[2msrc/lib/spot-color-worker.ts[22m [33m(x17)[39m
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+[1;1H[0J[2m8:36:27 PM[22m [36m[1m[vite][22m[39m [32mpage reload [39m[2msrc/lib/spot-color-worker.ts[22m [33m(x18)[39m
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+[1;1H[0J[2m8:36:30 PM[22m [36m[1m[vite][22m[39m [32mpage reload [39m[2msrc/lib/spot-color-worker.ts[22m [33m(x19)[39m
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+[1;1H[0J[2m8:36:31 PM[22m [36m[1m[vite][22m[39m [32mpage reload [39m[2msrc/lib/spot-color-worker.ts[22m [33m(x20)[39m
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+[1;1H[0J[2m8:36:42 PM[22m [36m[1m[vite][22m[39m [32mhmr update [39m[2m/src/index.css?v=8cI-aROAEnGZ7BtOl8XFV, /src/components/image-editor.tsx, /src/components/gang-sheet-panel.tsx, /src/components/preview-section.tsx, /src/components/controls-section.tsx[22m
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+[1;1H[0J[2m8:36:44 PM[22m [36m[1m[vite][22m[39m [32mhmr update [39m[2m/src/index.css?v=8cI-aROAEnGZ7BtOl8XFV, /src/components/image-editor.tsx, /src/components/gang-sheet-panel.tsx, /src/components/preview-section.tsx, /src/components/controls-section.tsx[22m [33m(x2)[39m
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+[1;1H[0J[2m8:36:46 PM[22m [36m[1m[vite][22m[39m [32mhmr update [39m[2m/src/index.css?v=8cI-aROAEnGZ7BtOl8XFV, /src/components/image-editor.tsx, /src/components/gang-sheet-panel.tsx, /src/components/preview-section.tsx, /src/components/controls-section.tsx[22m [33m(x3)[39m
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+[1;1H[0J[2m8:36:47 PM[22m [36m[1m[vite][22m[39m [32mhmr update [39m[2m/src/index.css?v=8cI-aROAEnGZ7BtOl8XFV, /src/components/image-editor.tsx, /src/components/gang-sheet-panel.tsx, /src/components/preview-section.tsx, /src/components/controls-section.tsx[22m [33m(x4)[39m
+[QR server] Trying variant "native:raw" (1198×1500)
+[QR server] Trying variant "native:raw-blk" (1198×1500)
+[QR server] Trying variant "native:otsu" (1198×1500)
+[QR server] Trying variant "native:otsu-blk" (1198×1500)
+[QR server] Trying variant "native:otsu-inv" (1198×1500)
+[QR server] Trying variant "native:gamma35" (1198×1500)
+[QR server] Trying variant "native:gamma35-otsu" (1198×1500)
+[QR server] Trying variant "native:gamma50-otsu" (1198×1500)
+[QR server] Trying variant "native:chR" (1198×1500)
+[QR server] Trying variant "native:chG" (1198×1500)
+[QR server] Trying variant "native:chB" (1198×1500)
+[QR server] Trying variant "native:local-adapt" (1198×1500)
+[QR server] Trying variant "native:t40-blk" (1198×1500)
+[QR server] Trying variant "native:t40-blk-inv" (1198×1500)
+[QR server] Trying variant "native:t80-blk" (1198×1500)
+[QR server] Trying variant "native:t80-blk-inv" (1198×1500)
+[QR server] Trying variant "native:t128-blk" (1198×1500)
+[QR server] Trying variant "native:t128-blk-inv" (1198×1500)
+[QR server] Trying variant "native:erase22" (1198×1500)
+[QR server] Trying variant "native:erase22-raw" (1198×1500)
+[QR server] Trying variant "native:erase22-g35" (1198×1500)
+[QR server] Trying variant "native:erase30" (1198×1500)
+[QR server] Trying variant "native:erase30-raw" (1198×1500)
+[QR server] Trying variant "native:erase30-g35" (1198×1500)
+[QR server] Trying variant "native:erase40" (1198×1500)
+[QR server] Trying variant "native:erase40-raw" (1198×1500)
+[QR server] Trying variant "native:erase40-g35" (1198×1500)
+[QR server] Trying variant "native:erase50" (1198×1500)
+[QR server] Trying variant "native:erase50-raw" (1198×1500)
+[QR server] Trying variant "native:erase50-g35" (1198×1500)
+[QR server] Trying variant "native:rot90" (1500×1198)
+[QR server] Trying variant "native:rot180" (1198×1500)
+[QR server] Trying variant "native:rot270" (1500×1198)
+[QR server] Trying variant "2x:raw" (1917×2400)
+[QR server] Trying variant "2x:raw-blk" (1917×2400)
+[QR server] Trying variant "2x:otsu" (1917×2400)
+[QR server] Trying variant "2x:otsu-blk" (1917×2400)
+[QR server] Trying variant "2x:otsu-inv" (1917×2400)
+[QR server] Trying variant "2x:gamma35" (1917×2400)
+[QR server] Trying variant "2x:gamma35-otsu" (1917×2400)
+[QR server] Trying variant "2x:gamma50-otsu" (1917×2400)
+[QR server] Trying variant "2x:chR" (1917×2400)
+[QR server] Trying variant "2x:chG" (1917×2400)
+[QR server] Trying variant "2x:chB" (1917×2400)
+[QR server] Trying variant "2x:local-adapt" (1917×2400)
+[QR server] Trying variant "2x:t40-blk" (1917×2400)
+[QR server] Trying variant "2x:t40-blk-inv" (1917×2400)
+[QR server] Trying variant "2x:t80-blk" (1917×2400)
+[QR server] Trying variant "2x:t80-blk-inv" (1917×2400)
+[QR server] Trying variant "2x:t128-blk" (1917×2400)
+[QR server] Trying variant "2x:t128-blk-inv" (1917×2400)
+[QR server] Trying variant "2x:erase22" (1917×2400)
+[QR server] Trying variant "2x:erase22-raw" (1917×2400)
+[QR server] Trying variant "2x:erase22-g35" (1917×2400)
+[QR server] Trying variant "2x:erase30" (1917×2400)
+[QR server] Trying variant "2x:erase30-raw" (1917×2400)
+[QR server] Trying variant "2x:erase30-g35" (1917×2400)
+[QR server] Trying variant "2x:erase40" (1917×2400)
+[QR server] Trying variant "2x:erase40-raw" (1917×2400)
+[QR server] Trying variant "2x:erase40-g35" (1917×2400)
+[QR server] Trying variant "2x:erase50" (1917×2400)
+[QR server] Trying variant "2x:erase50-raw" (1917×2400)
+[QR server] Trying variant "2x:erase50-g35" (1917×2400)
+[QR server] Trying variant "2x:rot90" (2400×1917)
+[QR server] Trying variant "2x:rot180" (1917×2400)
+[QR server] Trying variant "2x:rot270" (2400×1917)
+[QR server] Detected 0 QR(s) — variants exhausted
+8:39:13 PM [express] POST /api/detect-qr 200 in 28811ms :: {"qrCodes":[]}
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+[1;1H[0J[2m8:50:35 PM[22m [36m[1m[vite][22m[39m [32mpage reload [39m[2msrc/lib/contour-worker.ts[22m
+[QR server] Trying variant "native:raw" (925×921)
+[QR server] Trying variant "native:raw-blk" (925×921)
+[QR server] Trying variant "native:otsu" (925×921)
+[QR server] Trying variant "native:otsu-blk" (925×921)
+[QR server] Trying variant "native:otsu-inv" (925×921)
+[QR server] Trying variant "native:gamma35" (925×921)
+[QR server] Trying variant "native:gamma35-otsu" (925×921)
+[QR server] Trying variant "native:gamma50-otsu" (925×921)
+[QR server] Trying variant "native:chR" (925×921)
+[QR server] Trying variant "native:chG" (925×921)
+[QR server] Trying variant "native:chB" (925×921)
+[QR server] Trying variant "native:local-adapt" (925×921)
+[QR server] Trying variant "native:t40-blk" (925×921)
+[QR server] Trying variant "native:t40-blk-inv" (925×921)
+[QR server] Trying variant "native:t80-blk" (925×921)
+[QR server] Trying variant "native:t80-blk-inv" (925×921)
+[QR server] Trying variant "native:t128-blk" (925×921)
+[QR server] Trying variant "native:t128-blk-inv" (925×921)
+[QR server] Trying variant "native:erase22" (925×921)
+[QR server] Trying variant "native:erase22-raw" (925×921)
+[QR server] Trying variant "native:erase22-g35" (925×921)
+[QR server] Trying variant "native:erase30" (925×921)
+[QR server] Trying variant "native:erase30-raw" (925×921)
+[QR server] Trying variant "native:erase30-g35" (925×921)
+[QR server] Trying variant "native:erase40" (925×921)
+[QR server] Trying variant "native:erase40-raw" (925×921)
+[QR server] Trying variant "native:erase40-g35" (925×921)
+[QR server] Trying variant "native:erase50" (925×921)
+[QR server] Trying variant "native:erase50-raw" (925×921)
+[QR server] Trying variant "native:erase50-g35" (925×921)
+[QR server] Trying variant "native:rot90" (921×925)
+[QR server] Trying variant "native:rot180" (925×921)
+[QR server] Trying variant "native:rot270" (921×925)
+[QR server] Trying variant "2x:raw" (1850×1842)
+[QR server] Trying variant "2x:raw-blk" (1850×1842)
+[QR server] Trying variant "2x:otsu" (1850×1842)
+[QR server] Trying variant "2x:otsu-blk" (1850×1842)
+[QR server] Trying variant "2x:otsu-inv" (1850×1842)
+[QR server] Trying variant "2x:gamma35" (1850×1842)
+[QR server] Trying variant "2x:gamma35-otsu" (1850×1842)
+[QR server] Trying variant "2x:gamma50-otsu" (1850×1842)
+[QR server] Trying variant "2x:chR" (1850×1842)
+[QR server] Trying variant "2x:chG" (1850×1842)
+[QR server] Trying variant "2x:chB" (1850×1842)
+[QR server] Trying variant "2x:local-adapt" (1850×1842)
+[QR server] Trying variant "2x:t40-blk" (1850×1842)
+[QR server] Trying variant "2x:t40-blk-inv" (1850×1842)
+[QR server] Trying variant "2x:t80-blk" (1850×1842)
+[QR server] Trying variant "2x:t80-blk-inv" (1850×1842)
+[QR server] Trying variant "2x:t128-blk" (1850×1842)
+[QR server] Trying variant "2x:t128-blk-inv" (1850×1842)
+[QR server] Trying variant "2x:erase22" (1850×1842)
+[QR server] Trying variant "2x:erase22-raw" (1850×1842)
+[QR server] Trying variant "2x:erase22-g35" (1850×1842)
+[QR server] Trying variant "2x:erase30" (1850×1842)
+[QR server] Trying variant "2x:erase30-raw" (1850×1842)
+[QR server] Trying variant "2x:erase30-g35" (1850×1842)
+[QR server] Trying variant "2x:erase40" (1850×1842)
+[QR server] Trying variant "2x:erase40-raw" (1850×1842)
+[QR server] Trying variant "2x:erase40-g35" (1850×1842)
+[QR server] Trying variant "2x:erase50" (1850×1842)
+[QR server] Trying variant "2x:erase50-raw" (1850×1842)
+[QR server] Trying variant "2x:erase50-g35" (1850×1842)
+[QR server] Trying variant "2x:rot90" (1842×1850)
+[QR server] Trying variant "2x:rot180" (1850×1842)
+[QR server] Trying variant "2x:rot270" (1842×1850)
+[QR server] Detected 0 QR(s) — variants exhausted
+9:00:40 PM [express] POST /api/detect-qr 200 in 32473ms :: {"qrCodes":[]}

@@ -1,0 +1,35 @@
+Group design image + CutContour into one Illustrator group in contour PDF
+
+Task: User asked that the image and the CutContour in the contour download be
+"grouped" — specifically as one selectable group in Illustrator (art + cut line
+move/select together).
+
+Change (client/src/lib/contour-outline.ts, downloadContourPDF):
+- Instead of drawing the bleed background and design raster directly on the page
+  and appending the cut path(s) as separate page content streams, all of these
+  (bg image, design image, active CutContour path, optional locked contour path)
+  are now accumulated into a single PDF Form XObject (Type/XObject, Subtype/Form,
+  BBox = full page). Illustrator imports a Form XObject as one Group.
+- The CutContour Separation color spaces now live in the form's own Resources
+  (not page-level). The form is registered as /ArtCutGroup in page XObject
+  resources and drawn once via "q /ArtCutGroup Do Q".
+- Removed the two page.drawImage() calls; images are referenced by ref inside the
+  form resources (still embedded at save via embedPng).
+- Vector QR overlay moved to run AFTER the form draw so QR modules stay on top
+  (z-order preserved). Spot-color white/gloss layers remain separate page layers
+  (production separations, intentionally not part of the art group).
+- Added PDFRef import; added guards so page Resources/Contents are created when
+  absent (previously created implicitly by drawImage).
+
+Scope: only downloadContourPDF. generateContourPDFBase64, shape-outline.ts, and
+gang-sheet.ts export paths are unchanged.
+
+Verification: type-check shows no new errors in contour-outline.ts (pre-existing
+unrelated errors remain); app runs clean (no console/runtime errors); architect
+code review passed with no blocking issues. Non-blocking note: naive preflight
+tools that scan only page-level ColorSpace may not list the spot plate since it
+is now nested in the form — RIP rendering is unaffected.
+
+Also (earlier this session): answered that CutContour is a STROKE (S operator,
+0.5pt, Separation color) while white/gloss spot colors are FILLS (f* even-odd);
+confirmed the prior Sharp enhance-image route work was already in place.

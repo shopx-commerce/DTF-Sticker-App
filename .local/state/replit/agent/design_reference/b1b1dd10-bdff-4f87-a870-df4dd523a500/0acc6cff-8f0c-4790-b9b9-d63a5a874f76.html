@@ -1,0 +1,500 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Sticker Maker - Add White Outlines to Images</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&display=swap" rel="stylesheet">
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
+    <script>
+        tailwind.config = {
+            theme: {
+                extend: {
+                    fontFamily: {
+                        'inter': ['Inter', 'sans-serif']
+                    }
+                }
+            }
+        }
+    </script>
+</head>
+<body class="font-inter bg-gray-50 min-h-screen">
+    <!-- @COMPONENT: AppHeader -->
+    <header class="bg-white shadow-sm border-b border-gray-200">
+        <div class="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8">
+            <div class="flex justify-between items-center h-16">
+                <div class="flex items-center">
+                    <i class="fas fa-magic text-blue-500 text-2xl mr-3"></i>
+                    <h1 class="text-xl font-semibold text-gray-900">Sticker Maker</h1>
+                </div>
+                <div class="text-sm text-gray-500">
+                    Add white outlines to your images
+                </div>
+            </div>
+        </div>
+    </header>
+    <!-- @END_COMPONENT: AppHeader -->
+
+    <main class="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 py-8">
+        <div class="grid grid-cols-1 lg:grid-cols-3 gap-8">
+            
+            <!-- @COMPONENT: UploadSection -->
+            <div class="lg:col-span-2">
+                <!-- Upload Area -->
+                <div class="bg-white rounded-xl shadow-sm border border-gray-200 p-6 mb-6" id="uploadSection">
+                    <h2 class="text-lg font-semibold text-gray-900 mb-4">Upload Your Image</h2>
+                    
+                    <!-- Drag and Drop Area -->
+                    <div class="border-2 border-dashed border-gray-300 rounded-lg p-8 text-center hover:border-blue-400 transition-colors cursor-pointer" 
+                         id="dropZone" 
+                         data-implementation="Implement file drag-and-drop functionality">
+                        <i class="fas fa-cloud-upload-alt text-4xl text-gray-400 mb-4"></i>
+                        <p class="text-lg font-medium text-gray-900 mb-2">Drop your PNG image here</p>
+                        <p class="text-sm text-gray-500 mb-4">or click to browse files</p>
+                        <button class="bg-blue-500 hover:bg-blue-600 text-white px-6 py-2 rounded-lg font-medium transition-colors">
+                            Choose File
+                        </button>
+                        <input type="file" accept=".png" class="hidden" id="fileInput" data-event="change:handleFileUpload">
+                        <p class="text-xs text-gray-400 mt-3">PNG files only, max 10MB</p>
+                    </div>
+                </div>
+
+                <!-- Canvas Preview Area -->
+                <div class="bg-white rounded-xl shadow-sm border border-gray-200 p-6" id="previewSection" style="display: none;">
+                    <div class="flex justify-between items-center mb-4">
+                        <h2 class="text-lg font-semibold text-gray-900">Preview</h2>
+                        <div class="flex items-center space-x-2 text-sm text-gray-500">
+                            <span>Original size:</span>
+                            <span id="originalDimensions" data-bind="image.originalWidth">1024</span>×<span data-bind="image.originalHeight">768</span>px
+                        </div>
+                    </div>
+                    
+                    <!-- Canvas Container -->
+                    <div class="bg-gray-100 rounded-lg p-4 flex justify-center items-center min-h-96">
+                        <div class="relative">
+                            <!-- @FUNCTIONALITY: Canvas should implement real-time stroke preview and image manipulation -->
+                            <canvas id="previewCanvas" 
+                                    class="max-w-full max-h-96 shadow-lg rounded"
+                                    data-implementation="Implement HTML5 Canvas for image processing and stroke generation">
+                            </canvas>
+                            
+                            <!-- Loading Overlay -->
+                            <div id="processingOverlay" class="absolute inset-0 bg-white bg-opacity-75 rounded flex items-center justify-center" style="display: none;">
+                                <div class="text-center">
+                                    <i class="fas fa-spinner fa-spin text-2xl text-blue-500 mb-2"></i>
+                                    <p class="text-sm text-gray-600">Processing image...</p>
+                                </div>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+            </div>
+            <!-- @END_COMPONENT: UploadSection -->
+
+            <!-- @COMPONENT: ControlPanel -->
+            <div class="space-y-6">
+                <!-- Stroke Controls -->
+                <div class="bg-white rounded-xl shadow-sm border border-gray-200 p-6">
+                    <h3 class="text-lg font-semibold text-gray-900 mb-4">
+                        <i class="fas fa-edit text-blue-500 mr-2"></i>
+                        Stroke Settings
+                    </h3>
+                    
+                    <div class="space-y-4">
+                        <!-- Stroke Width -->
+                        <div>
+                            <label class="block text-sm font-medium text-gray-700 mb-2">
+                                Stroke Width
+                                <span class="text-gray-500">(<span id="strokeValue" data-bind="controls.strokeWidth">5</span>px)</span>
+                            </label>
+                            <input type="range" 
+                                   min="1" 
+                                   max="50" 
+                                   value="5" 
+                                   class="w-full h-2 bg-gray-200 rounded-lg appearance-none cursor-pointer slider"
+                                   id="strokeWidth"
+                                   data-event="input:updateStrokeWidth">
+                            <div class="flex justify-between text-xs text-gray-400 mt-1">
+                                <span>1px</span>
+                                <span>50px</span>
+                            </div>
+                        </div>
+
+                        <!-- Stroke Color (Fixed to White) -->
+                        <div>
+                            <label class="block text-sm font-medium text-gray-700 mb-2">Stroke Color</label>
+                            <div class="flex items-center space-x-3">
+                                <div class="w-8 h-8 bg-white border-2 border-gray-300 rounded shadow-sm"></div>
+                                <span class="text-sm text-gray-600">White (#FFFFFF)</span>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+
+                <!-- Resize Controls -->
+                <div class="bg-white rounded-xl shadow-sm border border-gray-200 p-6">
+                    <h3 class="text-lg font-semibold text-gray-900 mb-4">
+                        <i class="fas fa-expand-arrows-alt text-emerald-500 mr-2"></i>
+                        Resize Image
+                    </h3>
+                    
+                    <div class="space-y-4">
+                        <!-- Width -->
+                        <div>
+                            <label class="block text-sm font-medium text-gray-700 mb-2">Width (px)</label>
+                            <input type="number" 
+                                   value="1024" 
+                                   min="100" 
+                                   max="4000"
+                                   class="w-full px-3 py-2 border border-gray-300 rounded-lg focus:ring-2 focus:ring-blue-500 focus:border-blue-500"
+                                   id="imageWidth"
+                                   data-event="input:updateImageSize"
+                                   data-bind="controls.imageWidth">
+                        </div>
+
+                        <!-- Height -->
+                        <div>
+                            <label class="block text-sm font-medium text-gray-700 mb-2">Height (px)</label>
+                            <input type="number" 
+                                   value="768" 
+                                   min="100" 
+                                   max="4000"
+                                   class="w-full px-3 py-2 border border-gray-300 rounded-lg focus:ring-2 focus:ring-blue-500 focus:border-blue-500"
+                                   id="imageHeight"
+                                   data-event="input:updateImageSize"
+                                   data-bind="controls.imageHeight">
+                        </div>
+
+                        <!-- Aspect Ratio Lock -->
+                        <div class="flex items-center">
+                            <input type="checkbox" 
+                                   id="lockAspectRatio" 
+                                   checked
+                                   class="h-4 w-4 text-blue-600 focus:ring-blue-500 border-gray-300 rounded"
+                                   data-event="change:toggleAspectRatio">
+                            <label for="lockAspectRatio" class="ml-2 text-sm text-gray-700">
+                                <i class="fas fa-lock text-gray-400 mr-1"></i>
+                                Lock aspect ratio
+                            </label>
+                        </div>
+                    </div>
+                </div>
+
+                <!-- Download Section -->
+                <div class="bg-white rounded-xl shadow-sm border border-gray-200 p-6">
+                    <h3 class="text-lg font-semibold text-gray-900 mb-4">
+                        <i class="fas fa-download text-purple-500 mr-2"></i>
+                        Download Sticker
+                    </h3>
+                    
+                    <div class="space-y-4">
+                        <!-- File Info -->
+                        <div class="bg-gray-50 rounded-lg p-3">
+                            <div class="text-xs text-gray-500 mb-1">Output format</div>
+                            <div class="font-medium text-gray-900">PNG with transparent background</div>
+                            <div class="text-xs text-gray-500 mt-1">
+                                Size: <span data-bind="output.fileSize">2.3 MB</span>
+                            </div>
+                        </div>
+
+                        <!-- Download Button -->
+                        <button class="w-full bg-gradient-to-r from-purple-500 to-blue-500 hover:from-purple-600 hover:to-blue-600 text-white py-3 px-4 rounded-lg font-medium transition-colors flex items-center justify-center disabled:opacity-50 disabled:cursor-not-allowed"
+                                id="downloadBtn"
+                                data-event="click:downloadImage"
+                                data-implementation="Should generate and download processed PNG with transparent background">
+                            <i class="fas fa-download mr-2"></i>
+                            Download Sticker
+                        </button>
+
+                        <!-- Reset Button -->
+                        <button class="w-full bg-gray-100 hover:bg-gray-200 text-gray-700 py-2 px-4 rounded-lg font-medium transition-colors"
+                                data-event="click:resetCanvas">
+                            <i class="fas fa-undo mr-2"></i>
+                            Start Over
+                        </button>
+                    </div>
+                </div>
+
+                <!-- Tips -->
+                <div class="bg-blue-50 rounded-xl border border-blue-200 p-4">
+                    <h4 class="text-sm font-semibold text-blue-900 mb-2">
+                        <i class="fas fa-lightbulb text-blue-600 mr-1"></i>
+                        Tips
+                    </h4>
+                    <ul class="text-xs text-blue-800 space-y-1">
+                        <li>• Use high-quality PNG images for best results</li>
+                        <li>• Larger stroke widths work better with bigger images</li>
+                        <li>• The outline follows the edges of non-transparent pixels</li>
+                    </ul>
+                </div>
+            </div>
+            <!-- @END_COMPONENT: ControlPanel -->
+        </div>
+
+        <!-- @COMPONENT: SampleGallery -->
+        <div class="mt-12 bg-white rounded-xl shadow-sm border border-gray-200 p-6">
+            <h2 class="text-lg font-semibold text-gray-900 mb-4">
+                <i class="fas fa-images text-gray-600 mr-2"></i>
+                Sample Results
+            </h2>
+            <div class="grid grid-cols-2 md:grid-cols-4 gap-4">
+                <!-- Sample 1 -->
+                <!-- A cute cartoon cat face sticker with white outline -->
+                <div class="bg-gray-50 rounded-lg p-4 text-center">
+                    <img src="https://images.unsplash.com/photo-1514888286974-6c03e2ca1dba?ixlib=rb-4.0.3&auto=format&fit=crop&w=200&h=200" 
+                         alt="Cat sticker example" 
+                         class="w-full h-24 object-cover rounded mb-2"
+                         data-mock-image="true">
+                    <p class="text-xs text-gray-600">Cat Sticker</p>
+                </div>
+                
+                <!-- Sample 2 -->
+                <!-- A colorful butterfly with white outline effect -->
+                <div class="bg-gray-50 rounded-lg p-4 text-center">
+                    <img src="https://pixabay.com/get/g248e4f3f93ab52395fb9555f15fd25b925bacaa2566417b3af8cf0e128dc71a984db95e82528d201f370754a50b98e720f54490b512631565aa1c6fe7ddc5c29_1280.jpg" 
+                         alt="Butterfly sticker example" 
+                         class="w-full h-24 object-cover rounded mb-2"
+                         data-mock-image="true">
+                    <p class="text-xs text-gray-600">Butterfly</p>
+                </div>
+                
+                <!-- Sample 3 -->
+                <!-- A tropical leaf with white outline border -->
+                <div class="bg-gray-50 rounded-lg p-4 text-center">
+                    <img src="https://images.unsplash.com/photo-1518531933037-91b2f5f229cc?ixlib=rb-4.0.3&auto=format&fit=crop&w=200&h=200" 
+                         alt="Leaf sticker example" 
+                         class="w-full h-24 object-cover rounded mb-2"
+                         data-mock-image="true">
+                    <p class="text-xs text-gray-600">Tropical Leaf</p>
+                </div>
+                
+                <!-- Sample 4 -->
+                <!-- A geometric shape design with white stroke outline -->
+                <div class="bg-gray-50 rounded-lg p-4 text-center">
+                    <img src="https://images.unsplash.com/photo-1541888946425-d81bb19240f5?ixlib=rb-4.0.3&auto=format&fit=crop&w=200&h=200" 
+                         alt="Geometric sticker example" 
+                         class="w-full h-24 object-cover rounded mb-2"
+                         data-mock-image="true">
+                    <p class="text-xs text-gray-600">Geometric</p>
+                </div>
+            </div>
+        </div>
+        <!-- @END_COMPONENT: SampleGallery -->
+    </main>
+
+    <!-- @COMPONENT: Footer -->
+    <footer class="bg-white border-t border-gray-200 mt-16">
+        <div class="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 py-8">
+            <div class="text-center text-sm text-gray-500">
+                <p>© 2024 Sticker Maker. Create beautiful outlined stickers from your images.</p>
+            </div>
+        </div>
+    </footer>
+    <!-- @END_COMPONENT: Footer -->
+
+    <style>
+        /* Custom slider styling */
+        .slider::-webkit-slider-thumb {
+            appearance: none;
+            height: 20px;
+            width: 20px;
+            border-radius: 50%;
+            background: #3B82F6;
+            cursor: pointer;
+            border: 2px solid #ffffff;
+            box-shadow: 0 2px 4px rgba(0,0,0,0.1);
+        }
+        
+        .slider::-moz-range-thumb {
+            height: 20px;
+            width: 20px;
+            border-radius: 50%;
+            background: #3B82F6;
+            cursor: pointer;
+            border: 2px solid #ffffff;
+            box-shadow: 0 2px 4px rgba(0,0,0,0.1);
+        }
+
+        /* Drag and drop states */
+        .drag-over {
+            border-color: #3B82F6 !important;
+            background-color: #EFF6FF;
+        }
+    </style>
+
+    <script>
+        // TODO: Implement full image processing functionality with HTML5 Canvas
+        (function() {
+            // @STATE: uploadedImage:File = null, strokeWidth:number = 5, imageWidth:number = 1024, imageHeight:number = 768, aspectRatioLocked:boolean = true
+            
+            let state = {
+                uploadedImage: null,
+                strokeWidth: 5,
+                imageWidth: 1024,
+                imageHeight: 768,
+                aspectRatioLocked: true,
+                canvas: null,
+                ctx: null
+            };
+
+            // Initialize drag and drop functionality
+            const dropZone = document.getElementById('dropZone');
+            const fileInput = document.getElementById('fileInput');
+            const uploadSection = document.getElementById('uploadSection');
+            const previewSection = document.getElementById('previewSection');
+
+            // File input click handler
+            dropZone.addEventListener('click', () => {
+                fileInput.click();
+            });
+
+            // Drag and drop handlers
+            dropZone.addEventListener('dragover', (e) => {
+                e.preventDefault();
+                dropZone.classList.add('drag-over');
+            });
+
+            dropZone.addEventListener('dragleave', () => {
+                dropZone.classList.remove('drag-over');
+            });
+
+            dropZone.addEventListener('drop', (e) => {
+                e.preventDefault();
+                dropZone.classList.remove('drag-over');
+                const files = e.dataTransfer.files;
+                if (files.length > 0) {
+                    handleFileUpload(files[0]);
+                }
+            });
+
+            // File input change handler
+            fileInput.addEventListener('change', (e) => {
+                if (e.target.files.length > 0) {
+                    handleFileUpload(e.target.files[0]);
+                }
+            });
+
+            // Stroke width control
+            const strokeSlider = document.getElementById('strokeWidth');
+            const strokeValue = document.getElementById('strokeValue');
+            
+            strokeSlider.addEventListener('input', (e) => {
+                state.strokeWidth = parseInt(e.target.value);
+                strokeValue.textContent = state.strokeWidth;
+                // TODO: Update canvas preview with new stroke width
+            });
+
+            // Image size controls
+            const widthInput = document.getElementById('imageWidth');
+            const heightInput = document.getElementById('imageHeight');
+            const aspectRatioLock = document.getElementById('lockAspectRatio');
+
+            widthInput.addEventListener('input', (e) => {
+                state.imageWidth = parseInt(e.target.value);
+                if (state.aspectRatioLocked && state.uploadedImage) {
+                    // TODO: Calculate and update height maintaining aspect ratio
+                }
+                // TODO: Update canvas preview
+            });
+
+            heightInput.addEventListener('input', (e) => {
+                state.imageHeight = parseInt(e.target.value);
+                if (state.aspectRatioLocked && state.uploadedImage) {
+                    // TODO: Calculate and update width maintaining aspect ratio
+                }
+                // TODO: Update canvas preview
+            });
+
+            aspectRatioLock.addEventListener('change', (e) => {
+                state.aspectRatioLocked = e.target.checked;
+            });
+
+            // Download button
+            const downloadBtn = document.getElementById('downloadBtn');
+            downloadBtn.addEventListener('click', () => {
+                // TODO: Generate final image with stroke and download as PNG
+                console.log('Download functionality to be implemented');
+            });
+
+            function handleFileUpload(file) {
+                if (!file.type.includes('png')) {
+                    alert('Please upload a PNG file only.');
+                    return;
+                }
+
+                if (file.size > 10 * 1024 * 1024) { // 10MB limit
+                    alert('File size must be less than 10MB.');
+                    return;
+                }
+
+                state.uploadedImage = file;
+                
+                // Show processing overlay
+                const processingOverlay = document.getElementById('processingOverlay');
+                processingOverlay.style.display = 'flex';
+
+                // Hide upload section, show preview
+                uploadSection.style.display = 'none';
+                previewSection.style.display = 'block';
+
+                // TODO: Load image into canvas and initialize preview
+                const reader = new FileReader();
+                reader.onload = function(e) {
+                    const img = new Image();
+                    img.onload = function() {
+                        // Update original dimensions display
+                        document.getElementById('originalDimensions').textContent = `${img.width}×${img.height}px`;
+                        
+                        // Initialize canvas
+                        const canvas = document.getElementById('previewCanvas');
+                        const ctx = canvas.getContext('2d');
+                        
+                        canvas.width = img.width;
+                        canvas.height = img.height;
+                        
+                        // Draw original image
+                        ctx.drawImage(img, 0, 0);
+                        
+                        state.canvas = canvas;
+                        state.ctx = ctx;
+                        state.imageWidth = img.width;
+                        state.imageHeight = img.height;
+                        
+                        // Update input values
+                        widthInput.value = img.width;
+                        heightInput.value = img.height;
+                        
+                        // Hide processing overlay
+                        processingOverlay.style.display = 'none';
+                        
+                        // TODO: Apply initial stroke effect
+                    };
+                    img.src = e.target.result;
+                };
+                reader.readAsDataURL(file);
+            }
+
+            // Reset functionality
+            document.querySelector('[data-event="click:resetCanvas"]').addEventListener('click', () => {
+                // Reset state
+                state.uploadedImage = null;
+                state.strokeWidth = 5;
+                state.imageWidth = 1024;
+                state.imageHeight = 768;
+                
+                // Reset UI
+                uploadSection.style.display = 'block';
+                previewSection.style.display = 'none';
+                fileInput.value = '';
+                strokeSlider.value = 5;
+                strokeValue.textContent = '5';
+                widthInput.value = 1024;
+                heightInput.value = 768;
+            });
+        })();
+    </script>
+</body>
+</html>

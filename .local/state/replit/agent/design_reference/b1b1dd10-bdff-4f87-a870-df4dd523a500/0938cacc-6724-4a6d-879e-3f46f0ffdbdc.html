@@ -1,0 +1,480 @@
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Sticker Maker - Add White Outlines to Images</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
+    <script>
+        tailwind.config = {
+            theme: {
+                extend: {
+                    fontFamily: {
+                        'inter': ['Inter', 'sans-serif'],
+                    },
+                }
+            }
+        };
+    </script>
+</head>
+<body class="bg-gray-50 font-inter">
+    <!-- @COMPONENT: Header -->
+    <header class="bg-white border-b border-gray-200 px-6 py-4">
+        <div class="max-w-7xl mx-auto flex items-center justify-between">
+            <div class="flex items-center space-x-3">
+                <div class="w-8 h-8 bg-blue-500 rounded-lg flex items-center justify-center">
+                    <svg class="w-5 h-5 text-white" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                        <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 16l4.586-4.586a2 2 0 012.828 0L16 16m-2-2l1.586-1.586a2 2 0 012.828 0L20 14m-6-6h.01M6 20h12a2 2 0 002-2V6a2 2 0 00-2-2H6a2 2 0 00-2 2v12a2 2 0 002 2z"></path>
+                    </svg>
+                </div>
+                <h1 class="text-xl font-semibold text-gray-900">Sticker Maker</h1>
+            </div>
+            <div class="text-sm text-gray-500">
+                Create outlined stickers from your images
+            </div>
+        </div>
+    </header>
+    <!-- @END_COMPONENT: Header -->
+
+    <main class="max-w-7xl mx-auto px-6 py-8">
+        <div class="grid grid-cols-1 lg:grid-cols-3 gap-8">
+            
+            <!-- @COMPONENT: UploadSection -->
+            <div class="lg:col-span-1">
+                <h2 class="text-lg font-semibold text-gray-900 mb-4">Upload Image</h2>
+                
+                <!-- Drag and Drop Zone -->
+                <div id="dropZone" class="border-2 border-dashed border-gray-300 rounded-xl p-8 text-center hover:border-blue-400 hover:bg-blue-50 transition-colors cursor-pointer">
+                    <div class="flex flex-col items-center">
+                        <svg class="w-12 h-12 text-gray-400 mb-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M7 16a4 4 0 01-.88-7.903A5 5 0 1115.9 6L16 6a5 5 0 011 9.9M15 13l-3-3m0 0l-3 3m3-3v12"></path>
+                        </svg>
+                        <p class="text-gray-600 mb-2">Drop your PNG image here</p>
+                        <p class="text-sm text-gray-500 mb-4">or click to browse</p>
+                        <button class="bg-blue-500 text-white px-4 py-2 rounded-lg hover:bg-blue-600 transition-colors">
+                            Choose File
+                        </button>
+                    </div>
+                    <input type="file" id="imageInput" class="hidden" accept=".png,image/png" />
+                </div>
+
+                <!-- Current Image Info -->
+                <div id="imageInfo" class="mt-4 p-4 bg-white rounded-lg border border-gray-200 hidden">
+                    <h3 class="text-sm font-medium text-gray-900 mb-2">Image Information</h3>
+                    <div class="space-y-1 text-sm text-gray-600">
+                        <div class="flex justify-between">
+                            <span>Filename:</span>
+                            <span id="fileName" data-bind="image.name">image.png</span>
+                        </div>
+                        <div class="flex justify-between">
+                            <span>Dimensions:</span>
+                            <span id="imageDimensions" data-bind="image.dimensions">1024 × 768 px</span>
+                        </div>
+                        <div class="flex justify-between">
+                            <span>Size in inches:</span>
+                            <span id="imageSizeInches" data-bind="image.sizeInches">7.1 × 5.3 in</span>
+                        </div>
+                        <div class="flex justify-between">
+                            <span>DPI:</span>
+                            <span id="imageDPI" data-bind="image.dpi">144</span>
+                        </div>
+                        <div class="flex justify-between">
+                            <span>File size:</span>
+                            <span id="fileSize" data-bind="image.fileSize">256 KB</span>
+                        </div>
+                    </div>
+                </div>
+            </div>
+            <!-- @END_COMPONENT: UploadSection -->
+
+            <!-- @COMPONENT: PreviewSection -->
+            <div class="lg:col-span-1">
+                <h2 class="text-lg font-semibold text-gray-900 mb-4">Preview</h2>
+                
+                <div class="bg-white rounded-xl border border-gray-200 p-6">
+                    <!-- Canvas Container -->
+                    <div class="relative bg-gray-100 rounded-lg overflow-hidden" style="min-height: 400px;">
+                        <!-- Checkerboard background to show transparency -->
+                        <div class="absolute inset-0 opacity-50" style="background-image: url('data:image/svg+xml,<svg width=\"20\" height=\"20\" viewBox=\"0 0 20 20\" xmlns=\"http://www.w3.org/2000/svg\"><rect x=\"0\" y=\"0\" width=\"10\" height=\"10\" fill=\"%23f3f4f6\"/><rect x=\"10\" y=\"10\" width=\"10\" height=\"10\" fill=\"%23f3f4f6\"/></svg>'); background-size: 20px 20px;"></div>
+                        
+                        <canvas id="previewCanvas" class="relative z-10 max-w-full max-h-full mx-auto" style="max-height: 400px;"></canvas>
+                        
+                        <!-- Placeholder when no image -->
+                        <div id="previewPlaceholder" class="absolute inset-0 flex items-center justify-center">
+                            <div class="text-center">
+                                <svg class="w-16 h-16 text-gray-300 mx-auto mb-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                                    <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 16l4.586-4.586a2 2 0 012.828 0L16 16m-2-2l1.586-1.586a2 2 0 012.828 0L20 14m-6-6h.01M6 20h12a2 2 0 002-2V6a2 2 0 00-2-2H6a2 2 0 00-2 2v12a2 2 0 002 2z"></path>
+                                </svg>
+                                <p class="text-gray-500">Upload an image to see preview</p>
+                            </div>
+                        </div>
+                    </div>
+
+                    <!-- Preview Controls -->
+                    <div class="mt-4 flex justify-center space-x-4">
+                        <button id="zoomOut" class="p-2 text-gray-500 hover:text-gray-700 hover:bg-gray-100 rounded">
+                            <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                                <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M21 21l-6-6m2-5a7 7 0 11-14 0 7 7 0 0114 0zM13 10H7"></path>
+                            </svg>
+                        </button>
+                        <button id="resetZoom" class="px-3 py-1 text-sm text-gray-600 hover:text-gray-800 hover:bg-gray-100 rounded">
+                            Reset View
+                        </button>
+                        <button id="zoomIn" class="p-2 text-gray-500 hover:text-gray-700 hover:bg-gray-100 rounded">
+                            <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                                <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M21 21l-6-6m2-5a7 7 0 11-14 0 7 7 0 0114 0zM10 7v3m0 0v3m0-3h3m-3 0H7"></path>
+                            </svg>
+                        </button>
+                    </div>
+                </div>
+            </div>
+            <!-- @END_COMPONENT: PreviewSection -->
+
+            <!-- @COMPONENT: ControlsSection -->
+            <div class="lg:col-span-1">
+                <h2 class="text-lg font-semibold text-gray-900 mb-4">Adjustments</h2>
+                
+                <div class="space-y-6">
+                    <!-- Stroke Controls -->
+                    <div class="bg-white rounded-lg border border-gray-200 p-6">
+                        <h3 class="text-base font-medium text-gray-900 mb-4">White Outline</h3>
+                        
+                        <div class="space-y-4">
+                            <div>
+                                <label class="block text-sm text-gray-700 mb-2">Stroke Width</label>
+                                <div class="flex items-center space-x-3">
+                                    <input type="range" id="strokeWidth" min="0" max="50" value="5" class="flex-1 h-2 bg-gray-200 rounded-lg appearance-none cursor-pointer">
+                                    <div class="flex items-center space-x-1 min-w-0">
+                                        <input type="number" id="strokeWidthValue" value="5" min="0" max="50" class="w-16 px-2 py-1 text-sm border border-gray-300 rounded focus:ring-2 focus:ring-blue-500 focus:border-blue-500">
+                                        <span class="text-sm text-gray-500">px</span>
+                                    </div>
+                                </div>
+                            </div>
+
+                            <div>
+                                <label class="block text-sm text-gray-700 mb-2">Stroke Color</label>
+                                <div class="flex items-center space-x-2">
+                                    <input type="color" id="strokeColor" value="#ffffff" class="w-10 h-8 border border-gray-300 rounded cursor-pointer">
+                                    <span class="text-sm text-gray-600">White</span>
+                                </div>
+                            </div>
+
+                            <div class="flex items-center">
+                                <input type="checkbox" id="enableStroke" checked class="w-4 h-4 text-blue-600 border-gray-300 rounded focus:ring-blue-500">
+                                <label for="enableStroke" class="ml-2 text-sm text-gray-700">Enable outline</label>
+                            </div>
+                        </div>
+                    </div>
+
+                    <!-- Resize Controls -->
+                    <div class="bg-white rounded-lg border border-gray-200 p-6">
+                        <h3 class="text-base font-medium text-gray-900 mb-4">Resize</h3>
+                        
+                        <div class="space-y-4">
+                            <div class="grid grid-cols-2 gap-3">
+                                <div>
+                                    <label class="block text-sm text-gray-700 mb-1">Width (inches)</label>
+                                    <input type="number" id="widthInches" step="0.1" min="0.1" value="5.0" class="w-full px-3 py-2 border border-gray-300 rounded-lg focus:ring-2 focus:ring-blue-500 focus:border-blue-500">
+                                </div>
+                                <div>
+                                    <label class="block text-sm text-gray-700 mb-1">Height (inches)</label>
+                                    <input type="number" id="heightInches" step="0.1" min="0.1" value="3.8" class="w-full px-3 py-2 border border-gray-300 rounded-lg focus:ring-2 focus:ring-blue-500 focus:border-blue-500">
+                                </div>
+                            </div>
+
+                            <div class="flex items-center">
+                                <input type="checkbox" id="maintainAspectRatio" checked class="w-4 h-4 text-blue-600 border-gray-300 rounded focus:ring-blue-500">
+                                <label for="maintainAspectRatio" class="ml-2 text-sm text-gray-700">Lock aspect ratio</label>
+                            </div>
+
+                            <div>
+                                <label class="block text-sm text-gray-700 mb-2">Output DPI</label>
+                                <select id="outputDPI" class="w-full px-3 py-2 border border-gray-300 rounded-lg focus:ring-2 focus:ring-blue-500 focus:border-blue-500">
+                                    <option value="72">72 DPI (Screen)</option>
+                                    <option value="150">150 DPI (Good Quality)</option>
+                                    <option value="300" selected>300 DPI (Print Quality)</option>
+                                    <option value="600">600 DPI (High Quality)</option>
+                                </select>
+                            </div>
+
+                            <div class="text-sm text-gray-600 bg-gray-50 p-3 rounded-lg">
+                                <div class="flex justify-between">
+                                    <span>Output pixels:</span>
+                                    <span id="outputPixels" data-bind="output.pixels">1500 × 1140 px</span>
+                                </div>
+                                <div class="flex justify-between">
+                                    <span>Estimated file size:</span>
+                                    <span id="estimatedSize" data-bind="output.estimatedSize">~1.2 MB</span>
+                                </div>
+                            </div>
+                        </div>
+                    </div>
+
+                    <!-- Download Section -->
+                    <div class="bg-white rounded-lg border border-gray-200 p-6">
+                        <h3 class="text-base font-medium text-gray-900 mb-4">Download</h3>
+                        
+                        <div class="space-y-3">
+                            <button id="downloadStandard" class="w-full bg-blue-500 text-white py-3 px-4 rounded-lg hover:bg-blue-600 transition-colors font-medium" data-event="click:downloadStandard">
+                                Download PNG Sticker
+                            </button>
+                            
+                            <button id="downloadHighRes" class="w-full bg-emerald-500 text-white py-3 px-4 rounded-lg hover:bg-emerald-600 transition-colors font-medium" data-event="click:downloadHighRes">
+                                Download 300 DPI (Print Quality)
+                            </button>
+
+                            <div class="text-xs text-gray-500 text-center">
+                                Downloads will have transparent background with white outline
+                            </div>
+                        </div>
+                    </div>
+                </div>
+            </div>
+            <!-- @END_COMPONENT: ControlsSection -->
+        </div>
+
+        <!-- @COMPONENT: ProcessingIndicator -->
+        <div id="processingModal" class="fixed inset-0 bg-black bg-opacity-50 flex items-center justify-center z-50 hidden">
+            <div class="bg-white rounded-lg p-6 max-w-sm mx-4">
+                <div class="flex items-center space-x-3">
+                    <div class="animate-spin rounded-full h-6 w-6 border-b-2 border-blue-500"></div>
+                    <span class="text-gray-700">Processing image...</span>
+                </div>
+            </div>
+        </div>
+        <!-- @END_COMPONENT: ProcessingIndicator -->
+    </main>
+
+    <script>
+        (function() {
+            // @STATE: currentImage:HTMLImageElement = null
+            // @STATE: strokeWidth:number = 5
+            // @STATE: strokeColor:string = '#ffffff'
+            // @STATE: enableStroke:boolean = true
+            // @STATE: canvas:HTMLCanvasElement = null
+            // @STATE: ctx:CanvasRenderingContext2D = null
+
+            let currentImage = null;
+            let strokeWidth = 5;
+            let strokeColor = '#ffffff';
+            let enableStroke = true;
+            let canvas = null;
+            let ctx = null;
+
+            // Initialize canvas
+            function initCanvas() {
+                canvas = document.getElementById('previewCanvas');
+                ctx = canvas.getContext('2d');
+                canvas.width = 400;
+                canvas.height = 400;
+            }
+
+            // @FUNCTIONALITY: This handles file upload and drag-drop functionality
+            function initFileUpload() {
+                const dropZone = document.getElementById('dropZone');
+                const fileInput = document.getElementById('imageInput');
+
+                dropZone.addEventListener('click', () => fileInput.click());
+                
+                dropZone.addEventListener('dragover', (e) => {
+                    e.preventDefault();
+                    dropZone.classList.add('border-blue-400', 'bg-blue-50');
+                });
+
+                dropZone.addEventListener('dragleave', (e) => {
+                    e.preventDefault();
+                    dropZone.classList.remove('border-blue-400', 'bg-blue-50');
+                });
+
+                dropZone.addEventListener('drop', (e) => {
+                    e.preventDefault();
+                    dropZone.classList.remove('border-blue-400', 'bg-blue-50');
+                    const files = e.dataTransfer.files;
+                    if (files.length > 0) {
+                        handleFileUpload(files[0]);
+                    }
+                });
+
+                fileInput.addEventListener('change', (e) => {
+                    if (e.target.files.length > 0) {
+                        handleFileUpload(e.target.files[0]);
+                    }
+                });
+            }
+
+            // @FUNCTIONALITY: Process uploaded image file and display information
+            function handleFileUpload(file) {
+                if (!file.type.startsWith('image/png')) {
+                    alert('Please upload a PNG image file.');
+                    return;
+                }
+
+                const reader = new FileReader();
+                reader.onload = (e) => {
+                    const img = new Image();
+                    img.onload = () => {
+                        currentImage = img;
+                        updateImageInfo(file, img);
+                        drawImageWithStroke();
+                        document.getElementById('previewPlaceholder').classList.add('hidden');
+                    };
+                    img.src = e.target.result;
+                };
+                reader.readAsDataURL(file);
+            }
+
+            // Update image information display
+            function updateImageInfo(file, img) {
+                const info = document.getElementById('imageInfo');
+                const dpi = 144; // Default DPI assumption
+                
+                document.getElementById('fileName').textContent = file.name;
+                document.getElementById('imageDimensions').textContent = `${img.width} × ${img.height} px`;
+                document.getElementById('imageSizeInches').textContent = `${(img.width / dpi).toFixed(1)} × ${(img.height / dpi).toFixed(1)} in`;
+                document.getElementById('imageDPI').textContent = dpi;
+                document.getElementById('fileSize').textContent = `${(file.size / 1024).toFixed(0)} KB`;
+                
+                // Update resize inputs
+                document.getElementById('widthInches').value = (img.width / dpi).toFixed(1);
+                document.getElementById('heightInches').value = (img.height / dpi).toFixed(1);
+                
+                info.classList.remove('hidden');
+            }
+
+            // @FUNCTIONALITY: This drawing function should implement stroke generation using canvas API
+            function drawImageWithStroke() {
+                if (!currentImage || !ctx) return;
+
+                // Clear canvas
+                ctx.clearRect(0, 0, canvas.width, canvas.height);
+
+                // Calculate scaling to fit canvas
+                const scale = Math.min(canvas.width / currentImage.width, canvas.height / currentImage.height);
+                const scaledWidth = currentImage.width * scale;
+                const scaledHeight = currentImage.height * scale;
+                const x = (canvas.width - scaledWidth) / 2;
+                const y = (canvas.height - scaledHeight) / 2;
+
+                if (enableStroke && strokeWidth > 0) {
+                    // TODO: Implement proper stroke generation algorithm
+                    // This is a simplified version - real implementation would need edge detection
+                    ctx.strokeStyle = strokeColor;
+                    ctx.lineWidth = strokeWidth * scale;
+                    ctx.strokeRect(x - strokeWidth * scale / 2, y - strokeWidth * scale / 2, 
+                                 scaledWidth + strokeWidth * scale, scaledHeight + strokeWidth * scale);
+                }
+
+                // Draw the image
+                ctx.drawImage(currentImage, x, y, scaledWidth, scaledHeight);
+            }
+
+            // Initialize controls
+            function initControls() {
+                const strokeWidthSlider = document.getElementById('strokeWidth');
+                const strokeWidthValue = document.getElementById('strokeWidthValue');
+                const strokeColorPicker = document.getElementById('strokeColor');
+                const enableStrokeCheckbox = document.getElementById('enableStroke');
+
+                strokeWidthSlider.addEventListener('input', (e) => {
+                    strokeWidth = parseInt(e.target.value);
+                    strokeWidthValue.value = strokeWidth;
+                    drawImageWithStroke();
+                });
+
+                strokeWidthValue.addEventListener('input', (e) => {
+                    strokeWidth = parseInt(e.target.value);
+                    strokeWidthSlider.value = strokeWidth;
+                    drawImageWithStroke();
+                });
+
+                strokeColorPicker.addEventListener('change', (e) => {
+                    strokeColor = e.target.value;
+                    drawImageWithStroke();
+                });
+
+                enableStrokeCheckbox.addEventListener('change', (e) => {
+                    enableStroke = e.target.checked;
+                    drawImageWithStroke();
+                });
+
+                // Resize controls
+                const widthInput = document.getElementById('widthInches');
+                const heightInput = document.getElementById('heightInches');
+                const aspectRatioCheckbox = document.getElementById('maintainAspectRatio');
+
+                widthInput.addEventListener('input', (e) => {
+                    if (aspectRatioCheckbox.checked && currentImage) {
+                        const aspectRatio = currentImage.height / currentImage.width;
+                        heightInput.value = (parseFloat(e.target.value) * aspectRatio).toFixed(1);
+                    }
+                    updateOutputInfo();
+                });
+
+                heightInput.addEventListener('input', (e) => {
+                    if (aspectRatioCheckbox.checked && currentImage) {
+                        const aspectRatio = currentImage.width / currentImage.height;
+                        widthInput.value = (parseFloat(e.target.value) * aspectRatio).toFixed(1);
+                    }
+                    updateOutputInfo();
+                });
+
+                document.getElementById('outputDPI').addEventListener('change', updateOutputInfo);
+            }
+
+            // Update output information
+            function updateOutputInfo() {
+                const width = parseFloat(document.getElementById('widthInches').value);
+                const height = parseFloat(document.getElementById('heightInches').value);
+                const dpi = parseInt(document.getElementById('outputDPI').value);
+
+                const pixelWidth = Math.round(width * dpi);
+                const pixelHeight = Math.round(height * dpi);
+                const estimatedSize = (pixelWidth * pixelHeight * 4 / 1024 / 1024).toFixed(1);
+
+                document.getElementById('outputPixels').textContent = `${pixelWidth} × ${pixelHeight} px`;
+                document.getElementById('estimatedSize').textContent = `~${estimatedSize} MB`;
+            }
+
+            // Download functions
+            function initDownload() {
+                document.getElementById('downloadStandard').addEventListener('click', () => {
+                    // TODO: Implement download functionality with proper canvas export
+                    showProcessing();
+                    setTimeout(() => {
+                        hideProcessing();
+                        // downloadCanvas('sticker.png');
+                    }, 1500);
+                });
+
+                document.getElementById('downloadHighRes').addEventListener('click', () => {
+                    // TODO: Implement high-resolution export with 300 DPI
+                    showProcessing();
+                    setTimeout(() => {
+                        hideProcessing();
+                        // downloadHighResCanvas('sticker_300dpi.png');
+                    }, 2000);
+                });
+            }
+
+            function showProcessing() {
+                document.getElementById('processingModal').classList.remove('hidden');
+            }
+
+            function hideProcessing() {
+                document.getElementById('processingModal').classList.add('hidden');
+            }
+
+            // Initialize everything
+            document.addEventListener('DOMContentLoaded', () => {
+                initCanvas();
+                initFileUpload();
+                initControls();
+                initDownload();
+                updateOutputInfo();
+            });
+        })();
+    </script>
+</body>
+</html>
