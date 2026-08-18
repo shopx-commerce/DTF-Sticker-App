@@ -23,7 +23,8 @@ export default function VerifyEmailPage() {
         return;
       }
       try {
-        const res = await apiRequest("GET", `/api/auth/verify?token=${encodeURIComponent(token)}`);
+        // POST with the token in the body, not the query string — see server/routes/auth.ts.
+        const res = await apiRequest("POST", "/api/auth/verify", { token });
         const data = await res.json();
         if (!cancelled) {
           setStatus("success");

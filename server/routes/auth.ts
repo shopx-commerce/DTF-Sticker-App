@@ -5,12 +5,14 @@ import { storage } from "../storage";
 import { hashPassword, isEmailVerificationRequired } from "../auth";
 import { sendMail, isMailerConfigured } from "../lib/mailer";
 import { checkRateLimit } from "../lib/rate-limit";
+import { requireCsrf } from "../lib/csrf";
 import {
   registerSchema,
   loginSchema,
   forgotPasswordSchema,
   resetPasswordSchema,
   resendVerificationSchema,
+  verifyEmailSchema,
   toPublicUser,
   type User,
   type AuthTokenKind,
@@ -98,6 +100,9 @@ function sendResetEmail(req: Request, user: User): Promise<void> {
 }
 
 export function registerAuthRoutes(app: Express): void {
+  // Scoped here, not global — other endpoints use raw uploads without a CSRF header.
+  app.use("/api/auth", requireCsrf);
+
   app.post("/api/auth/register", async (req, res) => {
     try {
       const parsed = registerSchema.safeParse(req.body);
@@ -111,13 +116,14 @@ export function registerAuthRoutes(app: Express): void {
 
       const { email, password, name } = parsed.data;
 
+      // Same status + message on every branch — an existing vs. new account must be indistinguishable.
+      const responseMessage = isEmailVerificationRequired()
+        ? "If that email isn't already registered, check your inbox for a verification link."
+        : "If that email isn't already registered, your account is ready — you can log in now.";
+
       const existing = await storage.getUserByEmail(email);
       if (existing) {
-        // Don't reveal whether the account exists — respond identically to a
-        // successful registration so this endpoint can't enumerate emails.
-        return res.status(200).json({
-          message: "If that email isn't already registered, a verification email has been sent.",
-        });
+        return res.status(200).json({ message: responseMessage });
       }
 
       const passwordHash = await hashPassword(password);
@@ -125,24 +131,23 @@ export function registerAuthRoutes(app: Express): void {
 
       if (isEmailVerificationRequired()) {
         await sendVerificationEmail(req, user);
-        res.status(201).json({
-          message: "Account created. Check your email to verify your address before logging in.",
-        });
       } else {
         // REQUIRE_EMAIL_VERIFICATION=false — mark verified immediately rather than stuck forever.
         await storage.updateUser(user.id, { emailVerified: true });
-        res.status(201).json({ message: "Account created. You can log in now." });
       }
+      res.status(200).json({ message: responseMessage });
     } catch (error) {
       console.error("[auth] register error:", error);
       res.status(500).json({ message: "Failed to create account" });
     }
   });
 
-  app.get("/api/auth/verify", async (req, res) => {
+  // POST, not GET — keeps the token out of the query string, access logs, and Referer headers.
+  app.post("/api/auth/verify", async (req, res) => {
     try {
-      const token = typeof req.query.token === "string" ? req.query.token : "";
-      if (!token) return res.status(400).json({ message: "Missing token" });
+      const parsed = verifyEmailSchema.safeParse(req.body);
+      if (!parsed.success) return res.status(400).json({ message: "Missing token" });
+      const { token } = parsed.data;
 
       if (!checkRateLimit(`verify:${getClientIp(req)}`, 20, 15 * 60 * 1000)) {
         return res.status(429).json({ message: "Too many attempts. Please try again later." });

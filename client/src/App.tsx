@@ -11,6 +11,7 @@ import RegisterPage from "@/pages/register";
 import VerifyEmailPage from "@/pages/verify-email";
 import ForgotPasswordPage from "@/pages/forgot-password";
 import ResetPasswordPage from "@/pages/reset-password";
+import { useSessionExpiredToast } from "@/hooks/use-auth";
 
 function Router() {
   return (
@@ -27,11 +28,17 @@ function Router() {
   );
 }
 
+function SessionWatcher() {
+  useSessionExpiredToast();
+  return null;
+}
+
 function App() {
   return (
     <QueryClientProvider client={queryClient}>
       <TooltipProvider>
         <Toaster />
+        <SessionWatcher />
         <Router />
       </TooltipProvider>
     </QueryClientProvider>

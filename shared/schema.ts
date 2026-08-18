@@ -3,13 +3,18 @@ import { createInsertSchema } from "drizzle-zod";
 import { z } from "zod";
 
 // ─── Users ───────────────────────────────────────────────────────────────
-// `role` ('customer' | 'admin') is validated in app code, not a DB enum.
+// Not a DB enum, but $type<UserRole>() makes role comparisons compile-checked.
+export const userRoles = ["customer", "admin"] as const;
+export type UserRole = (typeof userRoles)[number];
+export const CUSTOMER_ROLE: UserRole = "customer";
+export const ADMIN_ROLE: UserRole = "admin";
+
 export const users = pgTable("users", {
   id: serial("id").primaryKey(),
   email: text("email").notNull().unique(),
   passwordHash: text("password_hash").notNull(),
   name: text("name"),
-  role: text("role").notNull().default("customer"),
+  role: text("role").notNull().default(CUSTOMER_ROLE).$type<UserRole>(),
   emailVerified: boolean("email_verified").notNull().default(false),
   createdAt: timestamp("created_at").notNull().defaultNow(),
 });
@@ -91,6 +96,11 @@ export const resetPasswordSchema = z.object({
   password: passwordSchema,
 });
 export type ResetPasswordInput = z.infer<typeof resetPasswordSchema>;
+
+export const verifyEmailSchema = z.object({
+  token: z.string().min(1),
+});
+export type VerifyEmailInput = z.infer<typeof verifyEmailSchema>;
 
 export const resendVerificationSchema = z.object({
   email: z.string().trim().toLowerCase().email("Enter a valid email address"),

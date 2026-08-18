@@ -11,7 +11,8 @@ export interface MailMessage {
   attachments?: sgMail.MailDataRequired["attachments"];
 }
 
-const DEFAULT_FROM = "sales@dtfmasters.com";
+// Overridable via MAIL_FROM; falls back to the verified sender already used by this project's SendGrid account.
+const DEFAULT_FROM = process.env.MAIL_FROM || "sales@dtfmasters.com";
 
 export function isMailerConfigured(): boolean {
   return !!process.env.SENDGRID_API_KEY;

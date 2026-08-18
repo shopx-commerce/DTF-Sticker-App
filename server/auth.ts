@@ -3,7 +3,7 @@ import passport from "passport";
 import { Strategy as LocalStrategy } from "passport-local";
 import type { Request, Response, NextFunction } from "express";
 import { storage } from "./storage";
-import type { User as AppUser } from "@shared/schema";
+import { ADMIN_ROLE, type User as AppUser } from "@shared/schema";
 
 // Augment Express's User type with our own so `req.user` is typed as the
 // real user record everywhere (routes, middleware) without manual casts.
@@ -72,6 +72,6 @@ export function requireAuth(req: Request, res: Response, next: NextFunction): vo
 }
 
 export function requireAdmin(req: Request, res: Response, next: NextFunction): void {
-  if (req.isAuthenticated() && req.user.role === "admin") return next();
+  if (req.isAuthenticated() && req.user.role === ADMIN_ROLE) return next();
   res.status(403).json({ message: "Admin access required" });
 }

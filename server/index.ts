@@ -8,6 +8,7 @@ import passport from "passport";
 import { registerRoutes } from "./routes";
 import { setupVite, serveStatic, log } from "./vite";
 import { configurePassport } from "./auth";
+import { ensureCsrfCookie } from "./lib/csrf";
 import { pool } from "./db";
 
 if (!process.env.DATABASE_URL) {
@@ -53,6 +54,9 @@ app.use(
 configurePassport();
 app.use(passport.initialize());
 app.use(passport.session());
+
+// Global so the cookie exists before login; requireCsrf itself is scoped to /api/auth.
+app.use(ensureCsrfCookie);
 
 app.use((req, res, next) => {
   const start = Date.now();

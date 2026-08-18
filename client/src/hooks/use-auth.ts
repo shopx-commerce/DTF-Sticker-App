@@ -1,14 +1,11 @@
+import { useEffect } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { apiRequest, getQueryFn, ME_QUERY_KEY } from "@/lib/queryClient";
+import { apiRequest, getQueryFn, ME_QUERY_KEY, SESSION_EXPIRED_EVENT } from "@/lib/queryClient";
+import { toast } from "@/hooks/use-toast";
+import type { PublicUser } from "@shared/schema";
 
-export interface AuthUser {
-  id: number;
-  email: string;
-  name: string | null;
-  role: string;
-  emailVerified: boolean;
-  createdAt: string;
-}
+// Derived from PublicUser; createdAt overridden to string since it's JSON over the wire.
+export type AuthUser = Omit<PublicUser, "createdAt"> & { createdAt: string };
 
 interface MeResponse {
   user: AuthUser;
@@ -110,4 +107,19 @@ export function useAuth() {
     resendVerification: resendVerificationMutation.mutateAsync,
     resendVerificationPending: resendVerificationMutation.isPending,
   };
+}
+
+// Owns the "session expired" toast; queryClient.ts just dispatches the event. Mount once near the app root.
+export function useSessionExpiredToast() {
+  useEffect(() => {
+    let lastShown = 0;
+    const handler = () => {
+      const now = Date.now();
+      if (now - lastShown < 5000) return; // debounce several 401s arriving at once
+      lastShown = now;
+      toast({ title: "Session expired", description: "Please log in again to continue.", variant: "destructive" });
+    };
+    window.addEventListener(SESSION_EXPIRED_EVENT, handler);
+    return () => window.removeEventListener(SESSION_EXPIRED_EVENT, handler);
+  }, []);
 }
