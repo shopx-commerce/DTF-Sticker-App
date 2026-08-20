@@ -14,11 +14,8 @@ const ToastViewport = React.forwardRef<
   <ToastPrimitives.Viewport
     ref={ref}
     className={cn(
-      // Anchor toasts at the TOP of the screen on every breakpoint so they
-      // never overlap the action buttons that live in the bottom panel
-      // (e.g. "Add to gang sheet"). Right-aligned on desktop, full-width
-      // banner on mobile.
-      "fixed top-0 right-0 z-[100] flex max-h-screen w-full flex-col p-4 sm:top-4 sm:right-4 md:max-w-[420px]",
+      // Bottom-center (not bottom-right) so it doesn't sit on top of right-docked panels like the Gang Sheet sheet.
+      "fixed inset-x-0 bottom-0 z-[100] flex max-h-screen w-full flex-col-reverse p-4 sm:inset-x-auto sm:bottom-4 sm:left-1/2 sm:-translate-x-1/2 md:w-auto md:max-w-[380px]",
       className
     )}
     {...props}
@@ -27,7 +24,8 @@ const ToastViewport = React.forwardRef<
 ToastViewport.displayName = ToastPrimitives.Viewport.displayName
 
 const toastVariants = cva(
-  "group pointer-events-auto relative flex w-full items-center justify-between gap-3 overflow-hidden rounded-md border p-4 pr-3 shadow-lg transition-all data-[swipe=cancel]:translate-x-0 data-[swipe=end]:translate-x-[var(--radix-toast-swipe-end-x)] data-[swipe=move]:translate-x-[var(--radix-toast-swipe-move-x)] data-[swipe=move]:transition-none data-[state=open]:animate-in data-[state=closed]:animate-out data-[swipe=end]:animate-out data-[state=closed]:fade-out-80 data-[state=closed]:slide-out-to-right-full data-[state=open]:slide-in-from-top-full",
+  // Full-width banner on mobile, true fit-content (no min-width) on sm+.
+  "group pointer-events-auto relative flex w-full sm:w-auto items-center justify-between sm:justify-start gap-3 overflow-hidden rounded-md border p-4 pr-2.5 shadow-lg transition-all data-[swipe=cancel]:translate-x-0 data-[swipe=end]:translate-x-[var(--radix-toast-swipe-end-x)] data-[swipe=move]:translate-x-[var(--radix-toast-swipe-move-x)] data-[swipe=move]:transition-none data-[state=open]:animate-in data-[state=closed]:animate-out data-[swipe=end]:animate-out data-[state=closed]:fade-out-80 data-[state=closed]:slide-out-to-right-full data-[state=open]:slide-in-from-bottom-full",
   {
     variants: {
       variant: {
@@ -78,18 +76,16 @@ const ToastClose = React.forwardRef<
 >(({ className, ...props }, ref) => (
   <ToastPrimitives.Close
     ref={ref}
+    aria-label="Dismiss"
     className={cn(
-      // Always-visible, large, easy-to-tap dismiss button. Sits in the
-      // toast's flex row (not absolutely positioned) so it never overlaps
-      // the title/description text.
-      "shrink-0 inline-flex items-center justify-center gap-1.5 h-10 px-3 rounded-md border border-foreground/20 bg-foreground/5 text-foreground text-sm font-semibold transition-colors hover:bg-foreground/15 focus:outline-none focus:ring-2 focus:ring-ring group-[.destructive]:border-red-200/30 group-[.destructive]:bg-red-500/20 group-[.destructive]:text-red-50 group-[.destructive]:hover:bg-red-500/30 group-[.destructive]:focus:ring-red-300",
+      // Icon-only; in the flex row (not absolutely positioned) so it never overlaps the text.
+      "shrink-0 inline-flex items-center justify-center h-8 w-8 rounded-md text-foreground/50 transition-colors hover:text-foreground hover:bg-foreground/10 focus:outline-none focus:ring-2 focus:ring-ring group-[.destructive]:text-red-50/70 group-[.destructive]:hover:text-red-50 group-[.destructive]:hover:bg-red-500/20 group-[.destructive]:focus:ring-red-300",
       className
     )}
     toast-close=""
     {...props}
   >
     <X className="h-4 w-4" />
-    <span>Dismiss</span>
   </ToastPrimitives.Close>
 ))
 ToastClose.displayName = ToastPrimitives.Close.displayName

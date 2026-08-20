@@ -1,6 +1,7 @@
-import { pgTable, text, serial, integer, boolean, timestamp, varchar, json, index } from "drizzle-orm/pg-core";
+import { pgTable, text, serial, integer, boolean, timestamp, jsonb, varchar, json, index, doublePrecision } from "drizzle-orm/pg-core";
 import { createInsertSchema } from "drizzle-zod";
 import { z } from "zod";
+import type { SerializedDesign } from "./design-document";
 
 // ─── Users ───────────────────────────────────────────────────────────────
 // Not a DB enum, but $type<UserRole>() makes role comparisons compile-checked.
@@ -62,6 +63,66 @@ export const sessions = pgTable("sessions", {
   index("IDX_session_expire").on(table.expire),
 ]);
 
+// ─── Assets — pointer + metadata row; bytes live in Cloudflare R2 (server/lib/object-storage.ts) ───
+export const assetKinds = ["source_image", "source_pdf", "thumbnail", "gang_sheet_pdf"] as const;
+export type AssetKind = (typeof assetKinds)[number];
+
+export const assets = pgTable("assets", {
+  id: serial("id").primaryKey(),
+  userId: integer("user_id")
+    .notNull()
+    .references(() => users.id, { onDelete: "cascade" }),
+  r2Key: text("r2_key").notNull(),
+  kind: text("kind").notNull(), // AssetKind
+  mime: text("mime").notNull(),
+  bytes: integer("bytes").notNull(),
+  width: integer("width"),
+  height: integer("height"),
+  createdAt: timestamp("created_at").notNull().defaultNow(),
+});
+
+export type Asset = typeof assets.$inferSelect;
+export type InsertAsset = typeof assets.$inferInsert;
+
+// ─── Designs — full editor state + asset pointers; forkedFromId tracks copies (Save as New / admin fork) ───
+export const designs = pgTable("designs", {
+  id: serial("id").primaryKey(),
+  userId: integer("user_id")
+    .notNull()
+    .references(() => users.id, { onDelete: "cascade" }),
+  name: text("name").notNull(),
+  state: jsonb("state").$type<SerializedDesign>().notNull(),
+  sourceAssetId: integer("source_asset_id").references(() => assets.id),
+  thumbnailAssetId: integer("thumbnail_asset_id").references(() => assets.id),
+  forkedFromId: integer("forked_from_id").references((): any => designs.id),
+  createdAt: timestamp("created_at").notNull().defaultNow(),
+  updatedAt: timestamp("updated_at").notNull().defaultNow(),
+  deletedAt: timestamp("deleted_at"),
+});
+
+export type Design = typeof designs.$inferSelect;
+export type InsertDesign = typeof designs.$inferInsert;
+
+// ─── Gang Sheets — just a record of the finished PDF, not a re-editable layout ───
+export const gangSheets = pgTable("gang_sheets", {
+  id: serial("id").primaryKey(),
+  userId: integer("user_id")
+    .notNull()
+    .references(() => users.id, { onDelete: "cascade" }),
+  name: text("name").notNull(),
+  pdfAssetId: integer("pdf_asset_id").notNull().references(() => assets.id),
+  thumbnailAssetId: integer("thumbnail_asset_id").references(() => assets.id),
+  sheetWidth: doublePrecision("sheet_width").notNull(),
+  sheetHeight: doublePrecision("sheet_height").notNull(),
+  itemCount: integer("item_count").notNull(), // distinct designs on the sheet
+  totalQuantity: integer("total_quantity").notNull(), // total stickers across all items
+  createdAt: timestamp("created_at").notNull().defaultNow(),
+  deletedAt: timestamp("deleted_at"),
+});
+
+export type GangSheet = typeof gangSheets.$inferSelect;
+export type InsertGangSheet = typeof gangSheets.$inferInsert;
+
 // ─── Request validation schemas ─────────────────────────────────────────
 
 // Used by registration/reset only — login just checks against whatever hash is already stored.
@@ -106,3 +167,12 @@ export const resendVerificationSchema = z.object({
   email: z.string().trim().toLowerCase().email("Enter a valid email address"),
 });
 export type ResendVerificationInput = z.infer<typeof resendVerificationSchema>;
+
+export const createGangSheetSchema = z.object({
+  name: z.string().trim().min(1, "Name is required").max(200),
+  sheetWidth: z.number().positive(),
+  sheetHeight: z.number().positive(),
+  itemCount: z.number().int().nonnegative(),
+  totalQuantity: z.number().int().nonnegative(),
+});
+export type CreateGangSheetInput = z.infer<typeof createGangSheetSchema>;

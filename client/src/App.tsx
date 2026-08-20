@@ -11,6 +11,7 @@ import RegisterPage from "@/pages/register";
 import VerifyEmailPage from "@/pages/verify-email";
 import ForgotPasswordPage from "@/pages/forgot-password";
 import ResetPasswordPage from "@/pages/reset-password";
+import MyDesignsPage from "@/pages/my-designs";
 import { useSessionExpiredToast } from "@/hooks/use-auth";
 
 function Router() {
@@ -18,6 +19,9 @@ function Router() {
     <Switch>
       <Route path="/" component={StickerMaker} />
       <Route path="/embed" component={EmbedPage} />
+      {/* my-designs redirects to /login itself if there's no session. */}
+      {/* Gang sheets live inside My Designs as a second section, not a separate page. */}
+      <Route path="/my-designs" component={MyDesignsPage} />
       <Route path="/login" component={LoginPage} />
       <Route path="/register" component={RegisterPage} />
       <Route path="/verify-email" component={VerifyEmailPage} />

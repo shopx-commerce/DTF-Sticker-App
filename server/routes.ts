@@ -9,6 +9,9 @@ import { readBarcodes } from "zxing-wasm";
 
 import sgMail from "@sendgrid/mail";
 import { registerAuthRoutes } from "./routes/auth";
+import { registerAssetRoutes } from "./routes/assets";
+import { registerDesignRoutes } from "./routes/designs";
+import { registerGangSheetRoutes } from "./routes/gang-sheets";
 
 // Configure multer for file uploads
 const upload = multer({
@@ -32,6 +35,9 @@ export async function registerRoutes(app: Express): Promise<Server> {
   });
 
   registerAuthRoutes(app);
+  registerAssetRoutes(app);
+  registerDesignRoutes(app);
+  registerGangSheetRoutes(app);
 
   // Process image with high-quality stroke and resize
   app.post("/api/process-image", upload.single('image'), async (req, res) => {
