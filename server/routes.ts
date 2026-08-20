@@ -2,14 +2,13 @@ import type { Express } from "express";
 import { createServer, type Server } from "http";
 import multer from "multer";
 import sharp from "sharp";
-import path from "path";
-import fs from "fs";
 import Replicate from "replicate";
 import jsQR from "jsqr";
 import { scanImageData as zbarScanImageData, ZBarSymbolType } from "@undecaf/zbar-wasm";
 import { readBarcodes } from "zxing-wasm";
 
 import sgMail from "@sendgrid/mail";
+import { registerAuthRoutes } from "./routes/auth";
 
 // Configure multer for file uploads
 const upload = multer({
@@ -31,6 +30,8 @@ export async function registerRoutes(app: Express): Promise<Server> {
   app.get("/api/health", (req, res) => {
     res.json({ status: "ok", timestamp: new Date().toISOString() });
   });
+
+  registerAuthRoutes(app);
 
   // Process image with high-quality stroke and resize
   app.post("/api/process-image", upload.single('image'), async (req, res) => {
@@ -224,49 +225,6 @@ ${pdfData ? '<p><strong>PDF design with CutContour is attached.</strong></p>' : 
         details: error instanceof Error ? error.message : "Unknown error",
       });
     }
-  });
-
-  app.get("/api/download-pipeline", (req, res) => {
-    const filePath = "client/src/components/preview-section.tsx";
-    const fullPath = path.resolve(filePath);
-    if (!fs.existsSync(fullPath)) {
-      return res.status(404).json({ error: "File not found: preview-section.tsx" });
-    }
-
-    res.setHeader("Content-Type", "text/plain; charset=utf-8");
-    res.setHeader("Content-Disposition", "attachment; filename=preview-section.tsx");
-    res.sendFile(fullPath);
-  });
-
-  app.get("/download", (_req, res) => {
-    res.send(`<!DOCTYPE html>
-<html lang="en">
-<head>
-  <meta charset="UTF-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>Download Preview Section</title>
-  <style>
-    body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; background: #1a1a2e; color: #e0e0e0; display: flex; justify-content: center; align-items: center; min-height: 100vh; margin: 0; }
-    .card { background: #16213e; border-radius: 12px; padding: 40px; max-width: 500px; text-align: center; box-shadow: 0 8px 32px rgba(0,0,0,0.3); }
-    h1 { color: #e94560; margin-bottom: 8px; }
-    p { color: #a0a0b0; line-height: 1.6; }
-    .files { text-align: left; background: #0f3460; border-radius: 8px; padding: 16px; margin: 20px 0; font-family: monospace; font-size: 14px; }
-    .files div { padding: 4px 0; color: #e0e0e0; }
-    .btn { display: inline-block; background: #e94560; color: white; padding: 14px 32px; border-radius: 8px; text-decoration: none; font-size: 16px; font-weight: 600; transition: background 0.2s; cursor: pointer; border: none; }
-    .btn:hover { background: #c73a52; }
-  </style>
-</head>
-<body>
-  <div class="card">
-    <h1>Preview Section</h1>
-    <p>Download the preview-section.tsx component source file.</p>
-    <div class="files">
-      <div>preview-section.tsx (1406 lines)</div>
-    </div>
-    <a href="/api/download-pipeline" class="btn">Download File</a>
-  </div>
-</body>
-</html>`);
   });
 
   // AI image segmentation using Florence-2 for detection + bounding-box masks

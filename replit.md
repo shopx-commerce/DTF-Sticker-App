@@ -26,7 +26,7 @@ Preferred communication style: Simple, everyday language.
 
 ### Data Storage
 - **Database**: PostgreSQL with Drizzle ORM for user management
-- **Session Storage**: In-memory storage (development)
+- **Session Storage**: Postgres-backed via `connect-pg-simple`, rolling expiry
 - **File Storage**: Temporary in-memory processing for uploads
 
 ### Key Features and Design Decisions
