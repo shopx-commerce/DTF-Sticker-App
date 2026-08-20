@@ -103,6 +103,9 @@ export const designs = pgTable("designs", {
 export type Design = typeof designs.$inferSelect;
 export type InsertDesign = typeof designs.$inferInsert;
 
+// Lean projection for list views — excludes the (potentially large) state JSONB.
+export type DesignListItem = Pick<Design, "id" | "name" | "thumbnailAssetId" | "updatedAt">;
+
 // ─── Gang Sheets — just a record of the finished PDF, not a re-editable layout ───
 export const gangSheets = pgTable("gang_sheets", {
   id: serial("id").primaryKey(),

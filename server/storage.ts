@@ -13,6 +13,7 @@ import {
   type Asset,
   type InsertAsset,
   type Design,
+  type DesignListItem,
   type GangSheet,
 } from "@shared/schema";
 import type { SerializedDesign } from "@shared/design-document";
@@ -71,7 +72,7 @@ export interface IStorage {
   createAsset(params: InsertAsset): Promise<Asset>;
   getAssetForUser(id: number, userId: number): Promise<Asset | undefined>;
 
-  listDesignsForUser(userId: number): Promise<Design[]>;
+  listDesignsForUser(userId: number): Promise<DesignListItem[]>;
   createDesign(params: CreateDesignParams): Promise<Design>;
   getDesignForUser(id: number, userId: number): Promise<Design | undefined>;
   updateDesign(id: number, updates: UpdateDesignParams): Promise<Design | undefined>;
@@ -154,10 +155,11 @@ export class DbStorage implements IStorage {
     return asset;
   }
 
-  async listDesignsForUser(userId: number): Promise<Design[]> {
+  async listDesignsForUser(userId: number): Promise<DesignListItem[]> {
     // Sorted by creation order, matching listGangSheetsForUser — one consistent sequence across both sections.
+    // Column-limited — the list view never needs the (large) state JSONB.
     return db
-      .select()
+      .select({ id: designs.id, name: designs.name, thumbnailAssetId: designs.thumbnailAssetId, updatedAt: designs.updatedAt })
       .from(designs)
       .where(and(eq(designs.userId, userId), isNull(designs.deletedAt)))
       .orderBy(desc(designs.createdAt));

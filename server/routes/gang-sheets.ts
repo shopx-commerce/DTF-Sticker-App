@@ -6,6 +6,7 @@ import { requireCsrf } from "../lib/csrf";
 import { storage } from "../storage";
 import { putObject, MAX_UPLOAD_BYTES } from "../lib/object-storage";
 import { createGangSheetSchema } from "@shared/schema";
+import { parseId } from "../lib/parse-id";
 
 // Accepts the already-generated PDF (+ optional thumbnail); no regeneration logic lives here.
 const upload = multer({
@@ -17,11 +18,6 @@ const upload = multer({
     cb(new Error("Unexpected file"));
   },
 });
-
-function parseId(raw: string): number | null {
-  const id = parseInt(raw, 10);
-  return Number.isFinite(id) ? id : null;
-}
 
 export function registerGangSheetRoutes(app: Express): void {
   app.use("/api/gang-sheets", requireCsrf);

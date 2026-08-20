@@ -4,6 +4,7 @@ import { requireAuth } from "../auth";
 import { requireCsrf } from "../lib/csrf";
 import { storage } from "../storage";
 import { serializedDesignSchema } from "@shared/design-document";
+import { parseId } from "../lib/parse-id";
 
 const createDesignSchema = z.object({
   name: z.string().trim().min(1, "Name is required").max(200),
@@ -17,11 +18,6 @@ const updateDesignSchema = z.object({
   state: serializedDesignSchema.optional(),
   thumbnailAssetId: z.number().int().optional(),
 });
-
-function parseId(raw: string): number | null {
-  const id = parseInt(raw, 10);
-  return Number.isFinite(id) ? id : null;
-}
 
 export function registerDesignRoutes(app: Express): void {
   app.use("/api/designs", requireCsrf);
@@ -91,6 +87,12 @@ export function registerDesignRoutes(app: Express): void {
 
       if (parsed.data.thumbnailAssetId !== undefined) {
         const asset = await storage.getAssetForUser(parsed.data.thumbnailAssetId, userId);
+        if (!asset) return res.status(400).json({ message: "Referenced asset not found" });
+      }
+
+      // state.source.assetId can point at a different asset than the design's own sourceAssetId — verify it too.
+      if (parsed.data.state !== undefined) {
+        const asset = await storage.getAssetForUser(parsed.data.state.source.assetId, userId);
         if (!asset) return res.status(400).json({ message: "Referenced asset not found" });
       }
 

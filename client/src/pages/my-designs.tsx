@@ -3,7 +3,7 @@ import { Link, useLocation } from "wouter";
 import { ImageIcon, LayoutGrid, Loader2, Trash2 } from "lucide-react";
 import AccountMenu from "@/components/account-menu";
 import { useAuth, getErrorMessage } from "@/hooks/use-auth";
-import { useDesignList, useDesignMutations, type DesignSummary } from "@/hooks/use-designs";
+import { useDesignList, useDesignMutations, type DesignListSummary } from "@/hooks/use-designs";
 import { useGangSheetList, useDeleteGangSheet } from "@/hooks/use-gang-sheets";
 import { getAssetUrl } from "@/lib/design-document";
 import { apiRequest } from "@/lib/queryClient";
@@ -76,9 +76,9 @@ export default function MyDesignsPage() {
   // ─── Designs ─────────────────────────────────────────────────────────
   const { data, isLoading, refetch } = useDesignList();
   const { duplicate, remove } = useDesignMutations();
-  const [renaming, setRenaming] = useState<DesignSummary | null>(null);
+  const [renaming, setRenaming] = useState<DesignListSummary | null>(null);
   const [renameValue, setRenameValue] = useState("");
-  const [deleting, setDeleting] = useState<DesignSummary | null>(null);
+  const [deleting, setDeleting] = useState<DesignListSummary | null>(null);
 
   // ─── Gang Sheets ─────────────────────────────────────────────────────
   const { data: gangSheetData, isLoading: gangSheetsLoading } = useGangSheetList();
@@ -94,11 +94,11 @@ export default function MyDesignsPage() {
     if (user.role === "admin") return setLocation("/admin");
   }, [authLoading, user, setLocation]);
 
-  const handleOpen = (design: DesignSummary) => {
+  const handleOpen = (design: DesignListSummary) => {
     setLocation(`/?design=${design.id}`);
   };
 
-  const handleDuplicate = async (design: DesignSummary) => {
+  const handleDuplicate = async (design: DesignListSummary) => {
     try {
       const result = await duplicate.mutateAsync({ id: design.id });
       toast({ title: "Saved as new", description: `"${result.design.name}" created.` });

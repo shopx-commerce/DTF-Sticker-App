@@ -1,7 +1,7 @@
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { apiRequest, getQueryFn } from "@/lib/queryClient";
 import type { SerializedDesign } from "@shared/design-document";
-import type { Design } from "@shared/schema";
+import type { Design, DesignListItem } from "@shared/schema";
 
 // Derived from Design; date columns overridden to string since they cross the wire as JSON.
 export type DesignSummary = Omit<Design, "createdAt" | "updatedAt" | "deletedAt"> & {
@@ -10,24 +10,15 @@ export type DesignSummary = Omit<Design, "createdAt" | "updatedAt" | "deletedAt"
   deletedAt: string | null;
 };
 
+// Derived from the lean list projection; updatedAt crosses the wire as JSON string.
+export type DesignListSummary = Omit<DesignListItem, "updatedAt"> & { updatedAt: string };
+
 const DESIGNS_KEY = ["/api/designs"] as const;
 
 export function useDesignList() {
-  return useQuery<{ designs: DesignSummary[] } | null>({
+  return useQuery<{ designs: DesignListSummary[] } | null>({
     queryKey: DESIGNS_KEY,
-    queryFn: getQueryFn<{ designs: DesignSummary[] } | null>({ on401: "returnNull" }),
-  });
-}
-
-// Explicit queryFn, not getQueryFn — it only reads queryKey[0], which would fetch the list endpoint instead.
-export function useDesign(id: number | null) {
-  return useQuery<{ design: DesignSummary } | null>({
-    queryKey: ["/api/designs", id],
-    queryFn: async () => {
-      const res = await apiRequest("GET", `/api/designs/${id}`);
-      return res.json();
-    },
-    enabled: id !== null,
+    queryFn: getQueryFn<{ designs: DesignListSummary[] } | null>({ on401: "returnNull" }),
   });
 }
 

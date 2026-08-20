@@ -64,7 +64,7 @@ interface ControlsSectionProps {
   onSpotPaintModeChange?: (mode: 'white' | 'gloss' | 'both' | 'clear' | null) => void;
   pendingSpotPaint?: { colorIndex: number; regionId: number | null; mode: string; id: number } | null;
   onSpotPaintApplied?: () => void;
-  spotColorRestore?: { colors: ExtractedColor[]; id: number } | null;
+  spotColorRestore?: { colors: ExtractedColor[]; id: number; spotWhiteName?: string; spotGlossName?: string } | null;
 }
 
 function InchInput({ value, onCommit, min = 0.5, max = 24, className }: {
@@ -189,6 +189,9 @@ export default function ControlsSection({
   useEffect(() => {
     if (!spotColorRestore || spotColorRestore.id === spotRestoreIdRef.current) return;
     spotRestoreIdRef.current = spotColorRestore.id;
+    // Also restore custom names — otherwise this component's own defaults overwrite them right back.
+    if (spotColorRestore.spotWhiteName) setSpotWhiteName(spotColorRestore.spotWhiteName);
+    if (spotColorRestore.spotGlossName) setSpotGlossName(spotColorRestore.spotGlossName);
     setExtractedColors(prev => {
       if (prev.length === 0 && spotColorRestore.colors.length === 0) return prev;
       return spotColorRestore.colors.map((restored, i) => {

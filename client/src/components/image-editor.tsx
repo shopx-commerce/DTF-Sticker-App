@@ -77,7 +77,7 @@ export default function ImageEditor({ onDesignUploaded }: { onDesignUploaded?: (
   const [magicWandTolerance, setMagicWandTolerance] = useState(0.08); // 0..1
   const [isMagicWandRunning, setIsMagicWandRunning] = useState(false);
   const [spotPreviewData, setSpotPreviewData] = useState<SpotPreviewData>({ enabled: false, colors: [] });
-  const [spotColorRestore, setSpotColorRestore] = useState<{ colors: ExtractedColor[]; id: number } | null>(null);
+  const [spotColorRestore, setSpotColorRestore] = useState<{ colors: ExtractedColor[]; id: number; spotWhiteName?: string; spotGlossName?: string } | null>(null);
   const [highlightedColor, setHighlightedColor] = useState<{ colorIndex: number; regionId: number | null } | null>(null);
   const highlightTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const [detectedAlgorithm, setDetectedAlgorithm] = useState<DetectedAlgorithm | undefined>(undefined);
@@ -197,7 +197,7 @@ export default function ImageEditor({ onDesignUploaded }: { onDesignUploaded?: (
     setResizeSettings(snap.resizeSettings);
     setShapeSettings(snap.shapeSettings);
     setSpotPreviewData(snap.spotColors);
-    setSpotColorRestore({ colors: snap.spotColors.colors, id: Date.now() });
+    setSpotColorRestore({ colors: snap.spotColors.colors, id: Date.now(), spotWhiteName: snap.spotColors.spotWhiteName, spotGlossName: snap.spotColors.spotGlossName });
     const imageChanged = snap.imageInfo?.image?.src !== imageInfo?.image?.src;
     if (imageChanged && snap.imageInfo !== undefined) {
       setImageInfo(snap.imageInfo);
@@ -1006,7 +1006,7 @@ export default function ImageEditor({ onDesignUploaded }: { onDesignUploaded?: (
   useEffect(() => {
     if (!pendingSpotTagsRef.current || spotPreviewData.colors.length === 0) return;
     const matched = matchSpotTagsToColors(pendingSpotTagsRef.current, spotPreviewData.colors);
-    setSpotColorRestore({ colors: matched, id: Date.now() });
+    setSpotColorRestore({ colors: matched, id: Date.now(), spotWhiteName: spotPreviewData.spotWhiteName, spotGlossName: spotPreviewData.spotGlossName });
     if (spotPreviewData.colors.some(c => c.regions)) {
       pendingSpotTagsRef.current = null;
     }
