@@ -41,9 +41,11 @@ function readCsrfCookie(): string | undefined {
 export async function apiRequest(
   method: string,
   url: string,
-  data?: unknown | undefined,
+  data?: unknown | FormData | undefined,
 ): Promise<Response> {
-  const headers: Record<string, string> = data ? { "Content-Type": "application/json" } : {};
+  // FormData sets its own Content-Type (with the multipart boundary) — never override it.
+  const isFormData = data instanceof FormData;
+  const headers: Record<string, string> = data && !isFormData ? { "Content-Type": "application/json" } : {};
   if (method !== "GET") {
     const csrfToken = readCsrfCookie();
     if (csrfToken) headers[CSRF_HEADER] = csrfToken;
@@ -52,7 +54,7 @@ export async function apiRequest(
   const res = await fetch(url, {
     method,
     headers,
-    body: data ? JSON.stringify(data) : undefined,
+    body: isFormData ? data : data ? JSON.stringify(data) : undefined,
     credentials: "include",
   });
 

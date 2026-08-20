@@ -26,6 +26,11 @@ import {
   type PackResult,
 } from "@/lib/gang-sheet";
 import type { BezierPath } from "@/lib/contour-worker-manager";
+import { useAuth, getErrorMessage } from "@/hooks/use-auth";
+import { useSaveGangSheet } from "@/hooks/use-gang-sheets";
+import { useToast } from "@/hooks/use-toast";
+import { Input } from "@/components/ui/input";
+import { Dialog, DialogContent, DialogHeader, DialogTitle, DialogFooter } from "@/components/ui/dialog";
 
 interface GangSheetPanelProps {
   open: boolean;
@@ -49,6 +54,12 @@ export default function GangSheetPanel({
   const [isExporting, setIsExporting] = useState(false);
   const [loadedImages, setLoadedImages] = useState<Map<string, HTMLImageElement>>(new Map());
   const [fitWarning, setFitWarning] = useState<{ id: string; maxFit: number } | null>(null);
+  const { isAuthenticated } = useAuth();
+  const { toast } = useToast();
+  const saveGangSheetMutation = useSaveGangSheet();
+  const [saveNameDialogOpen, setSaveNameDialogOpen] = useState(false);
+  const [saveNameValue, setSaveNameValue] = useState("");
+  const [isSaving, setIsSaving] = useState(false);
 
   const packResult: PackResult = useMemo(
     () => packGangSheet(items, settings),
@@ -204,6 +215,55 @@ export default function GangSheetPanel({
       setIsExporting(false);
     }
   }, [items, settings, packResult]);
+
+  // Opens the naming dialog; actual save happens in handleConfirmSaveGangSheet.
+  const handleSaveGangSheet = useCallback(() => {
+    if (!isAuthenticated) {
+      toast({ title: "Sign in required", description: "Log in to save gang sheets.", variant: "destructive" });
+      return;
+    }
+    setSaveNameValue(`Gang Sheet ${settings.sheetWidth}x${settings.sheetHeight}`);
+    setSaveNameDialogOpen(true);
+  }, [isAuthenticated, settings, toast]);
+
+  // One action: generates the PDF, downloads it, and uploads that same file as the saved record.
+  const handleConfirmSaveGangSheet = useCallback(async () => {
+    const name = saveNameValue.trim() || `Gang Sheet ${settings.sheetWidth}x${settings.sheetHeight}`;
+    setSaveNameDialogOpen(false);
+    setIsSaving(true);
+    try {
+      const pdfBlob = await downloadGangSheetPDF(items, settings, packResult.placements);
+
+      let thumbnailBlob: Blob | null = null;
+      try {
+        if (canvasRef.current) {
+          thumbnailBlob = await new Promise<Blob | null>((resolve) =>
+            canvasRef.current!.toBlob(resolve, "image/png")
+          );
+        }
+      } catch (thumbError) {
+        console.warn("[GangSheet] thumbnail capture failed (non-fatal):", thumbError);
+      }
+
+      const totalQuantity = items.reduce((sum, item) => sum + item.quantity, 0);
+
+      const saved = await saveGangSheetMutation.mutateAsync({
+        name,
+        pdfBlob,
+        thumbnailBlob,
+        sheetWidth: settings.sheetWidth,
+        sheetHeight: settings.sheetHeight,
+        itemCount: items.length,
+        totalQuantity,
+      });
+
+      toast({ title: "Gang sheet saved", description: `"${saved.name}" saved and downloaded.` });
+    } catch (error) {
+      toast({ title: "Couldn't save gang sheet", description: getErrorMessage(error), variant: "destructive" });
+    } finally {
+      setIsSaving(false);
+    }
+  }, [items, settings, packResult, saveNameValue, saveGangSheetMutation, toast]);
 
   // Render the preview canvas after images are loaded or panel opens.
   //
@@ -928,8 +988,38 @@ export default function GangSheetPanel({
               </>
             )}
           </Button>
+          {isAuthenticated && (
+            // Labeled to match the dialog's button — saving also downloads, so say so up front.
+            <Button
+              onClick={handleSaveGangSheet}
+              disabled={isSaving || packResult.placements.length === 0}
+              variant="outline"
+              className="w-full mt-2 border-gray-200 text-gray-700"
+            >
+              {isSaving ? "Saving…" : "Save & Download"}
+            </Button>
+          )}
         </div>
       </SheetContent>
+
+      <Dialog open={saveNameDialogOpen} onOpenChange={setSaveNameDialogOpen}>
+        <DialogContent>
+          <DialogHeader>
+            <DialogTitle>Name this gang sheet</DialogTitle>
+          </DialogHeader>
+          <Input
+            autoFocus
+            value={saveNameValue}
+            onChange={(e) => setSaveNameValue(e.target.value)}
+            onKeyDown={(e) => { if (e.key === "Enter") handleConfirmSaveGangSheet(); }}
+            placeholder="Gang Sheet"
+          />
+          <DialogFooter>
+            <Button variant="outline" onClick={() => setSaveNameDialogOpen(false)}>Cancel</Button>
+            <Button onClick={handleConfirmSaveGangSheet}>Save &amp; Download</Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
     </Sheet>
   );
 }

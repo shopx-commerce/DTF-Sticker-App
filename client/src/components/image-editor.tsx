@@ -14,13 +14,22 @@ import { useDebouncedValue } from "@/hooks/use-debounce";
 import { removeBackgroundFromImage } from "@/lib/background-removal";
 import { magicWandErase } from "@/lib/magic-wand";
 import { detectQRsInImage } from "@/lib/qr";
-import type { ParsedPDFData } from "@/lib/pdf-parser";
+import { parsePDF, type ParsedPDFData } from "@/lib/pdf-parser";
 import { detectShape, mapDetectedShapeToType } from "@/lib/shape-detection";
 import { useToast } from "@/hooks/use-toast";
 import EnhanceWorker from "@/lib/enhance-worker?worker";
 import type { GangSheetItem, GangSheetSettings } from "@/lib/gang-sheet";
 import { DEFAULT_GANG_SHEET_SETTINGS, clampGangSheetQuantity } from "@/lib/gang-sheet";
 import GangSheetPanel from "./gang-sheet-panel";
+import { useSearch } from "wouter";
+import { useAuth, getErrorMessage } from "@/hooks/use-auth";
+import { useDesignMutations, type DesignSummary } from "@/hooks/use-designs";
+import { serializeDesign, matchSpotTagsToColors, uploadAsset, fetchAssetAsFile } from "@/lib/design-document";
+import { apiRequest } from "@/lib/queryClient";
+import type { SerializedDesign } from "@shared/design-document";
+import { Dialog, DialogContent, DialogHeader, DialogTitle, DialogFooter } from "@/components/ui/dialog";
+import { Input } from "@/components/ui/input";
+import { Button } from "@/components/ui/button";
 
 export type { ImageInfo, StrokeSettings, StrokeMode, ResizeSettings, ShapeSettings, StickerSize, LockedContour, SegmentLayer, SegmentationData } from "@/lib/types";
 import type { ImageInfo, StrokeSettings, StrokeMode, ResizeSettings, ShapeSettings, StickerSize, LockedContour, SegmentLayer, SegmentationData } from "@/lib/types";
@@ -68,7 +77,7 @@ export default function ImageEditor({ onDesignUploaded }: { onDesignUploaded?: (
   const [magicWandTolerance, setMagicWandTolerance] = useState(0.08); // 0..1
   const [isMagicWandRunning, setIsMagicWandRunning] = useState(false);
   const [spotPreviewData, setSpotPreviewData] = useState<SpotPreviewData>({ enabled: false, colors: [] });
-  const [spotColorRestore, setSpotColorRestore] = useState<{ colors: ExtractedColor[]; id: number } | null>(null);
+  const [spotColorRestore, setSpotColorRestore] = useState<{ colors: ExtractedColor[]; id: number; spotWhiteName?: string; spotGlossName?: string } | null>(null);
   const [highlightedColor, setHighlightedColor] = useState<{ colorIndex: number; regionId: number | null } | null>(null);
   const highlightTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const [detectedAlgorithm, setDetectedAlgorithm] = useState<DetectedAlgorithm | undefined>(undefined);
@@ -96,7 +105,29 @@ export default function ImageEditor({ onDesignUploaded }: { onDesignUploaded?: (
   const [gangSheetSettings, setGangSheetSettings] = useState<GangSheetSettings>(DEFAULT_GANG_SHEET_SETTINGS);
   const [spotPaintMode, setSpotPaintMode] = useState<'white' | 'gloss' | 'both' | 'clear' | null>(null);
   const [pendingSpotPaint, setPendingSpotPaint] = useState<{ colorIndex: number; regionId: number | null; mode: string; id: number } | null>(null);
-  
+
+  // ─── Save & Manage Designs ─────────────────────────────────────────────
+  const { isAuthenticated } = useAuth();
+  const designMutations = useDesignMutations();
+  const [currentDesignId, setCurrentDesignId] = useState<number | null>(null);
+  const [currentDesignName, setCurrentDesignName] = useState<string>('Untitled design');
+  const [sourceAssetId, setSourceAssetId] = useState<number | null>(null);
+  const [isSavingDesign, setIsSavingDesign] = useState(false);
+  // Naming dialog for Save (first time) / Save as New — replaces window.prompt().
+  const [saveNameDialog, setSaveNameDialog] = useState<{ open: boolean; mode: 'save' | 'save-as-new' | null }>({ open: false, mode: null });
+  const [saveNameValue, setSaveNameValue] = useState('');
+  // Tags from a reopened design, matched to colors by hex once re-extracted.
+  const pendingSpotTagsRef = useRef<SerializedDesign['spotColors']['tags'] | null>(null);
+  // Same, but for segmentation layer tags, matched by `label` once re-segmented.
+  const pendingSegmentTagsRef = useRef<SerializedDesign['segmentation']['layers'] | null>(null);
+  const openedDesignParamRef = useRef<string | null>(null);
+  const searchParams = useSearch();
+  // Synced from the URL so reopening a design doesn't flash the empty upload state first.
+  const [isLoadingDesign, setIsLoadingDesign] = useState(() => {
+    const p = new URLSearchParams(searchParams);
+    return p.get('design') !== null;
+  });
+
   const canvasRef = useRef<HTMLCanvasElement>(null);
 
   // Undo/Redo history
@@ -166,7 +197,7 @@ export default function ImageEditor({ onDesignUploaded }: { onDesignUploaded?: (
     setResizeSettings(snap.resizeSettings);
     setShapeSettings(snap.shapeSettings);
     setSpotPreviewData(snap.spotColors);
-    setSpotColorRestore({ colors: snap.spotColors.colors, id: Date.now() });
+    setSpotColorRestore({ colors: snap.spotColors.colors, id: Date.now(), spotWhiteName: snap.spotColors.spotWhiteName, spotGlossName: snap.spotColors.spotGlossName });
     const imageChanged = snap.imageInfo?.image?.src !== imageInfo?.image?.src;
     if (imageChanged && snap.imageInfo !== undefined) {
       setImageInfo(snap.imageInfo);
@@ -905,6 +936,206 @@ export default function ImageEditor({ onDesignUploaded }: { onDesignUploaded?: (
     }));
   }, []);
 
+  // Rebuilds the source file via the normal upload path, then restores saved settings.
+  const reopenDesign = useCallback(async (design: DesignSummary) => {
+    try {
+      const src = design.state.source;
+      if (src.kind === 'pdf') {
+        const file = await fetchAssetAsFile(src.assetId, 'design.pdf', 'application/pdf');
+        const pdfData = await parsePDF(file);
+        handlePDFUpload(file, pdfData);
+      } else {
+        const file = await fetchAssetAsFile(src.assetId, 'design.png', 'image/png');
+        const image = await new Promise<HTMLImageElement>((resolve, reject) => {
+          const img = new Image();
+          img.onload = () => resolve(img);
+          img.onerror = () => reject(new Error('Failed to decode saved image'));
+          img.src = URL.createObjectURL(file);
+        });
+        await handleImageUpload(file, image);
+      }
+
+      const s = design.state;
+      setStrokeSettings(s.strokeSettings);
+      setResizeSettings(s.resizeSettings);
+      setShapeSettings(s.shapeSettings);
+      setStrokeMode(s.strokeMode);
+      setStickerSize(s.stickerSize as StickerSize);
+      setCutContourLabel(s.cutContourLabel);
+      setLockedContour(s.lockedContour ?? null);
+      // Masks aren't persisted; stash the tags for the re-segment effect below.
+      setSegmentationData({ enabled: s.segmentation.enabled, mode: s.segmentation.mode, layers: [] });
+      pendingSegmentTagsRef.current = s.segmentation.layers.length > 0 ? s.segmentation.layers : null;
+      setSpotPreviewData(prev => ({
+        ...prev,
+        enabled: s.spotColors.enabled,
+        spotWhiteName: s.spotColors.spotWhiteName,
+        spotGlossName: s.spotColors.spotGlossName,
+      }));
+      pendingSpotTagsRef.current = s.spotColors.tags;
+
+      setCurrentDesignId(design.id);
+      setCurrentDesignName(design.name);
+      setSourceAssetId(src.assetId);
+
+      toast(pendingSegmentTagsRef.current
+        ? { title: 'Design loaded', description: `"${design.name}" opened. This design has saved layer tags — click Segment to restore them.` }
+        : { title: 'Design loaded', description: `"${design.name}" opened.` });
+    } catch (error) {
+      console.error('[reopen] failed:', error);
+      toast({ title: 'Failed to open design', description: getErrorMessage(error), variant: 'destructive' });
+    }
+  }, [handlePDFUpload, handleImageUpload, toast]);
+
+  // Loads ?design=<id> on mount/change.
+  useEffect(() => {
+    const params = new URLSearchParams(searchParams);
+    const designId = params.get('design');
+
+    if (!designId || designId === openedDesignParamRef.current) return;
+    openedDesignParamRef.current = designId;
+    setIsLoadingDesign(true);
+    apiRequest('GET', `/api/designs/${designId}`)
+      .then(res => res.json())
+      .then(data => reopenDesign(data.design))
+      .catch(error => toast({ title: 'Failed to load design', description: getErrorMessage(error), variant: 'destructive' }))
+      .finally(() => setIsLoadingDesign(false));
+  }, [searchParams, reopenDesign, toast]);
+
+  // Reapplies a reopened design's White/Gloss tags once colors are (re-)extracted.
+  useEffect(() => {
+    if (!pendingSpotTagsRef.current || spotPreviewData.colors.length === 0) return;
+    const matched = matchSpotTagsToColors(pendingSpotTagsRef.current, spotPreviewData.colors);
+    setSpotColorRestore({ colors: matched, id: Date.now(), spotWhiteName: spotPreviewData.spotWhiteName, spotGlossName: spotPreviewData.spotGlossName });
+    if (spotPreviewData.colors.some(c => c.regions)) {
+      pendingSpotTagsRef.current = null;
+    }
+  }, [spotPreviewData.colors]);
+
+  // Same idea for segmentation layer tags, matched by `label` once re-segmented.
+  useEffect(() => {
+    if (!pendingSegmentTagsRef.current || segmentationData.layers.length === 0) return;
+    const tagsByLabel = new Map(pendingSegmentTagsRef.current.map(t => [t.label, t]));
+    let matchedAny = false;
+    setSegmentationData(prev => ({
+      ...prev,
+      layers: prev.layers.map(layer => {
+        const tag = tagsByLabel.get(layer.label);
+        if (!tag) return layer;
+        matchedAny = true;
+        return { ...layer, spotWhite: tag.spotWhite, spotGloss: tag.spotGloss };
+      }),
+    }));
+    pendingSegmentTagsRef.current = null;
+    if (matchedAny) {
+      toast({ title: 'Layer tags restored', description: 'Saved White/Gloss tags were reapplied to the matching layers.' });
+    }
+  }, [segmentationData.layers, toast]);
+
+  // Actual save logic, given a resolved name (existing designs already have one).
+  const performSave = useCallback(async (mode: 'save' | 'save-as-new', name: string) => {
+    if (!imageInfo) return;
+
+    setIsSavingDesign(true);
+    try {
+      let assetId = sourceAssetId;
+      if (!assetId || mode === 'save-as-new') {
+        if (imageInfo.isPDF && imageInfo.originalPdfData) {
+          const pdfBlob = new Blob([imageInfo.originalPdfData], { type: 'application/pdf' });
+          const uploaded = await uploadAsset(pdfBlob, imageInfo.file.name || 'design.pdf', 'source_pdf');
+          assetId = uploaded.id;
+        } else {
+          const uploaded = await uploadAsset(imageInfo.file, imageInfo.file.name || 'design.png', 'source_image', {
+            width: imageInfo.originalWidth,
+            height: imageInfo.originalHeight,
+          });
+          assetId = uploaded.id;
+        }
+        setSourceAssetId(assetId);
+      }
+
+      // Thumbnail is cosmetic — a failure here shouldn't block the save.
+      let thumbnailAssetId: number | undefined;
+      try {
+        if (canvasRef.current) {
+          const blob = await new Promise<Blob | null>(resolve => canvasRef.current!.toBlob(resolve, 'image/png'));
+          if (blob) {
+            const uploaded = await uploadAsset(blob, 'thumbnail.png', 'thumbnail');
+            thumbnailAssetId = uploaded.id;
+          }
+        }
+      } catch (thumbError) {
+        console.warn('[save] thumbnail upload failed (non-fatal):', thumbError);
+      }
+
+      const state = serializeDesign({
+        sourceAssetId: assetId!,
+        imageInfo,
+        strokeSettings,
+        resizeSettings,
+        shapeSettings,
+        strokeMode,
+        stickerSize,
+        cutContourLabel,
+        lockedContour,
+        spotPreviewData,
+        segmentationData,
+      });
+
+      if (mode === 'save' && currentDesignId) {
+        await designMutations.update.mutateAsync({
+          id: currentDesignId,
+          name,
+          state,
+          sourceAssetId: assetId!,
+          thumbnailAssetId,
+        });
+        setCurrentDesignName(name);
+        toast({ title: 'Saved' });
+      } else {
+        const result = await designMutations.create.mutateAsync({ name, state, sourceAssetId: assetId!, thumbnailAssetId });
+        setCurrentDesignId(result.design.id);
+        setCurrentDesignName(name);
+        toast({ title: 'Saved as new design' });
+      }
+    } catch (error) {
+      toast({ title: 'Save failed', description: getErrorMessage(error), variant: 'destructive' });
+    } finally {
+      setIsSavingDesign(false);
+    }
+  }, [
+    imageInfo, sourceAssetId, currentDesignId,
+    strokeSettings, resizeSettings, shapeSettings, strokeMode, stickerSize,
+    cutContourLabel, lockedContour, spotPreviewData, segmentationData,
+    designMutations, toast,
+  ]);
+
+  // Entry point from Save / Save as New; opens a naming dialog instead of window.prompt().
+  const handleSaveDesign = useCallback((mode: 'save' | 'save-as-new') => {
+    if (!imageInfo) {
+      toast({ title: 'Nothing to save', description: 'Upload a design first.', variant: 'destructive' });
+      return;
+    }
+    if (!isAuthenticated) {
+      toast({ title: 'Sign in required', description: 'Log in to save your designs.', variant: 'destructive' });
+      return;
+    }
+
+    if (mode === 'save' && currentDesignId) {
+      performSave('save', currentDesignName);
+    } else {
+      setSaveNameDialog({ open: true, mode });
+      setSaveNameValue(mode === 'save-as-new' ? `${currentDesignName} (copy)` : currentDesignName);
+    }
+  }, [imageInfo, isAuthenticated, currentDesignId, currentDesignName, performSave, toast]);
+
+  const handleConfirmSaveName = useCallback(() => {
+    if (!saveNameDialog.mode) return;
+    const name = saveNameValue.trim() || currentDesignName;
+    setSaveNameDialog({ open: false, mode: null });
+    performSave(saveNameDialog.mode, name);
+  }, [saveNameDialog, saveNameValue, currentDesignName, performSave]);
+
   const handleResizeChange = useCallback((newSettings: Partial<ResizeSettings>) => {
     setResizeSettings(prev => {
       const updated = { ...prev, ...newSettings };
@@ -1442,7 +1673,7 @@ export default function ImageEditor({ onDesignUploaded }: { onDesignUploaded?: (
             URL.revokeObjectURL(url);
           }
         }, 'image/png');
-        
+
       } else if (downloadType === 'cutcontour') {
         // Generate magenta vector path along transparent pixel boundaries
         await new Promise(resolve => setTimeout(resolve, 100)); // UI feedback delay
@@ -1456,7 +1687,7 @@ export default function ImageEditor({ onDesignUploaded }: { onDesignUploaded?: (
         // Download the magenta cut contour
         magentaCutCanvas.toBlob((blob: Blob | null) => {
           if (!blob) return;
-          
+
           const url = URL.createObjectURL(blob);
           const link = document.createElement('a');
           link.href = url;
@@ -1466,7 +1697,7 @@ export default function ImageEditor({ onDesignUploaded }: { onDesignUploaded?: (
           document.body.removeChild(link);
           URL.revokeObjectURL(url);
         }, 'image/png');
-        
+
         // Also generate vector formats for cutting machines
         const vectorPaths = createVectorPaths(imageInfo.image, {
           ...strokeSettings, 
@@ -1549,6 +1780,18 @@ export default function ImageEditor({ onDesignUploaded }: { onDesignUploaded?: (
     }
   }, [imageInfo, strokeSettings, resizeSettings, shapeSettings, cutContourLabel, lockedContour]);
 
+  // Shown while a saved design is being fetched/rebuilt, to avoid an empty-state flash.
+  if (isLoadingDesign) {
+    return (
+      <div className="min-h-[70vh] flex items-center justify-center">
+        <div className="w-full max-w-xl mx-auto text-center bg-white rounded-2xl shadow-xl p-12">
+          <div className="w-8 h-8 mx-auto border-2 border-slate-300 border-t-slate-800 rounded-full animate-spin" />
+          <p className="mt-4 text-slate-500 text-sm">Loading your design…</p>
+        </div>
+      </div>
+    );
+  }
+
   // Empty state - no image uploaded
   if (!imageInfo) {
     return (
@@ -1581,6 +1824,46 @@ export default function ImageEditor({ onDesignUploaded }: { onDesignUploaded?: (
           stickerSize={stickerSize}
         />
       </div>
+      {isAuthenticated && (
+        // Save/Save as New only shown signed in — anonymous editing stays fully functional either way.
+        <div className="lg:col-span-12 flex items-center justify-end gap-2 -mb-1">
+          {currentDesignId && (
+            <span className="text-xs text-slate-400 truncate max-w-[200px] mr-auto">{currentDesignName}</span>
+          )}
+          <button
+            onClick={() => handleSaveDesign('save-as-new')}
+            disabled={isSavingDesign}
+            className="text-xs px-3 py-1.5 rounded-md border border-slate-200 bg-white text-slate-700 hover:bg-slate-50 disabled:opacity-50 transition-colors"
+          >
+            Save as New
+          </button>
+          <button
+            onClick={() => handleSaveDesign('save')}
+            disabled={isSavingDesign}
+            className="text-xs px-3 py-1.5 rounded-md bg-slate-900 text-white hover:bg-slate-800 disabled:opacity-50 transition-colors"
+          >
+            {isSavingDesign ? 'Saving…' : currentDesignId ? 'Save' : 'Save Design'}
+          </button>
+        </div>
+      )}
+      <Dialog open={saveNameDialog.open} onOpenChange={(open) => setSaveNameDialog(prev => ({ ...prev, open }))}>
+        <DialogContent>
+          <DialogHeader>
+            <DialogTitle>{saveNameDialog.mode === 'save-as-new' ? 'Save as new design' : 'Name this design'}</DialogTitle>
+          </DialogHeader>
+          <Input
+            autoFocus
+            value={saveNameValue}
+            onChange={(e) => setSaveNameValue(e.target.value)}
+            onKeyDown={(e) => { if (e.key === 'Enter') handleConfirmSaveName(); }}
+            placeholder="Untitled design"
+          />
+          <DialogFooter>
+            <Button variant="outline" onClick={() => setSaveNameDialog({ open: false, mode: null })}>Cancel</Button>
+            <Button onClick={handleConfirmSaveName}>Save</Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
       {/* Left sidebar - Settings */}
       <div className="lg:col-span-4 xl:col-span-3 space-y-3">
         <ControlsSection

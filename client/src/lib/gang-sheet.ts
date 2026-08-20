@@ -445,11 +445,12 @@ function remapBezierPathToSheet(
 
 // ─── Gang Sheet PDF Export ───
 
+// Also returns the generated Blob so a caller can persist it via "Save Gang Sheet" — same bytes.
 export async function downloadGangSheetPDF(
   items: GangSheetItem[],
   settings: GangSheetSettings,
   placements: PlacedItem[]
-): Promise<void> {
+): Promise<Blob> {
   const { sheetWidth, sheetHeight } = settings;
   const widthPts = sheetWidth * 72;
   const heightPts = sheetHeight * 72;
@@ -931,4 +932,6 @@ export async function downloadGangSheetPDF(
   } finally {
     URL.revokeObjectURL(url);
   }
+
+  return blob;
 }

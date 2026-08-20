@@ -25,9 +25,9 @@ Preferred communication style: Simple, everyday language.
 - **Development**: tsx
 
 ### Data Storage
-- **Database**: PostgreSQL with Drizzle ORM for user management
+- **Database**: PostgreSQL with Drizzle ORM (users, sessions, designs, gang sheets, assets)
 - **Session Storage**: Postgres-backed via `connect-pg-simple`, rolling expiry
-- **File Storage**: Temporary in-memory processing for uploads
+- **File Storage**: Cloudflare R2 (S3-compatible) for uploaded/generated assets, via a swappable storage interface (`server/lib/object-storage.ts`)
 
 ### Key Features and Design Decisions
 - **Image Processing Pipeline**: Drag-and-drop upload, real-time canvas preview, customizable stroke (width, color, enable/disable), shape backgrounds (square, rectangle, circle, oval with fill colors and strokes), and high-resolution export.
