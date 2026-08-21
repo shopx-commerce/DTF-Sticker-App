@@ -5,6 +5,7 @@ import {
   sessions,
   assets,
   designs,
+  downloads,
   gangSheets,
   type User,
   type InsertUser,
@@ -14,6 +15,7 @@ import {
   type InsertAsset,
   type Design,
   type DesignListItem,
+  type InsertDownload,
   type GangSheet,
 } from "@shared/schema";
 import type { SerializedDesign } from "@shared/design-document";
@@ -77,6 +79,8 @@ export interface IStorage {
   getDesignForUser(id: number, userId: number): Promise<Design | undefined>;
   updateDesign(id: number, updates: UpdateDesignParams): Promise<Design | undefined>;
   softDeleteDesign(id: number): Promise<void>;
+
+  recordDownload(params: InsertDownload): Promise<void>;
 
   createGangSheet(params: CreateGangSheetParams): Promise<GangSheet>;
   listGangSheetsForUser(userId: number): Promise<GangSheet[]>;
@@ -190,6 +194,10 @@ export class DbStorage implements IStorage {
 
   async softDeleteDesign(id: number): Promise<void> {
     await db.update(designs).set({ deletedAt: new Date() }).where(eq(designs.id, id));
+  }
+
+  async recordDownload(params: InsertDownload): Promise<void> {
+    await db.insert(downloads).values(params);
   }
 
   async createGangSheet(params: CreateGangSheetParams): Promise<GangSheet> {

@@ -26,6 +26,7 @@ import {
   type PackResult,
 } from "@/lib/gang-sheet";
 import type { BezierPath } from "@/lib/contour-worker-manager";
+import { recordDownload } from "@/lib/downloads";
 import { useAuth, getErrorMessage } from "@/hooks/use-auth";
 import { useSaveGangSheet } from "@/hooks/use-gang-sheets";
 import { useToast } from "@/hooks/use-toast";
@@ -209,6 +210,7 @@ export default function GangSheetPanel({
     setIsExporting(true);
     try {
       await downloadGangSheetPDF(items, settings, packResult.placements);
+      recordDownload({ downloadType: "gang-sheet" });
     } catch (err) {
       console.error("[GangSheet] PDF export failed:", err);
     } finally {
@@ -257,6 +259,7 @@ export default function GangSheetPanel({
         totalQuantity,
       });
 
+      recordDownload({ downloadType: "gang-sheet", gangSheetId: saved.id });
       toast({ title: "Gang sheet saved", description: `"${saved.name}" saved and downloaded.` });
     } catch (error) {
       toast({ title: "Couldn't save gang sheet", description: getErrorMessage(error), variant: "destructive" });

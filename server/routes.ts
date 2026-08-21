@@ -11,6 +11,7 @@ import sgMail from "@sendgrid/mail";
 import { registerAuthRoutes } from "./routes/auth";
 import { registerAssetRoutes } from "./routes/assets";
 import { registerDesignRoutes } from "./routes/designs";
+import { registerDownloadRoutes } from "./routes/downloads";
 import { registerGangSheetRoutes } from "./routes/gang-sheets";
 
 // Configure multer for file uploads
@@ -37,6 +38,7 @@ export async function registerRoutes(app: Express): Promise<Server> {
   registerAuthRoutes(app);
   registerAssetRoutes(app);
   registerDesignRoutes(app);
+  registerDownloadRoutes(app);
   registerGangSheetRoutes(app);
 
   // Process image with high-quality stroke and resize
