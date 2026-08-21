@@ -126,6 +126,29 @@ export const gangSheets = pgTable("gang_sheets", {
 export type GangSheet = typeof gangSheets.$inferSelect;
 export type InsertGangSheet = typeof gangSheets.$inferInsert;
 
+// ─── Downloads — one row per completed download; only recorded for signed-in users ───
+export const downloadTypes = [
+  "standard", "highres", "vector", "cutcontour", "design-only", "download-package", "gang-sheet",
+] as const;
+export type DownloadType = (typeof downloadTypes)[number];
+
+export const downloads = pgTable("downloads", {
+  id: serial("id").primaryKey(),
+  userId: integer("user_id")
+    .notNull()
+    .references(() => users.id, { onDelete: "cascade" }),
+  // Nullable: download doesn't require a saved design; survives as an orphaned row if deleted.
+  designId: integer("design_id").references(() => designs.id, { onDelete: "set null" }),
+  // Same idea for gang sheets — quick-download without saving is allowed.
+  gangSheetId: integer("gang_sheet_id").references(() => gangSheets.id, { onDelete: "set null" }),
+  downloadType: text("download_type").notNull(), // DownloadType
+  format: text("format"),
+  createdAt: timestamp("created_at").notNull().defaultNow(),
+});
+
+export type Download = typeof downloads.$inferSelect;
+export type InsertDownload = typeof downloads.$inferInsert;
+
 // ─── Request validation schemas ─────────────────────────────────────────
 
 // Used by registration/reset only — login just checks against whatever hash is already stored.
@@ -170,6 +193,14 @@ export const resendVerificationSchema = z.object({
   email: z.string().trim().toLowerCase().email("Enter a valid email address"),
 });
 export type ResendVerificationInput = z.infer<typeof resendVerificationSchema>;
+
+export const recordDownloadSchema = z.object({
+  designId: z.number().int().optional(),
+  gangSheetId: z.number().int().optional(),
+  downloadType: z.enum(downloadTypes),
+  format: z.string().max(20).optional(),
+});
+export type RecordDownloadInput = z.infer<typeof recordDownloadSchema>;
 
 export const createGangSheetSchema = z.object({
   name: z.string().trim().min(1, "Name is required").max(200),

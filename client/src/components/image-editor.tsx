@@ -26,6 +26,7 @@ import { useAuth, getErrorMessage } from "@/hooks/use-auth";
 import { useDesignMutations, type DesignSummary } from "@/hooks/use-designs";
 import { serializeDesign, matchSpotTagsToColors, uploadAsset, fetchAssetAsFile } from "@/lib/design-document";
 import { apiRequest } from "@/lib/queryClient";
+import { recordDownload } from "@/lib/downloads";
 import type { SerializedDesign } from "@shared/design-document";
 import { Dialog, DialogContent, DialogHeader, DialogTitle, DialogFooter } from "@/components/ui/dialog";
 import { Input } from "@/components/ui/input";
@@ -1567,6 +1568,7 @@ export default function ImageEditor({ onDesignUploaded }: { onDesignUploaded?: (
           `${nameWithoutExt}_with_cutcontour.pdf`,
           cutContourLabel
         );
+        recordDownload({ designId: currentDesignId ?? undefined, downloadType, format });
         setIsProcessing(false);
         return;
       }
@@ -1658,21 +1660,19 @@ export default function ImageEditor({ onDesignUploaded }: { onDesignUploaded?: (
         ctx.drawImage(finalImage, imageX, imageY, imageWidth, imageHeight);
         ctx.restore();
 
-        // Download final design only
+        // Awaited so recordDownload below can't fire before the file exists.
         const nameWithoutExt = imageInfo.file.name.replace(/\.[^/.]+$/, '');
-        canvas.toBlob((blob) => {
-          if (blob) {
-            const url = URL.createObjectURL(blob);
-            const link = document.createElement('a');
-            link.href = url;
-            link.download = `${nameWithoutExt}_final_design.png`;
-            link.style.display = 'none';
-            document.body.appendChild(link);
-            link.click();
-            document.body.removeChild(link);
-            URL.revokeObjectURL(url);
-          }
-        }, 'image/png');
+        const finalDesignBlob = await new Promise<Blob | null>((resolve) => canvas.toBlob(resolve, 'image/png'));
+        if (!finalDesignBlob) throw new Error('Failed to generate final design image');
+        const finalDesignUrl = URL.createObjectURL(finalDesignBlob);
+        const finalDesignLink = document.createElement('a');
+        finalDesignLink.href = finalDesignUrl;
+        finalDesignLink.download = `${nameWithoutExt}_final_design.png`;
+        finalDesignLink.style.display = 'none';
+        document.body.appendChild(finalDesignLink);
+        finalDesignLink.click();
+        document.body.removeChild(finalDesignLink);
+        URL.revokeObjectURL(finalDesignUrl);
 
       } else if (downloadType === 'cutcontour') {
         // Generate magenta vector path along transparent pixel boundaries
@@ -1684,19 +1684,17 @@ export default function ImageEditor({ onDesignUploaded }: { onDesignUploaded?: (
           vectorQuality: 'high' // High quality for precise cutting paths
         });
         
-        // Download the magenta cut contour
-        magentaCutCanvas.toBlob((blob: Blob | null) => {
-          if (!blob) return;
-
-          const url = URL.createObjectURL(blob);
-          const link = document.createElement('a');
-          link.href = url;
-          link.download = 'magenta_cut_contour.png';
-          document.body.appendChild(link);
-          link.click();
-          document.body.removeChild(link);
-          URL.revokeObjectURL(url);
-        }, 'image/png');
+        // Awaited for the same reason as the download-package branch above.
+        const cutContourBlob = await new Promise<Blob | null>((resolve) => magentaCutCanvas.toBlob(resolve, 'image/png'));
+        if (!cutContourBlob) throw new Error('Failed to generate cut contour image');
+        const cutContourUrl = URL.createObjectURL(cutContourBlob);
+        const cutContourLink = document.createElement('a');
+        cutContourLink.href = cutContourUrl;
+        cutContourLink.download = 'magenta_cut_contour.png';
+        document.body.appendChild(cutContourLink);
+        cutContourLink.click();
+        document.body.removeChild(cutContourLink);
+        URL.revokeObjectURL(cutContourUrl);
 
         // Also generate vector formats for cutting machines
         const vectorPaths = createVectorPaths(imageInfo.image, {
@@ -1765,6 +1763,8 @@ export default function ImageEditor({ onDesignUploaded }: { onDesignUploaded?: (
           return;
         }
       }
+      // Only reached once a file was actually produced (no-cutlines returns earlier).
+      recordDownload({ designId: currentDesignId ?? undefined, downloadType, format });
     } catch (error) {
       console.error("Download failed:", error);
       console.error("Error details:", {
@@ -1778,7 +1778,7 @@ export default function ImageEditor({ onDesignUploaded }: { onDesignUploaded?: (
     } finally {
       setIsProcessing(false);
     }
-  }, [imageInfo, strokeSettings, resizeSettings, shapeSettings, cutContourLabel, lockedContour]);
+  }, [imageInfo, strokeSettings, resizeSettings, shapeSettings, cutContourLabel, lockedContour, currentDesignId]);
 
   // Shown while a saved design is being fetched/rebuilt, to avoid an empty-state flash.
   if (isLoadingDesign) {

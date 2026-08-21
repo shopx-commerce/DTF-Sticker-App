@@ -25,7 +25,7 @@ Preferred communication style: Simple, everyday language.
 - **Development**: tsx
 
 ### Data Storage
-- **Database**: PostgreSQL with Drizzle ORM (users, sessions, designs, gang sheets, assets)
+- **Database**: PostgreSQL with Drizzle ORM (users, sessions, designs, gang sheets, downloads, assets)
 - **Session Storage**: Postgres-backed via `connect-pg-simple`, rolling expiry
 - **File Storage**: Cloudflare R2 (S3-compatible) for uploaded/generated assets, via a swappable storage interface (`server/lib/object-storage.ts`)
 
