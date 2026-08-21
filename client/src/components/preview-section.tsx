@@ -37,6 +37,8 @@ interface PreviewSectionProps {
   onRedo?: () => void;
   canUndo?: boolean;
   canRedo?: boolean;
+  // Admin's read-only "View" — hides the size controls/undo-redo/background swatches above the canvas.
+  readOnly?: boolean;
 }
 
 function InchInput({ value, onCommit, min = 0.5, max = 50, className }: {
@@ -80,7 +82,7 @@ function InchInput({ value, onCommit, min = 0.5, max = 50, className }: {
 }
 
 const PreviewSection = forwardRef<HTMLCanvasElement, PreviewSectionProps>(
-  ({ imageInfo, strokeSettings, resizeSettings, shapeSettings, cadCutBounds, spotPreviewData, showCutLineInfo, onDetectedAlgorithm, detectedShapeType, detectedShapeInfo, detectedAlgorithm, onStrokeChange, lockedContour, segmentationData, onSpotColorClick, spotPaintMode, magicWandMode, onMagicWandPick, fileName, onResizeChange, onUndo, onRedo, canUndo, canRedo }, ref) => {
+  ({ imageInfo, strokeSettings, resizeSettings, shapeSettings, cadCutBounds, spotPreviewData, showCutLineInfo, onDetectedAlgorithm, detectedShapeType, detectedShapeInfo, detectedAlgorithm, onStrokeChange, lockedContour, segmentationData, onSpotColorClick, spotPaintMode, magicWandMode, onMagicWandPick, fileName, onResizeChange, onUndo, onRedo, canUndo, canRedo, readOnly }, ref) => {
     const canvasRef = useRef<HTMLCanvasElement>(null);
     const containerRef = useRef<HTMLDivElement>(null);
     const [zoom, setZoom] = useState(1);
@@ -1756,8 +1758,8 @@ const PreviewSection = forwardRef<HTMLCanvasElement, PreviewSectionProps>(
       <div className="w-full">
         <Card className="bg-white border-gray-100 shadow-sm rounded-2xl overflow-hidden">
           <CardContent className="p-0">
-            {/* Design info + preview background swatches */}
-            <div className="mx-2 mt-2 mb-0 flex items-center gap-1.5 p-1.5">
+            {/* Design info + preview background swatches — hidden in the admin read-only view. */}
+            {!readOnly && <div className="mx-2 mt-2 mb-0 flex items-center gap-1.5 p-1.5">
               {imageInfo && (
                 <div className="flex items-center gap-1 min-w-0 flex-shrink-0">
                   <span className="text-[10px] text-gray-400 font-medium">W</span>
@@ -1851,7 +1853,7 @@ const PreviewSection = forwardRef<HTMLCanvasElement, PreviewSectionProps>(
                   ))}
                 </div>
               )}
-            </div>
+            </div>}
 
             <div className="flex flex-col items-start">
               <div className="flex w-full">

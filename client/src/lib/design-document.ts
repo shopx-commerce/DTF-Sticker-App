@@ -166,3 +166,10 @@ export async function fetchAssetAsFile(assetId: number, filename: string, mime: 
   const blob = await res.blob();
   return new File([blob], filename, { type: mime });
 }
+
+// Admin-only equivalent — fetches ANY user's asset, for the read-only design view.
+export async function fetchAssetAsFileForAdmin(assetId: number, filename: string, mime: string): Promise<File> {
+  const res = await apiRequest("GET", `/api/admin/assets/${assetId}/file`);
+  const blob = await res.blob();
+  return new File([blob], filename, { type: mime });
+}

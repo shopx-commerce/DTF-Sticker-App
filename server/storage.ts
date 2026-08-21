@@ -17,6 +17,9 @@ import {
   type DesignListItem,
   type InsertDownload,
   type GangSheet,
+  type UserWithStats,
+  type DesignWithOwner,
+  type AdminStats,
 } from "@shared/schema";
 import type { SerializedDesign } from "@shared/design-document";
 import { eq, and, isNull, gt, desc, sql } from "drizzle-orm";
@@ -73,6 +76,7 @@ export interface IStorage {
 
   createAsset(params: InsertAsset): Promise<Asset>;
   getAssetForUser(id: number, userId: number): Promise<Asset | undefined>;
+  getAssetAny(id: number): Promise<Asset | undefined>;
 
   listDesignsForUser(userId: number): Promise<DesignListItem[]>;
   createDesign(params: CreateDesignParams): Promise<Design>;
@@ -86,6 +90,14 @@ export interface IStorage {
   listGangSheetsForUser(userId: number): Promise<GangSheet[]>;
   getGangSheetForUser(id: number, userId: number): Promise<GangSheet | undefined>;
   softDeleteGangSheet(id: number): Promise<void>;
+
+  // Admin-only: unscoped by owner — gated by requireAdmin at the route layer, not here.
+  listUsersWithStats(): Promise<UserWithStats[]>;
+  listAllDesignsForAdmin(): Promise<DesignWithOwner[]>;
+  getDesignAny(id: number): Promise<Design | undefined>;
+  getDesignWithOwner(id: number): Promise<(Design & { ownerEmail: string }) | undefined>;
+  getForkForUser(originalDesignId: number, userId: number): Promise<Design | undefined>;
+  getAdminStats(): Promise<AdminStats>;
 }
 
 export class DbStorage implements IStorage {
@@ -159,6 +171,12 @@ export class DbStorage implements IStorage {
     return asset;
   }
 
+  // No ownership filter — admin-only, used to copy a design's files during fork.
+  async getAssetAny(id: number): Promise<Asset | undefined> {
+    const [asset] = await db.select().from(assets).where(eq(assets.id, id));
+    return asset;
+  }
+
   async listDesignsForUser(userId: number): Promise<DesignListItem[]> {
     // Sorted by creation order, matching listGangSheetsForUser — one consistent sequence across both sections.
     // Column-limited — the list view never needs the (large) state JSONB.
@@ -223,6 +241,88 @@ export class DbStorage implements IStorage {
 
   async softDeleteGangSheet(id: number): Promise<void> {
     await db.update(gangSheets).set({ deletedAt: new Date() }).where(eq(gangSheets.id, id));
+  }
+
+  async listUsersWithStats(): Promise<UserWithStats[]> {
+    return db
+      .select({
+        id: users.id,
+        email: users.email,
+        name: users.name,
+        role: users.role,
+        emailVerified: users.emailVerified,
+        createdAt: users.createdAt,
+        // DISTINCT avoids the two left joins multiplying against each other.
+        designCount: sql<number>`count(distinct ${designs.id})`.mapWith(Number),
+        downloadCount: sql<number>`count(distinct ${downloads.id})`.mapWith(Number),
+      })
+      .from(users)
+      .leftJoin(designs, and(eq(designs.userId, users.id), isNull(designs.deletedAt)))
+      .leftJoin(downloads, eq(downloads.userId, users.id))
+      .groupBy(users.id)
+      .orderBy(desc(users.createdAt));
+  }
+
+  async listAllDesignsForAdmin(): Promise<DesignWithOwner[]> {
+    return db
+      .select({
+        id: designs.id,
+        name: designs.name,
+        userId: designs.userId,
+        ownerEmail: users.email,
+        thumbnailAssetId: designs.thumbnailAssetId,
+        sourceAssetId: designs.sourceAssetId,
+        forkedFromId: designs.forkedFromId,
+        createdAt: designs.createdAt,
+        updatedAt: designs.updatedAt,
+      })
+      .from(designs)
+      .innerJoin(users, eq(designs.userId, users.id))
+      .where(isNull(designs.deletedAt))
+      .orderBy(desc(designs.updatedAt));
+  }
+
+  // No ownership filter — admin routes may inspect/fork any design; every call site is behind requireAdmin.
+  async getDesignAny(id: number): Promise<Design | undefined> {
+    const [design] = await db
+      .select()
+      .from(designs)
+      .where(and(eq(designs.id, id), isNull(designs.deletedAt)));
+    return design;
+  }
+
+  // Same as getDesignAny, plus the owner's email — for the admin's read-only design view.
+  async getDesignWithOwner(id: number): Promise<(Design & { ownerEmail: string }) | undefined> {
+    const [row] = await db
+      .select({ design: designs, ownerEmail: users.email })
+      .from(designs)
+      .innerJoin(users, eq(designs.userId, users.id))
+      .where(and(eq(designs.id, id), isNull(designs.deletedAt)));
+    return row ? { ...row.design, ownerEmail: row.ownerEmail } : undefined;
+  }
+
+  // Makes "Edit as my own" idempotent — repeat forks reopen the same copy instead of duplicating.
+  async getForkForUser(originalDesignId: number, userId: number): Promise<Design | undefined> {
+    const [design] = await db
+      .select()
+      .from(designs)
+      .where(and(eq(designs.forkedFromId, originalDesignId), eq(designs.userId, userId), isNull(designs.deletedAt)))
+      .orderBy(desc(designs.createdAt))
+      .limit(1);
+    return design;
+  }
+
+  async getAdminStats(): Promise<AdminStats> {
+    const [[userRow], [designRow], [downloadRow]] = await Promise.all([
+      db.select({ count: sql<number>`count(*)`.mapWith(Number) }).from(users),
+      db.select({ count: sql<number>`count(*)`.mapWith(Number) }).from(designs).where(isNull(designs.deletedAt)),
+      db.select({ count: sql<number>`count(*)`.mapWith(Number) }).from(downloads),
+    ]);
+    return {
+      totalUsers: userRow.count,
+      totalDesigns: designRow.count,
+      totalDownloads: downloadRow.count,
+    };
   }
 }
 

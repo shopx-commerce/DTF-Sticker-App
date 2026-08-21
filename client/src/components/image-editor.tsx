@@ -21,10 +21,11 @@ import EnhanceWorker from "@/lib/enhance-worker?worker";
 import type { GangSheetItem, GangSheetSettings } from "@/lib/gang-sheet";
 import { DEFAULT_GANG_SHEET_SETTINGS, clampGangSheetQuantity } from "@/lib/gang-sheet";
 import GangSheetPanel from "./gang-sheet-panel";
-import { useSearch } from "wouter";
+import { useSearch, useLocation } from "wouter";
 import { useAuth, getErrorMessage } from "@/hooks/use-auth";
 import { useDesignMutations, type DesignSummary } from "@/hooks/use-designs";
-import { serializeDesign, matchSpotTagsToColors, uploadAsset, fetchAssetAsFile } from "@/lib/design-document";
+import type { AdminDesignDetail } from "@/hooks/use-admin";
+import { serializeDesign, matchSpotTagsToColors, uploadAsset, fetchAssetAsFile, fetchAssetAsFileForAdmin } from "@/lib/design-document";
 import { apiRequest } from "@/lib/queryClient";
 import { recordDownload } from "@/lib/downloads";
 import type { SerializedDesign } from "@shared/design-document";
@@ -109,6 +110,7 @@ export default function ImageEditor({ onDesignUploaded }: { onDesignUploaded?: (
 
   // ─── Save & Manage Designs ─────────────────────────────────────────────
   const { isAuthenticated } = useAuth();
+  const [, setLocation] = useLocation();
   const designMutations = useDesignMutations();
   const [currentDesignId, setCurrentDesignId] = useState<number | null>(null);
   const [currentDesignName, setCurrentDesignName] = useState<string>('Untitled design');
@@ -126,8 +128,12 @@ export default function ImageEditor({ onDesignUploaded }: { onDesignUploaded?: (
   // Synced from the URL so reopening a design doesn't flash the empty upload state first.
   const [isLoadingDesign, setIsLoadingDesign] = useState(() => {
     const p = new URLSearchParams(searchParams);
-    return p.get('design') !== null;
+    return p.get('design') !== null || p.get('adminView') !== null;
   });
+  // Admin's read-only "View" — loads another user's design with Save hidden; "Edit as my own" forks it.
+  const [isReadOnlyView, setIsReadOnlyView] = useState(false);
+  const [readOnlyOwnerEmail, setReadOnlyOwnerEmail] = useState<string | null>(null);
+  const [readOnlyOriginalId, setReadOnlyOriginalId] = useState<number | null>(null);
 
   const canvasRef = useRef<HTMLCanvasElement>(null);
 
@@ -940,6 +946,11 @@ export default function ImageEditor({ onDesignUploaded }: { onDesignUploaded?: (
   // Rebuilds the source file via the normal upload path, then restores saved settings.
   const reopenDesign = useCallback(async (design: DesignSummary) => {
     try {
+      // Clear any leftover admin read-only banner from a previous view.
+      setIsReadOnlyView(false);
+      setReadOnlyOwnerEmail(null);
+      setReadOnlyOriginalId(null);
+
       const src = design.state.source;
       if (src.kind === 'pdf') {
         const file = await fetchAssetAsFile(src.assetId, 'design.pdf', 'application/pdf');
@@ -988,10 +999,71 @@ export default function ImageEditor({ onDesignUploaded }: { onDesignUploaded?: (
     }
   }, [handlePDFUpload, handleImageUpload, toast]);
 
-  // Loads ?design=<id> on mount/change.
+  // Admin's "View" — loads the original owner's design via unscoped endpoints, not a fork; leaves currentDesignId/sourceAssetId unset so nothing can write back to it.
+  const reopenDesignReadOnly = useCallback(async (design: AdminDesignDetail) => {
+    try {
+      const src = design.state.source;
+      if (src.kind === 'pdf') {
+        const file = await fetchAssetAsFileForAdmin(src.assetId, 'design.pdf', 'application/pdf');
+        const pdfData = await parsePDF(file);
+        handlePDFUpload(file, pdfData);
+      } else {
+        const file = await fetchAssetAsFileForAdmin(src.assetId, 'design.png', 'image/png');
+        const image = await new Promise<HTMLImageElement>((resolve, reject) => {
+          const img = new Image();
+          img.onload = () => resolve(img);
+          img.onerror = () => reject(new Error('Failed to decode design image'));
+          img.src = URL.createObjectURL(file);
+        });
+        await handleImageUpload(file, image);
+      }
+
+      const s = design.state;
+      setStrokeSettings(s.strokeSettings);
+      setResizeSettings(s.resizeSettings);
+      setShapeSettings(s.shapeSettings);
+      setStrokeMode(s.strokeMode);
+      setStickerSize(s.stickerSize as StickerSize);
+      setCutContourLabel(s.cutContourLabel);
+      setLockedContour(s.lockedContour ?? null);
+      setSegmentationData({ enabled: s.segmentation.enabled, mode: s.segmentation.mode, layers: [] });
+      pendingSegmentTagsRef.current = s.segmentation.layers.length > 0 ? s.segmentation.layers : null;
+      setSpotPreviewData(prev => ({
+        ...prev,
+        enabled: s.spotColors.enabled,
+        spotWhiteName: s.spotColors.spotWhiteName,
+        spotGlossName: s.spotColors.spotGlossName,
+      }));
+      pendingSpotTagsRef.current = s.spotColors.tags;
+
+      setCurrentDesignName(design.name);
+      setIsReadOnlyView(true);
+      setReadOnlyOwnerEmail(design.ownerEmail);
+      setReadOnlyOriginalId(design.id);
+
+      toast({ title: 'Viewing design', description: `"${design.name}" — read-only.` });
+    } catch (error) {
+      console.error('[admin view] failed:', error);
+      toast({ title: 'Failed to load design', description: getErrorMessage(error), variant: 'destructive' });
+    }
+  }, [handlePDFUpload, handleImageUpload, toast]);
+
+  // Loads ?design=<id> or ?adminView=<id> on mount/change; one ref guard covers both.
   useEffect(() => {
     const params = new URLSearchParams(searchParams);
     const designId = params.get('design');
+    const adminViewId = params.get('adminView');
+
+    if (adminViewId && adminViewId !== openedDesignParamRef.current) {
+      openedDesignParamRef.current = adminViewId;
+      setIsLoadingDesign(true);
+      apiRequest('GET', `/api/admin/designs/${adminViewId}`)
+        .then(res => res.json())
+        .then(data => reopenDesignReadOnly(data.design))
+        .catch(error => toast({ title: 'Failed to load design', description: getErrorMessage(error), variant: 'destructive' }))
+        .finally(() => setIsLoadingDesign(false));
+      return;
+    }
 
     if (!designId || designId === openedDesignParamRef.current) return;
     openedDesignParamRef.current = designId;
@@ -1001,7 +1073,7 @@ export default function ImageEditor({ onDesignUploaded }: { onDesignUploaded?: (
       .then(data => reopenDesign(data.design))
       .catch(error => toast({ title: 'Failed to load design', description: getErrorMessage(error), variant: 'destructive' }))
       .finally(() => setIsLoadingDesign(false));
-  }, [searchParams, reopenDesign, toast]);
+  }, [searchParams, reopenDesign, reopenDesignReadOnly, toast]);
 
   // Reapplies a reopened design's White/Gloss tags once colors are (re-)extracted.
   useEffect(() => {
@@ -1113,6 +1185,11 @@ export default function ImageEditor({ onDesignUploaded }: { onDesignUploaded?: (
 
   // Entry point from Save / Save as New; opens a naming dialog instead of window.prompt().
   const handleSaveDesign = useCallback((mode: 'save' | 'save-as-new') => {
+    if (isReadOnlyView) {
+      // Save is already hidden in read-only mode — belt-and-suspenders guard.
+      toast({ title: 'Read-only', description: 'Use "Edit as my own" to make an editable copy.', variant: 'destructive' });
+      return;
+    }
     if (!imageInfo) {
       toast({ title: 'Nothing to save', description: 'Upload a design first.', variant: 'destructive' });
       return;
@@ -1128,7 +1205,7 @@ export default function ImageEditor({ onDesignUploaded }: { onDesignUploaded?: (
       setSaveNameDialog({ open: true, mode });
       setSaveNameValue(mode === 'save-as-new' ? `${currentDesignName} (copy)` : currentDesignName);
     }
-  }, [imageInfo, isAuthenticated, currentDesignId, currentDesignName, performSave, toast]);
+  }, [imageInfo, isAuthenticated, isReadOnlyView, currentDesignId, currentDesignName, performSave, toast]);
 
   const handleConfirmSaveName = useCallback(() => {
     if (!saveNameDialog.mode) return;
@@ -1136,6 +1213,18 @@ export default function ImageEditor({ onDesignUploaded }: { onDesignUploaded?: (
     setSaveNameDialog({ open: false, mode: null });
     performSave(saveNameDialog.mode, name);
   }, [saveNameDialog, saveNameValue, currentDesignName, performSave]);
+
+  // "Edit as my own" — forks the original (idempotent) and opens the copy.
+  const handleEditAsOwnFromView = useCallback(async () => {
+    if (readOnlyOriginalId === null) return;
+    try {
+      const res = await apiRequest('POST', `/api/admin/designs/${readOnlyOriginalId}/fork`);
+      const data = await res.json();
+      setLocation(`/?design=${data.design.id}`);
+    } catch (error) {
+      toast({ title: "Couldn't copy design", description: getErrorMessage(error), variant: 'destructive' });
+    }
+  }, [readOnlyOriginalId, setLocation, toast]);
 
   const handleResizeChange = useCallback((newSettings: Partial<ResizeSettings>) => {
     setResizeSettings(prev => {
@@ -1824,7 +1913,44 @@ export default function ImageEditor({ onDesignUploaded }: { onDesignUploaded?: (
           stickerSize={stickerSize}
         />
       </div>
-      {isAuthenticated && (
+      {/* Admin's read-only "View" — replaces the Save toolbar entirely. */}
+      {isReadOnlyView ? (
+        <div className="lg:col-span-12 flex items-center justify-between gap-3 bg-amber-50 border border-amber-200 rounded-lg px-4 py-2 -mb-1">
+          <span className="text-xs text-amber-900">
+            Viewing <strong>{readOnlyOwnerEmail}</strong>&rsquo;s design — read-only
+          </span>
+          <div className="flex items-center gap-2 shrink-0">
+            <button
+              onClick={() => {
+                // Same spot-color snapshot shape as the gang sheet "Add" handler.
+                const colors = spotPreviewData.colors.map(c => ({
+                  hex: c.hex,
+                  rgb: { ...c.rgb },
+                  spotWhite: c.spotWhite,
+                  spotGloss: c.spotGloss,
+                  spotWhiteName: spotPreviewData.spotWhiteName || 'RDG_WHITE',
+                  spotGlossName: spotPreviewData.spotGlossName || 'RDG_GLOSS',
+                  spotFluorY: c.spotFluorY,
+                  spotFluorM: c.spotFluorM,
+                  spotFluorG: c.spotFluorG,
+                  spotFluorOrange: c.spotFluorOrange,
+                }));
+                handleDownload('standard', 'pdf', colors);
+              }}
+              disabled={!imageInfo || isProcessing}
+              className="text-xs px-3 py-1.5 rounded-md border border-amber-300 bg-white text-amber-900 hover:bg-amber-100 transition-colors disabled:opacity-50"
+            >
+              {isProcessing ? 'Downloading…' : 'Download'}
+            </button>
+            <button
+              onClick={handleEditAsOwnFromView}
+              className="text-xs px-3 py-1.5 rounded-md bg-slate-900 text-white hover:bg-slate-800 transition-colors"
+            >
+              Edit as my own
+            </button>
+          </div>
+        </div>
+      ) : isAuthenticated && (
         // Save/Save as New only shown signed in — anonymous editing stays fully functional either way.
         <div className="lg:col-span-12 flex items-center justify-end gap-2 -mb-1">
           {currentDesignId && (
@@ -1864,8 +1990,8 @@ export default function ImageEditor({ onDesignUploaded }: { onDesignUploaded?: (
           </DialogFooter>
         </DialogContent>
       </Dialog>
-      {/* Left sidebar - Settings */}
-      <div className="lg:col-span-4 xl:col-span-3 space-y-3">
+      {/* Left sidebar - Settings. Hidden (not unmounted) in read-only view — still needed for color extraction. */}
+      <div className={isReadOnlyView ? "hidden" : "lg:col-span-4 xl:col-span-3 space-y-3"}>
         <ControlsSection
           strokeSettings={strokeSettings}
           resizeSettings={resizeSettings}
@@ -1909,11 +2035,11 @@ export default function ImageEditor({ onDesignUploaded }: { onDesignUploaded?: (
         />
       </div>
       
-      {/* Right area - Upload, Info, and Preview */}
-      <div className="lg:col-span-8 xl:col-span-9">
+      {/* Right area - Upload, Info, and Preview. Full width in read-only view. */}
+      <div className={isReadOnlyView ? "lg:col-span-12" : "lg:col-span-8 xl:col-span-9"}>
         <div className="sticky top-4 space-y-3">
-          {/* Top row: Actions bar */}
-          <div className="flex items-center gap-2 bg-white rounded-lg border border-gray-100 shadow-sm px-3 py-2">
+          {/* Top row: Actions bar — edit tools only, hidden in read-only view */}
+          {!isReadOnlyView && <div className="flex items-center gap-2 bg-white rounded-lg border border-gray-100 shadow-sm px-3 py-2">
             {imageInfo && (
               <button
                 onClick={() => handleRemoveBackground(85)}
@@ -2108,10 +2234,10 @@ export default function ImageEditor({ onDesignUploaded }: { onDesignUploaded?: (
                 </div>
               </div>
             )}
-          </div>
+          </div>}
 
-          {/* Gang Sheet - separate from CutContour controls */}
-          {imageInfo && (
+          {/* Gang Sheet - separate from CutContour controls; hidden in read-only view. */}
+          {!isReadOnlyView && imageInfo && (
             <div className="flex items-center gap-2 bg-emerald-50 rounded-lg border border-emerald-200 shadow-sm px-3 py-2">
               <button
                 onClick={handleAddToGangSheet}
@@ -2161,6 +2287,7 @@ export default function ImageEditor({ onDesignUploaded }: { onDesignUploaded?: (
             onRedo={handleRedo}
             canUndo={canUndo}
             canRedo={canRedo}
+            readOnly={isReadOnlyView}
             spotPaintMode={spotPaintMode}
             magicWandMode={magicWandMode}
             onMagicWandPick={handleMagicWandClick}
