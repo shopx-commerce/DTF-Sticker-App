@@ -7,11 +7,12 @@ import jsQR from "jsqr";
 import { scanImageData as zbarScanImageData, ZBarSymbolType } from "@undecaf/zbar-wasm";
 import { readBarcodes } from "zxing-wasm";
 
-import sgMail from "@sendgrid/mail";
+import { sendMail, isMailerConfigured } from "./lib/mailer";
 import { registerAuthRoutes } from "./routes/auth";
 import { registerAssetRoutes } from "./routes/assets";
 import { registerDesignRoutes } from "./routes/designs";
 import { registerDownloadRoutes } from "./routes/downloads";
+import { registerAdminRoutes } from "./routes/admin";
 import { registerGangSheetRoutes } from "./routes/gang-sheets";
 
 // Configure multer for file uploads
@@ -39,6 +40,7 @@ export async function registerRoutes(app: Express): Promise<Server> {
   registerAssetRoutes(app);
   registerDesignRoutes(app);
   registerDownloadRoutes(app);
+  registerAdminRoutes(app);
   registerGangSheetRoutes(app);
 
   // Process image with high-quality stroke and resize
@@ -158,14 +160,10 @@ export async function registerRoutes(app: Express): Promise<Server> {
         return res.status(400).json({ error: "Invalid email format" });
       }
 
-      const sendGridApiKey = process.env.SENDGRID_API_KEY;
-      
-      if (!sendGridApiKey) {
+      if (!isMailerConfigured()) {
         console.error("SendGrid API key not configured");
         return res.status(500).json({ error: "Email service not configured" });
       }
-
-      sgMail.setApiKey(sendGridApiKey);
 
       // Prepare email content
       const notesSection = customerNotes ? `\nCustomer Notes:\n${customerNotes}\n` : "";
@@ -202,28 +200,22 @@ ${htmlNotesSection}
 ${pdfData ? '<p><strong>PDF design with CutContour is attached.</strong></p>' : '<p><em>No design file was attached.</em></p>'}
 `;
 
-      // Build email message
-      const msg: sgMail.MailDataRequired = {
+      await sendMail({
         to: "sales@dtfmasters.com",
-        from: "sales@dtfmasters.com",
         subject: `New Sticker Design Submission from ${customerName}`,
         text: emailContent,
         html: htmlContent,
-      };
-
-      // If there's PDF data, attach it
-      if (pdfData) {
-        msg.attachments = [
-          {
-            content: pdfData,
-            filename: fileName || "design.pdf",
-            type: "application/pdf",
-            disposition: "attachment",
-          },
-        ];
-      }
-
-      await sgMail.send(msg);
+        attachments: pdfData
+          ? [
+              {
+                content: pdfData,
+                filename: fileName || "design.pdf",
+                type: "application/pdf",
+                disposition: "attachment",
+              },
+            ]
+          : undefined,
+      });
 
       res.json({ success: true, message: "Design sent successfully" });
     } catch (error) {

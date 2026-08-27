@@ -149,6 +149,22 @@ export const downloads = pgTable("downloads", {
 export type Download = typeof downloads.$inferSelect;
 export type InsertDownload = typeof downloads.$inferInsert;
 
+// ─── Admin aggregate views — computed shapes, not tables ───
+export type UserWithStats = Pick<User, "id" | "email" | "name" | "role" | "emailVerified" | "createdAt"> & {
+  designCount: number;
+  downloadCount: number;
+};
+
+export type DesignWithOwner = Pick<Design, "id" | "name" | "userId" | "thumbnailAssetId" | "sourceAssetId" | "forkedFromId" | "createdAt" | "updatedAt"> & {
+  ownerEmail: string;
+};
+
+export interface AdminStats {
+  totalUsers: number;
+  totalDesigns: number;
+  totalDownloads: number;
+}
+
 // ─── Request validation schemas ─────────────────────────────────────────
 
 // Used by registration/reset only — login just checks against whatever hash is already stored.
