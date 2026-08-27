@@ -1,10 +1,4 @@
-export interface PDFCutContourInfo {
-  hasCutContour: boolean;
-  cutContourPath: Path2D | null;
-  cutContourPoints: { x: number; y: number }[][];
-  pageWidth: number;
-  pageHeight: number;
-}
+import type { PDFCutContourInfo } from './pdf-parser';
 
 export interface ImageInfo {
   file: File;
@@ -15,6 +9,10 @@ export interface ImageInfo {
   isPDF?: boolean;
   pdfCutContourInfo?: PDFCutContourInfo;
   originalPdfData?: ArrayBuffer;
+  /** Set for SVG uploads — the sanitized source string, retained only to re-rasterise at export/placement size. */
+  svgSource?: string;
+  /** Set when a PDF/SVG's page was auto-trimmed to its artwork on import — the trimmed box, as a fraction of the full page, so export can reapply it to a render of any size. */
+  vectorInkBox?: import('./vector-trim').VectorInkBox;
   /**
    * Hex colours removed by the "Remove Color" tool, most-recent first.
    * Surfaced as the first swatches in fill / bleed pickers so the user can

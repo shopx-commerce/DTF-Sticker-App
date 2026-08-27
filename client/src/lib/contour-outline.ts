@@ -1,9 +1,42 @@
-import type { StrokeSettings, ResizeSettings } from "@/lib/types";
+import type { StrokeSettings, ResizeSettings, ImageInfo } from "@/lib/types";
 import { PDFDocument, PDFName, PDFArray, PDFDict, PDFPage, rgb, degrees } from 'pdf-lib';
 import { removeLoopsWithClipper, ensureClockwise, detectSelfIntersections, gaussianSmoothContour, subsamplePolygon, polygonToSplinePath } from "@/lib/clipper-path";
 import { getContourWorkerManager, type BezierPath } from "@/lib/contour-worker-manager";
 import { addSpotColorVectorsToPDF, type SpotPixelMapData } from "@/lib/spot-color-vectors";
 import { planVectorQROverlays, detectQRAppearance, type DetectedQR, type QRAppearance } from "@/lib/qr";
+import { hasVectorPrintSource, createVectorPrintSourceResolver } from "@/lib/vector-print-source";
+import { vectorPrintDpi } from "@/lib/vector-raster-limits";
+
+// Re-rasterises a vector-backed (PDF/SVG) design at its placement size instead of embedding the capped import preview; falls back to the preview when not vector-backed or the re-render fails.
+async function resolveVectorPrintImage(
+  previewImage: HTMLImageElement,
+  imageInfo: ImageInfo | undefined,
+  targetWidthPx: number,
+  targetHeightPx: number
+): Promise<HTMLImageElement> {
+  if (!imageInfo || !hasVectorPrintSource(imageInfo)) return previewImage;
+  const resolver = createVectorPrintSourceResolver();
+  const blob = await resolver.resolve(imageInfo, targetWidthPx, targetHeightPx);
+  if (!blob) return previewImage;
+  try {
+    return await new Promise<HTMLImageElement>((resolve, reject) => {
+      const img = new Image();
+      const url = URL.createObjectURL(blob);
+      img.onload = () => { URL.revokeObjectURL(url); resolve(img); };
+      img.onerror = () => { URL.revokeObjectURL(url); reject(new Error('vector print source decode failed')); };
+      img.src = url;
+    });
+  } catch (err) {
+    console.error('[vector-print-source] decode failed, falling back to preview:', err);
+    return previewImage;
+  }
+}
+
+// Pixel size to re-rasterise a vector print source at for a design placed at widthInches x heightInches.
+function vectorPrintTargetPx(widthInches: number, heightInches: number): { w: number; h: number } {
+  const dpi = vectorPrintDpi(widthInches, heightInches);
+  return { w: Math.max(1, Math.round(widthInches * dpi)), h: Math.max(1, Math.round(heightInches * dpi)) };
+}
 
 // ─── Vector QR overlay (source-aware) ────────────────────────────────────
 // Paints each detected QR as crisp PDF vector geometry. Modules are forced
@@ -2278,7 +2311,8 @@ export async function downloadContourPDF(
   cutContourLabel: string = 'CutContour',
   lockedContour?: { label: string; pathPoints: Array<{x: number; y: number}>; allPathPoints?: Array<Array<{x: number; y: number}>>; widthInches: number; heightInches: number } | null,
   qrOptions?: QRExportOptions,
-  spotPixelMap?: SpotPixelMapData
+  spotPixelMap?: SpotPixelMapData,
+  imageInfo?: ImageInfo
 ): Promise<void> {
   try {
     console.log('[downloadContourPDF] Starting, cached:', !!cachedContourData);
@@ -2335,7 +2369,23 @@ export async function downloadContourPDF(
     
     const pdfDoc = await PDFDocument.create();
     const page = pdfDoc.addPage([widthPts, heightPts]);
-    
+
+    // Image size as the contour pipeline sees it — when natural AR differs from resize AR, one axis draws larger than resizeSettings so contour and image stay aligned.
+    const natAR = image.naturalWidth / image.naturalHeight;
+    const resAR = resizeSettings.widthInches / resizeSettings.heightInches;
+    let contourImageW: number, contourImageH: number;
+    if (natAR <= resAR) {
+      contourImageW = resizeSettings.widthInches;
+      contourImageH = resizeSettings.widthInches / natAR;
+    } else {
+      contourImageH = resizeSettings.heightInches;
+      contourImageW = resizeSettings.heightInches * natAR;
+    }
+
+    // Vector-backed uploads re-rasterise from the retained source at this placement size instead of embedding the capped import preview.
+    const vectorTarget = vectorPrintTargetPx(contourImageW, contourImageH);
+    const drawImage = await resolveVectorPrintImage(image, imageInfo, vectorTarget.w, vectorTarget.h);
+
     // OPTIMIZATION: Create background and design canvases in parallel
     // Background uses lower DPI (150) since it's solid color - doesn't need 300 DPI
     const bgDPI = 150;
@@ -2440,11 +2490,11 @@ export async function downloadContourPDF(
         // Default path: embed the design as-is. The vector QR overlay
         // module-overdraws each cell (or skips for logo modules).
         canvas = document.createElement('canvas');
-        canvas.width = image.width;
-        canvas.height = image.height;
+        canvas.width = drawImage.width;
+        canvas.height = drawImage.height;
         const tempCtx = canvas.getContext('2d');
         if (!tempCtx) throw new Error('Failed to get design canvas context');
-        tempCtx.drawImage(image, 0, 0);
+        tempCtx.drawImage(drawImage, 0, 0);
       }
       return await new Promise<Blob>((resolve, reject) => {
         canvas.toBlob((b) => {
@@ -2453,22 +2503,22 @@ export async function downloadContourPDF(
         }, 'image/png');
       });
     };
-    
+
     // Run both canvas operations in parallel
     const [bgBlob, designBlob] = await Promise.all([
       createBackgroundBlob(),
       createDesignBlob()
     ]);
-    
+
     // Convert blobs to bytes in parallel
     const [bgPngBytes, pngBytes] = await Promise.all([
       bgBlob.arrayBuffer().then(buf => new Uint8Array(buf)),
       designBlob.arrayBuffer().then(buf => new Uint8Array(buf))
     ]);
-    
+
     // Embed images in PDF as PNG for better quality
     const bgPngImage = await pdfDoc.embedPng(bgPngBytes);
-    
+
     // Draw the background raster image first
     page.drawImage(bgPngImage, {
       x: 0,
@@ -2476,24 +2526,8 @@ export async function downloadContourPDF(
       width: widthPts,
       height: heightPts,
     });
-  
-  const pngImage = await pdfDoc.embedPng(pngBytes);
 
-  // Compute the image size as the contour pipeline sees it.
-  // effectiveDPI = min(dpiFromWidth, dpiFromHeight); when the image's natural AR
-  // differs from the resize settings AR, one axis will have a larger effective
-  // size than resizeSettings specifies. We must draw the image at that size so
-  // the contour and image stay aligned.
-  const natAR = image.naturalWidth / image.naturalHeight;
-  const resAR = resizeSettings.widthInches / resizeSettings.heightInches;
-  let contourImageW: number, contourImageH: number;
-  if (natAR <= resAR) {
-    contourImageW = resizeSettings.widthInches;
-    contourImageH = resizeSettings.widthInches / natAR;
-  } else {
-    contourImageH = resizeSettings.heightInches;
-    contourImageW = resizeSettings.heightInches * natAR;
-  }
+  const pngImage = await pdfDoc.embedPng(pngBytes);
 
   const imageXPts = imageOffsetX * 72;
   const imageWidthPts = contourImageW * 72;
@@ -2710,7 +2744,8 @@ export async function downloadDesignOnlyPDF(
   spotColors?: SpotColorInput[],
   singleArtboard: boolean = false,
   qrOptions?: QRExportOptions,
-  spotPixelMap?: SpotPixelMapData
+  spotPixelMap?: SpotPixelMapData,
+  imageInfo?: ImageInfo
 ): Promise<void> {
   try {
     console.log('[downloadDesignOnlyPDF] Starting design-only PDF (no cut lines)');
@@ -2724,6 +2759,10 @@ export async function downloadDesignOnlyPDF(
     const pdfDoc = await PDFDocument.create();
     const page = pdfDoc.addPage([widthPts, heightPts]);
 
+    // Vector-backed uploads re-rasterise from the retained source at this placement size instead of embedding the capped import preview.
+    const vectorTarget = vectorPrintTargetPx(widthInches, heightInches);
+    const drawImage = await resolveVectorPrintImage(image, imageInfo, vectorTarget.w, vectorTarget.h);
+
     const useQRFix = qrOptions?.enabled === true && qrOptions?.qrCodes && qrOptions.qrCodes.length > 0;
     // QR re-render is opt-in. When NOT enabled, we just embed the source
     // as a plain raster (no QR processing). When enabled, the source is
@@ -2732,11 +2771,11 @@ export async function downloadDesignOnlyPDF(
     // logo carve-out.
     const designCanvas: HTMLCanvasElement = (() => {
       const c = document.createElement('canvas');
-      c.width = image.width;
-      c.height = image.height;
+      c.width = drawImage.width;
+      c.height = drawImage.height;
       const cx = c.getContext('2d');
       if (!cx) throw new Error('Failed to get canvas context');
-      cx.drawImage(image, 0, 0);
+      cx.drawImage(drawImage, 0, 0);
       return c;
     })();
     const designBlob: Blob = await new Promise((resolve, reject) => {
@@ -2810,7 +2849,8 @@ export async function generateContourPDFBase64(
   strokeSettings: StrokeSettings,
   resizeSettings: ResizeSettings,
   cachedContourData?: CachedContourData,
-  cutContourLabel: string = 'CutContour'
+  cutContourLabel: string = 'CutContour',
+  imageInfo?: ImageInfo
 ): Promise<string | null> {
   let pathPoints: Array<{x: number; y: number}>;
   let previewPathPoints: Array<{x: number; y: number}>;
@@ -2868,10 +2908,25 @@ export async function generateContourPDFBase64(
   
   const widthPts = widthInches * 72;
   const heightPts = heightInches * 72;
-  
+
   const pdfDoc = await PDFDocument.create();
   const page = pdfDoc.addPage([widthPts, heightPts]);
-  
+
+  const natAR2 = image.naturalWidth / image.naturalHeight;
+  const resAR2 = resizeSettings.widthInches / resizeSettings.heightInches;
+  let contourImageW2: number, contourImageH2: number;
+  if (natAR2 <= resAR2) {
+    contourImageW2 = resizeSettings.widthInches;
+    contourImageH2 = resizeSettings.widthInches / natAR2;
+  } else {
+    contourImageH2 = resizeSettings.heightInches;
+    contourImageW2 = resizeSettings.heightInches * natAR2;
+  }
+
+  // Vector-backed uploads re-rasterise from the retained source at this placement size instead of embedding the capped import preview.
+  const vectorTarget2 = vectorPrintTargetPx(contourImageW2, contourImageH2);
+  const drawImage = await resolveVectorPrintImage(image, imageInfo, vectorTarget2.w, vectorTarget2.h);
+
   // OPTIMIZATION: Create background and design canvases in parallel
   // Background uses lower DPI (150) since it's solid color - doesn't need 300 DPI
   const bgDPI = 150;
@@ -2965,9 +3020,9 @@ export async function generateContourPDFBase64(
         return;
       }
       
-      tempCanvas.width = image.width;
-      tempCanvas.height = image.height;
-      tempCtx.drawImage(image, 0, 0);
+      tempCanvas.width = drawImage.width;
+      tempCanvas.height = drawImage.height;
+      tempCtx.drawImage(drawImage, 0, 0);
       
       tempCanvas.toBlob((b) => {
         if (b) resolve(b);
@@ -3000,17 +3055,6 @@ export async function generateContourPDFBase64(
   });
   
   const pngImage = await pdfDoc.embedPng(pngBytes);
-
-  const natAR2 = image.naturalWidth / image.naturalHeight;
-  const resAR2 = resizeSettings.widthInches / resizeSettings.heightInches;
-  let contourImageW2: number, contourImageH2: number;
-  if (natAR2 <= resAR2) {
-    contourImageW2 = resizeSettings.widthInches;
-    contourImageH2 = resizeSettings.widthInches / natAR2;
-  } else {
-    contourImageH2 = resizeSettings.heightInches;
-    contourImageW2 = resizeSettings.heightInches * natAR2;
-  }
 
   const imageXPts = imageOffsetX * 72;
   const imageWidthPts = contourImageW2 * 72;

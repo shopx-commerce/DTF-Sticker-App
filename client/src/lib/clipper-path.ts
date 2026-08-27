@@ -6,8 +6,14 @@ interface Point {
   y: number;
 }
 
+// Both smoothing functions below index circularly by modulo — drop malformed entries first so a bad point can't crash the render.
+function cleanPoints(points: Point[]): Point[] {
+  return points.filter(p => p && typeof p.x === 'number' && typeof p.y === 'number' && !isNaN(p.x) && !isNaN(p.y));
+}
+
 // Moving average smoothing to reduce jagged edges from alpha tracing
-export function smoothContourPoints(points: Point[], windowSize: number = 5): Point[] {
+export function smoothContourPoints(rawPoints: Point[], windowSize: number = 5): Point[] {
+  const points = cleanPoints(rawPoints);
   if (points.length < windowSize * 2) return points;
   
   const halfWindow = Math.floor(windowSize / 2);
@@ -18,9 +24,9 @@ export function smoothContourPoints(points: Point[], windowSize: number = 5): Po
     let sumY = 0;
     let count = 0;
     
-    // Circular window for closed contour
+    // Double-modulo: JS's % keeps the sign of its left operand, so a small point count can still go negative.
     for (let j = -halfWindow; j <= halfWindow; j++) {
-      const idx = (i + j + points.length) % points.length;
+      const idx = ((i + j) % points.length + points.length) % points.length;
       sumX += points[idx].x;
       sumY += points[idx].y;
       count++;
@@ -36,7 +42,8 @@ export function smoothContourPoints(points: Point[], windowSize: number = 5): Po
 }
 
 // Gaussian-weighted smoothing for even smoother curves
-export function gaussianSmoothContour(points: Point[], sigma: number = 2): Point[] {
+export function gaussianSmoothContour(rawPoints: Point[], sigma: number = 2): Point[] {
+  const points = cleanPoints(rawPoints);
   if (points.length < 5) return points;
   
   // Calculate kernel size based on sigma (3-sigma rule)
@@ -64,7 +71,8 @@ export function gaussianSmoothContour(points: Point[], sigma: number = 2): Point
     
     for (let k = 0; k < kernelSize; k++) {
       const offset = k - kernelRadius;
-      const idx = (i + offset + points.length) % points.length;
+      // Same double-modulo as smoothContourPoints above — the kernel radius can exceed a short path's point count.
+      const idx = ((i + offset) % points.length + points.length) % points.length;
       sumX += points[idx].x * kernel[k];
       sumY += points[idx].y * kernel[k];
     }

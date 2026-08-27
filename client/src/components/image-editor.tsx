@@ -15,6 +15,7 @@ import { removeBackgroundFromImage } from "@/lib/background-removal";
 import { magicWandErase } from "@/lib/magic-wand";
 import { detectQRsInImage } from "@/lib/qr";
 import { parsePDF, type ParsedPDFData } from "@/lib/pdf-parser";
+import type { ParsedSVGData } from "@/lib/svg-parser";
 import { detectShape, mapDetectedShapeToType } from "@/lib/shape-detection";
 import { useToast } from "@/hooks/use-toast";
 import EnhanceWorker from "@/lib/enhance-worker?worker";
@@ -26,6 +27,7 @@ import { useAuth, getErrorMessage } from "@/hooks/use-auth";
 import { useDesignMutations, type DesignSummary } from "@/hooks/use-designs";
 import type { AdminDesignDetail } from "@/hooks/use-admin";
 import { serializeDesign, matchSpotTagsToColors, uploadAsset, fetchAssetAsFile, fetchAssetAsFileForAdmin } from "@/lib/design-document";
+import { trimVectorImport } from "@/lib/vector-trim";
 import { apiRequest } from "@/lib/queryClient";
 import { recordDownload } from "@/lib/downloads";
 import type { SerializedDesign } from "@shared/design-document";
@@ -876,28 +878,41 @@ export default function ImageEditor({ onDesignUploaded }: { onDesignUploaded?: (
     }
   }, [applyNewImage]);
 
-  const handlePDFUpload = useCallback((file: File, pdfData: ParsedPDFData) => {
+  const handlePDFUpload = useCallback(async (file: File, pdfData: ParsedPDFData) => {
     // Close any open dropdowns
     if (document.activeElement instanceof HTMLElement) {
       document.activeElement.blur();
     }
-    
+
     const { image, cutContourInfo, originalPdfData, dpi } = pdfData;
-    
+
+    // Auto-trim to the page's artwork; skipped when a cut-contour path was detected since its points are in the untrimmed page's coordinate space and the legacy cutcontour-download branch draws them against the page as a whole.
+    const trimmed = cutContourInfo.hasCutContour ? null : await trimVectorImport({
+      image,
+      widthInches: pdfData.widthInches,
+      heightInches: pdfData.heightInches,
+    });
+
     // Create image info with PDF-specific data
     const newImageInfo: ImageInfo = {
       file,
-      image,
-      originalWidth: image.width,
-      originalHeight: image.height,
+      image: trimmed?.image ?? image,
+      originalWidth: trimmed?.widthPx ?? image.width,
+      originalHeight: trimmed?.heightPx ?? image.height,
       dpi,
       isPDF: true,
       pdfCutContourInfo: cutContourInfo,
       originalPdfData,
+      vectorInkBox: trimmed?.inkBox,
     };
-    
+
     setImageInfo(newImageInfo);
-    
+
+    // Match the export label to whatever spot color the PDF actually already carries.
+    if (cutContourInfo.detectedLabel) {
+      setCutContourLabel(cutContourInfo.detectedLabel as 'CutContour' | 'PerfCutContour' | 'KissCut');
+    }
+
     setStrokeSettings({
       width: 0.14,
       color: "#ffffff",
@@ -936,6 +951,76 @@ export default function ImageEditor({ onDesignUploaded }: { onDesignUploaded?: (
     
     const { widthInches, heightInches } = calculateImageDimensions(image.width, image.height, dpi);
     
+    setResizeSettings(prev => ({
+      ...prev,
+      widthInches,
+      heightInches,
+    }));
+  }, []);
+
+  const handleSVGUpload = useCallback(async (file: File, svgData: ParsedSVGData) => {
+    // Close any open dropdowns
+    if (document.activeElement instanceof HTMLElement) {
+      document.activeElement.blur();
+    }
+
+    const { image, svgSource, dpi } = svgData;
+
+    // Auto-trim the page down to its artwork — see handlePDFUpload's note. SVG has no pre-existing cut-contour path to keep aligned with an untrimmed page, so always attempt the trim.
+    const trimmed = await trimVectorImport({
+      image,
+      widthInches: svgData.widthInches,
+      heightInches: svgData.heightInches,
+    });
+
+    // Save/reopen persist `imageInfo.file` verbatim as `source_image` (PNG/JPEG only, decoded back through a plain <img>), so it has to be the rasterised bytes, not the raw SVG.
+    const pngBlob = trimmed?.pngBlob ?? svgData.pngBlob;
+    const pngFile = new File([pngBlob], `${file.name.replace(/\.svg$/i, '') || 'design'}.png`, { type: 'image/png' });
+
+    const newImageInfo: ImageInfo = {
+      file: pngFile,
+      image: trimmed?.image ?? image,
+      originalWidth: trimmed?.widthPx ?? svgData.widthPx,
+      originalHeight: trimmed?.heightPx ?? svgData.heightPx,
+      dpi,
+      svgSource,
+      vectorInkBox: trimmed?.inkBox,
+    };
+
+    setImageInfo(newImageInfo);
+
+    setStrokeSettings({
+      width: 0.14,
+      color: "#ffffff",
+      enabled: false,
+      alphaThreshold: 128,
+      backgroundColor: "#ffffff",
+      useCustomBackground: true,
+      cornerMode: 'rounded',
+      autoBridging: true,
+      autoBridgingThreshold: 0.02,
+      contourMode: undefined,
+    });
+    setDetectedAlgorithm(undefined);
+    setShapeSettings({
+      enabled: false,
+      type: 'square',
+      offset: 0.25,
+      fillColor: '#FFFFFF',
+      strokeEnabled: false,
+      strokeWidth: 2,
+      strokeColor: '#000000',
+      cornerRadius: 0.25,
+      bleedEnabled: false,
+      bleedColor: '#FFFFFF',
+    });
+    setStrokeMode('none');
+
+    setCadCutBounds(null);
+    setStickerSize(4);
+
+    const { widthInches, heightInches } = calculateImageDimensions(image.width, image.height, dpi);
+
     setResizeSettings(prev => ({
       ...prev,
       widthInches,
@@ -1644,8 +1729,8 @@ export default function ImageEditor({ onDesignUploaded }: { onDesignUploaded?: (
     setIsProcessing(true);
     
     try {
-      // Handle PDF with existing CutContour - generate proper vector CutContour PDF
-      if (imageInfo.isPDF && imageInfo.pdfCutContourInfo?.hasCutContour && downloadType === 'cutcontour') {
+      // PDF with an existing spot-color contour — every download button in the UI sends 'standard', never 'cutcontour', so this must not be gated on downloadType or it's unreachable dead code.
+      if (imageInfo.isPDF && imageInfo.pdfCutContourInfo?.hasCutContour) {
         const { generatePDFWithVectorCutContour } = await import('@/lib/pdf-parser');
         const nameWithoutExt = imageInfo.file.name.replace(/\.[^/.]+$/, '');
         await generatePDFWithVectorCutContour(
@@ -1655,7 +1740,9 @@ export default function ImageEditor({ onDesignUploaded }: { onDesignUploaded?: (
           imageInfo.pdfCutContourInfo.pageHeight,
           imageInfo.dpi || 300,
           `${nameWithoutExt}_with_cutcontour.pdf`,
-          cutContourLabel
+          cutContourLabel,
+          spotColors,
+          singleArtboard
         );
         recordDownload({ designId: currentDesignId ?? undefined, downloadType, format });
         setIsProcessing(false);
@@ -1827,7 +1914,8 @@ export default function ImageEditor({ onDesignUploaded }: { onDesignUploaded?: (
             cutContourLabel,
             lockedContour ? { label: lockedContour.label, pathPoints: lockedContour.pathPoints, allPathPoints: lockedContour.allPathPoints, widthInches: lockedContour.widthInches, heightInches: lockedContour.heightInches } : null,
             { qrCodes: imageInfo.qrCodes, enabled: imageInfo.qrRerenderEnabled === true },
-            spotPixelMap
+            spotPixelMap,
+            imageInfo
           );
         } else if (shapeSettings.enabled) {
           // Shape background mode: Download PDF with shape + CutContour spot color
@@ -1886,9 +1974,10 @@ export default function ImageEditor({ onDesignUploaded }: { onDesignUploaded?: (
     return (
       <div className="min-h-[70vh] flex items-center justify-center">
         <div className="w-full max-w-xl mx-auto transition-all duration-300">
-          <UploadSection 
+          <UploadSection
             onImageUpload={handleImageUpload}
             onPDFUpload={handlePDFUpload}
+            onSVGUpload={handleSVGUpload}
             showCutLineInfo={false}
             imageInfo={null}
             resizeSettings={resizeSettings}
@@ -1899,6 +1988,9 @@ export default function ImageEditor({ onDesignUploaded }: { onDesignUploaded?: (
     );
   }
 
+  // "Add Contour" can never succeed here — tracing/shape mode is skipped entirely for a PDF whose cutline came from the file itself.
+  const isPdfWithDetectedContour = !!(imageInfo?.isPDF && imageInfo?.pdfCutContourInfo?.hasCutContour);
+
   // Loaded state - image uploaded
   return (
     <div className="grid grid-cols-1 lg:grid-cols-12 gap-4">
@@ -1907,6 +1999,7 @@ export default function ImageEditor({ onDesignUploaded }: { onDesignUploaded?: (
         <UploadSection
           onImageUpload={handleImageUpload}
           onPDFUpload={handlePDFUpload}
+          onSVGUpload={handleSVGUpload}
           showCutLineInfo={false}
           imageInfo={imageInfo}
           resizeSettings={resizeSettings}
@@ -1997,6 +2090,7 @@ export default function ImageEditor({ onDesignUploaded }: { onDesignUploaded?: (
           resizeSettings={resizeSettings}
           shapeSettings={shapeSettings}
           stickerSize={stickerSize}
+          cutContourLabel={cutContourLabel}
           onStrokeChange={handleStrokeChange}
           onResizeChange={handleResizeChange}
           onShapeChange={handleShapeChange}
@@ -2211,14 +2305,20 @@ export default function ImageEditor({ onDesignUploaded }: { onDesignUploaded?: (
                 </div>
                 <div className="relative" ref={applyAddRef}>
                   <button
-                    onClick={() => setShowApplyAddDropdown(prev => !prev)}
-                    className="flex items-center gap-1.5 px-2 py-1 bg-indigo-50 rounded border border-indigo-100 hover:bg-indigo-100 transition-colors cursor-pointer"
+                    onClick={() => { if (!isPdfWithDetectedContour) setShowApplyAddDropdown(prev => !prev); }}
+                    disabled={isPdfWithDetectedContour}
+                    title={isPdfWithDetectedContour ? "Not available — this PDF's cutline already came from the file, there's nothing traced/drawn to add." : undefined}
+                    className={`flex items-center gap-1.5 px-2 py-1 rounded border transition-colors ${
+                      isPdfWithDetectedContour
+                        ? 'bg-gray-50 border-gray-200 opacity-50 cursor-not-allowed'
+                        : 'bg-indigo-50 border-indigo-100 hover:bg-indigo-100 cursor-pointer'
+                    }`}
                   >
-                    <div className="w-2 h-2 rounded-full bg-indigo-500"></div>
-                    <span className="text-[10px] text-indigo-600 font-medium">Add Contour</span>
-                    <svg className="w-2.5 h-2.5 text-indigo-400" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M11 4H4a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2v-7"/><path d="M18.5 2.5a2.121 2.121 0 0 1 3 3L12 15l-4 1 1-4 9.5-9.5z"/></svg>
+                    <div className={`w-2 h-2 rounded-full ${isPdfWithDetectedContour ? 'bg-gray-400' : 'bg-indigo-500'}`}></div>
+                    <span className={`text-[10px] font-medium ${isPdfWithDetectedContour ? 'text-gray-400' : 'text-indigo-600'}`}>Add Contour</span>
+                    <svg className={`w-2.5 h-2.5 ${isPdfWithDetectedContour ? 'text-gray-300' : 'text-indigo-400'}`} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M11 4H4a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2v-7"/><path d="M18.5 2.5a2.121 2.121 0 0 1 3 3L12 15l-4 1 1-4 9.5-9.5z"/></svg>
                   </button>
-                  {showApplyAddDropdown && (
+                  {showApplyAddDropdown && !isPdfWithDetectedContour && (
                     <div className="absolute right-0 top-full mt-1 bg-white rounded-lg shadow-lg border border-gray-200 py-1 z-50 min-w-[140px]">
                       {(['CutContour', 'PerfCutContour', 'KissCut'] as const).map((label) => (
                         <button
@@ -2337,7 +2437,8 @@ export default function ImageEditor({ onDesignUploaded }: { onDesignUploaded?: (
                         args.spotColors,
                         args.singleArtboard,
                         { qrCodes: imageInfo.qrCodes, enabled: imageInfo.qrRerenderEnabled === true },
-                        noCtlinesSpotPixelMap
+                        noCtlinesSpotPixelMap,
+                        imageInfo
                       );
                     } else {
                       const dpi = 300;
