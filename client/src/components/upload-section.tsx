@@ -1,18 +1,21 @@
 import { useCallback, useState } from "react";
 import { Upload, Sparkles, Image, FileText } from "lucide-react";
 import { parsePDF, isPDFFile, type ParsedPDFData } from "@/lib/pdf-parser";
+import { isSVGFile } from "@/lib/vector-file";
+import type { ParsedSVGData } from "@/lib/svg-parser";
 import type { ImageInfo, ResizeSettings } from "./image-editor";
 
 interface UploadSectionProps {
   onImageUpload: (file: File, image: HTMLImageElement) => void;
   onPDFUpload?: (file: File, pdfData: ParsedPDFData) => void;
+  onSVGUpload?: (file: File, svgData: ParsedSVGData) => void;
   showCutLineInfo?: boolean;
   imageInfo?: ImageInfo | null;
   resizeSettings?: ResizeSettings | null;
   stickerSize?: number;
 }
 
-export default function UploadSection({ onImageUpload, onPDFUpload, showCutLineInfo = false, imageInfo, resizeSettings, stickerSize }: UploadSectionProps) {
+export default function UploadSection({ onImageUpload, onPDFUpload, onSVGUpload, showCutLineInfo = false, imageInfo, resizeSettings, stickerSize }: UploadSectionProps) {
   const [isDragOver, setIsDragOver] = useState(false);
 
   const handleFileUpload = useCallback(async (file: File) => {
@@ -30,9 +33,25 @@ export default function UploadSection({ onImageUpload, onPDFUpload, showCutLineI
       }
       return;
     }
-    
+
+    if (isSVGFile(file)) {
+      if (onSVGUpload) {
+        try {
+          const { parseSVG } = await import('@/lib/svg-parser');
+          const svgData = await parseSVG(file);
+          onSVGUpload(file, svgData);
+        } catch (error) {
+          console.error('Error parsing SVG:', error);
+          alert(error instanceof Error ? error.message : 'Error parsing SVG file. Please try a different file.');
+        }
+      } else {
+        alert('SVG upload not supported.');
+      }
+      return;
+    }
+
     if (!file.type.startsWith('image/')) {
-      alert('Please upload an image file (PNG, JPEG) or PDF.');
+      alert('Please upload an image file (PNG, JPEG), PDF, or SVG.');
       return;
     }
 
@@ -46,7 +65,7 @@ export default function UploadSection({ onImageUpload, onPDFUpload, showCutLineI
       alert('Failed to load image. Please try a different file.');
     };
     img.src = url;
-  }, [onImageUpload, onPDFUpload]);
+  }, [onImageUpload, onPDFUpload, onSVGUpload]);
 
   const handleDrop = useCallback((e: React.DragEvent) => {
     e.preventDefault();
@@ -130,7 +149,7 @@ export default function UploadSection({ onImageUpload, onPDFUpload, showCutLineI
               </div>
               <div className="flex items-center gap-1.5 px-3 py-1.5 rounded-full bg-white/80 border border-slate-200/60 shadow-sm">
                 <FileText className="w-3.5 h-3.5 text-slate-400" />
-                <span className="text-xs text-slate-500 font-medium">PDF</span>
+                <span className="text-xs text-slate-500 font-medium">PDF, SVG</span>
               </div>
             </div>
 
@@ -157,7 +176,7 @@ export default function UploadSection({ onImageUpload, onPDFUpload, showCutLineI
         type="file" 
         id="imageInput" 
         className="hidden" 
-        accept=".png,.jpg,.jpeg,.pdf,image/png,image/jpeg,application/pdf" 
+        accept=".png,.jpg,.jpeg,.pdf,.svg,image/png,image/jpeg,application/pdf,image/svg+xml"
         onChange={handleFileInputChange}
       />
     </div>

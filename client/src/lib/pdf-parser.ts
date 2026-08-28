@@ -1,5 +1,6 @@
 import * as pdfjsLib from 'pdfjs-dist';
 import 'pdfjs-dist/build/pdf.worker.min.mjs';
+import { vectorPrintDpi, vectorExportMaxEdge } from './vector-raster-limits';
 
 pdfjsLib.GlobalWorkerOptions.workerSrc = new URL(
   'pdfjs-dist/build/pdf.worker.min.mjs',
@@ -12,6 +13,19 @@ export interface PDFCutContourInfo {
   cutContourPoints: { x: number; y: number }[][];
   pageWidth: number;
   pageHeight: number;
+  detectedLabel: string | null;
+}
+
+// Existing spot-color separations a customer's PDF might already carry — matched loosely (spacing/casing/separators vary by RIP software).
+const CUT_SPOT_PATTERNS: { label: string; match: RegExp }[] = [
+  { label: 'PerfCutContour', match: /perf[\s_-]?cut/i },
+  { label: 'KissCut', match: /kiss[\s_-]?cut/i },
+  { label: 'CutContour', match: /cut[\s_-]?contour/i },
+];
+
+// Order matters: PerfCut/KissCut checked first since "PerfCutContour" would otherwise also match the generic CutContour pattern.
+function matchCutSpotLabel(name: string): string | null {
+  return CUT_SPOT_PATTERNS.find(p => p.match.test(name))?.label ?? null;
 }
 
 export interface ParsedPDFData {
@@ -21,6 +35,9 @@ export interface ParsedPDFData {
   cutContourInfo: PDFCutContourInfo;
   originalPdfData: ArrayBuffer;
   dpi: number;
+  // Page 1's true physical size, from PDF geometry — not derived from the (possibly clamped) preview raster.
+  widthInches: number;
+  heightInches: number;
 }
 
 export async function parsePDF(file: File): Promise<ParsedPDFData> {
@@ -30,21 +47,26 @@ export async function parsePDF(file: File): Promise<ParsedPDFData> {
   const cutContourInfo = await extractCutContourFromRawPDF(arrayBuffer);
   console.log('[PDF Parser] CutContour detected:', cutContourInfo.hasCutContour);
   
-  // Then render with PDF.js for the image
-  const pdf = await pdfjsLib.getDocument({ data: arrayBuffer }).promise;
+  // PDF.js detaches whatever buffer it's given — hand it a throwaway copy so `originalPdfData` (the same `arrayBuffer`, saved below) doesn't come back zero-length.
+  const pdf = await pdfjsLib.getDocument({ data: new Uint8Array(arrayBuffer.slice(0)) }).promise;
   const page = await pdf.getPage(1);
-  
-  const targetDPI = 300;
-  const pdfScale = targetDPI / 72;
-  const viewport = page.getViewport({ scale: pdfScale });
-  
-  // Get base viewport at 1:1 scale for path coordinates
+
+  // Base viewport at 1:1 scale — page's true physical size (72 points/inch), independent of any preview clamp.
   const baseViewport = page.getViewport({ scale: 1 });
-  
+  const widthInches = Math.max(0.01, baseViewport.width / 72);
+  const heightInches = Math.max(0.01, baseViewport.height / 72);
+
+  // Clamped to the platform's safe canvas ceiling — iOS Safari silently no-ops drawImage past that instead of failing loudly.
+  let pdfScale = 300 / 72;
+  const maxEdge = vectorExportMaxEdge();
+  const dimensionalScale = Math.min(1, maxEdge / Math.max(baseViewport.width * pdfScale, 1), maxEdge / Math.max(baseViewport.height * pdfScale, 1));
+  pdfScale *= dimensionalScale;
+  const viewport = page.getViewport({ scale: pdfScale });
+
   // Update cutContourInfo with page dimensions (at render DPI)
   cutContourInfo.pageWidth = viewport.width;
   cutContourInfo.pageHeight = viewport.height;
-  
+
   // If CutContour was detected but no paths extracted, try using PDF.js operator list
   if (cutContourInfo.hasCutContour && cutContourInfo.cutContourPoints.length === 0) {
     try {
@@ -87,8 +109,59 @@ export async function parsePDF(file: File): Promise<ParsedPDFData> {
     height: viewport.height,
     cutContourInfo,
     originalPdfData: arrayBuffer,
-    dpi: targetDPI
+    // Print DPI, not the possibly-clamped preview's — the export path re-renders this page at placement size.
+    dpi: vectorPrintDpi(widthInches, heightInches),
+    widthInches,
+    heightInches
   };
+}
+
+// Re-renders page 1 of a retained PDF at (at least) the requested pixel size, so export draws from the PDF's own geometry at true DPI instead of upscaling the clamped import preview; the caller resizes the result down if it overshoots.
+export async function rasterisePdfPageToPngBlob(
+  pdfData: ArrayBuffer,
+  targetWidth: number,
+  targetHeight: number,
+  clampToMaxEdge: number
+): Promise<Blob> {
+  let pdf: pdfjsLib.PDFDocumentProxy | null = null;
+  try {
+    // pdf.js detaches whatever buffer it's given — hand it a throwaway copy so the original survives for the next export.
+    pdf = await pdfjsLib.getDocument({ data: new Uint8Array(pdfData.slice(0)) }).promise;
+    const page = await pdf.getPage(1);
+
+    const base = page.getViewport({ scale: 1 });
+    let scale = Math.max(
+      targetWidth / Math.max(base.width, 1),
+      targetHeight / Math.max(base.height, 1)
+    );
+    const longestEdge = Math.max(base.width, base.height) * scale;
+    if (longestEdge > clampToMaxEdge) scale *= clampToMaxEdge / longestEdge;
+
+    const viewport = page.getViewport({ scale });
+    const canvas = document.createElement('canvas');
+    canvas.width = Math.max(1, Math.ceil(viewport.width));
+    canvas.height = Math.max(1, Math.ceil(viewport.height));
+    const ctx = canvas.getContext('2d', { alpha: true, willReadFrequently: true });
+    if (!ctx) throw new Error('Could not create canvas context for PDF rendering');
+    ctx.clearRect(0, 0, canvas.width, canvas.height);
+
+    await page.render({
+      canvasContext: ctx,
+      viewport,
+      background: 'rgba(0,0,0,0)',
+      intent: 'print'
+    } as any).promise;
+
+    const blob = await new Promise<Blob | null>((resolve) => {
+      canvas.toBlob(resolve, 'image/png');
+    });
+    canvas.width = 0;
+    canvas.height = 0;
+    if (!blob) throw new Error('Failed to encode PDF page as PNG');
+    return blob;
+  } finally {
+    pdf?.destroy();
+  }
 }
 
 // Extract paths from PDF.js operator list (handles decompressed content)
@@ -212,9 +285,10 @@ async function extractCutContourFromRawPDF(arrayBuffer: ArrayBuffer): Promise<PD
     cutContourPath: null,
     cutContourPoints: [],
     pageWidth: 0,
-    pageHeight: 0
+    pageHeight: 0,
+    detectedLabel: null
   };
-  
+
   try {
     const pdfDoc = await PDFDocument.load(arrayBuffer);
     const pages = pdfDoc.getPages();
@@ -261,9 +335,11 @@ async function extractCutContourFromRawPDF(arrayBuffer: ArrayBuffer): Promise<PD
               if (spotName) {
                 const spotNameStr = spotName.toString();
                 console.log('[PDF Parser] Separation spot color:', spotNameStr);
-                if (spotNameStr.toLowerCase().includes('cutcontour')) {
+                const label = matchCutSpotLabel(spotNameStr);
+                if (label) {
                   result.hasCutContour = true;
-                  console.log('[PDF Parser] CutContour spot color detected!');
+                  result.detectedLabel = label;
+                  console.log('[PDF Parser] Spot-color contour detected:', label);
                 }
               }
             }
@@ -275,18 +351,22 @@ async function extractCutContourFromRawPDF(arrayBuffer: ArrayBuffer): Promise<PD
       }
     }
     
-    // Also search raw PDF bytes for CutContour text as fallback
-    const pdfBytes = new Uint8Array(arrayBuffer);
-    const pdfText = new TextDecoder('latin1').decode(pdfBytes);
-    if (pdfText.toLowerCase().includes('cutcontour')) {
-      console.log('[PDF Parser] CutContour found in raw PDF bytes!');
-      result.hasCutContour = true;
+    // Also search raw PDF bytes for a known contour spot name as fallback
+    if (!result.hasCutContour) {
+      const pdfBytes = new Uint8Array(arrayBuffer);
+      const pdfText = new TextDecoder('latin1').decode(pdfBytes);
+      const label = matchCutSpotLabel(pdfText);
+      if (label) {
+        console.log('[PDF Parser] Spot-color contour found in raw PDF bytes:', label);
+        result.hasCutContour = true;
+        result.detectedLabel = label;
+      }
     }
-    
-    // If CutContour found, try to extract path from content stream
+
+    // If a contour spot color was found, try to extract its path from the content stream
     if (result.hasCutContour) {
-      // First find which color space name maps to CutContour
-      let cutContourCSName = 'CutContour';
+      // First find which color space name maps to the detected label
+      let cutContourCSName = result.detectedLabel ?? 'CutContour';
       if (resources) {
         const colorSpaces = resources.get(PDFName.of('ColorSpace'));
         if (colorSpaces instanceof PDFDict) {
@@ -296,14 +376,14 @@ async function extractCutContourFromRawPDF(arrayBuffer: ArrayBuffer): Promise<PD
             try {
               resolvedValue = context.lookup(value as any) || value;
             } catch (e) {}
-            
+
             if (resolvedValue instanceof PDFArray) {
               const firstStr = resolvedValue.get(0)?.toString() || '';
               if (firstStr === '/Separation') {
                 const spotName = resolvedValue.get(1)?.toString() || '';
-                if (spotName.toLowerCase().includes('cutcontour')) {
+                if (matchCutSpotLabel(spotName)) {
                   cutContourCSName = name.toString().replace('/', '');
-                  console.log('[PDF Parser] CutContour color space reference name:', cutContourCSName);
+                  console.log('[PDF Parser] Contour color space reference name:', cutContourCSName);
                   break;
                 }
               }
@@ -391,7 +471,7 @@ function extractPathFromContentStream(content: string, pageWidth: number, pageHe
       // Handle specific operators
       if (token === 'CS' || token === 'cs') {
         const csName = stack.length > 0 ? stack[stack.length - 1] : '';
-        if (csName === '/' + colorSpaceName || csName.toLowerCase() === '/cutcontour') {
+        if (csName === '/' + colorSpaceName || matchCutSpotLabel(csName)) {
           inCutContour = true;
           console.log('[PDF Parser] Entering CutContour mode with', csName);
         } else if (inCutContour && csName.startsWith('/')) {
@@ -490,140 +570,11 @@ function extractPathFromContentStream(content: string, pageWidth: number, pageHe
   return paths;
 }
 
-async function extractCutContour(
-  page: pdfjsLib.PDFPageProxy, 
-  viewport: pdfjsLib.PageViewport,
-  scale: number
-): Promise<PDFCutContourInfo> {
-  const result: PDFCutContourInfo = {
-    hasCutContour: false,
-    cutContourPath: null,
-    cutContourPoints: [],
-    pageWidth: viewport.width,
-    pageHeight: viewport.height
-  };
-  
-  try {
-    const operatorList = await page.getOperatorList();
-    const ops = operatorList.fnArray;
-    const args = operatorList.argsArray;
-    
-    let inCutContour = false;
-    let currentPath: { x: number; y: number }[] = [];
-    const path2D = new Path2D();
-    
-    // Debug: Log all operators and look for spot color patterns
-    const colorOps: string[] = [];
-    const allColorArgs: any[] = [];
-    
-    for (let i = 0; i < ops.length; i++) {
-      const op = ops[i];
-      const arg = args[i];
-      
-      // Check for various color-related operators
-      if (op === pdfjsLib.OPS.setFillColorN || 
-          op === pdfjsLib.OPS.setStrokeColorN ||
-          op === pdfjsLib.OPS.setFillColorSpace ||
-          op === pdfjsLib.OPS.setStrokeColorSpace) {
-        colorOps.push(`op${op}`);
-        allColorArgs.push(arg);
-        
-        // Check for CutContour in any argument
-        if (Array.isArray(arg)) {
-          for (const a of arg) {
-            if (typeof a === 'string' && a.toLowerCase().includes('cutcontour')) {
-              result.hasCutContour = true;
-              inCutContour = true;
-              console.log('[PDF Parser] CutContour found in args:', a);
-            }
-          }
-        }
-      }
-    }
-    
-    if (colorOps.length > 0) {
-      console.log('[PDF Parser] Color operators found:', colorOps.length);
-      console.log('[PDF Parser] Sample color args:', allColorArgs.slice(0, 5));
-    } else {
-      console.log('[PDF Parser] No color operators found in operator list');
-    }
-    
-    // Also check the raw PDF stream for CutContour text
-    console.log('[PDF Parser] Total operators:', ops.length);
-    
-    for (let i = 0; i < ops.length; i++) {
-      const op = ops[i];
-      const arg = args[i];
-      
-      if (op === pdfjsLib.OPS.setFillColorN || op === pdfjsLib.OPS.setStrokeColorN) {
-        const colorName = arg?.[arg.length - 1];
-        if (typeof colorName === 'string' && 
-            colorName.toLowerCase().includes('cutcontour')) {
-          inCutContour = true;
-          result.hasCutContour = true;
-          console.log('[PDF Parser] CutContour detected:', colorName);
-        }
-      }
-      
-      if (op === pdfjsLib.OPS.setFillRGBColor || op === pdfjsLib.OPS.setStrokeRGBColor) {
-        inCutContour = false;
-      }
-      
-      if (inCutContour) {
-        if (op === pdfjsLib.OPS.moveTo) {
-          const x = arg[0] * scale;
-          const y = viewport.height - (arg[1] * scale);
-          path2D.moveTo(x, y);
-          if (currentPath.length > 0) {
-            result.cutContourPoints.push([...currentPath]);
-            currentPath = [];
-          }
-          currentPath.push({ x, y });
-        } else if (op === pdfjsLib.OPS.lineTo) {
-          const x = arg[0] * scale;
-          const y = viewport.height - (arg[1] * scale);
-          path2D.lineTo(x, y);
-          currentPath.push({ x, y });
-        } else if (op === pdfjsLib.OPS.curveTo) {
-          const x1 = arg[0] * scale;
-          const y1 = viewport.height - (arg[1] * scale);
-          const x2 = arg[2] * scale;
-          const y2 = viewport.height - (arg[3] * scale);
-          const x3 = arg[4] * scale;
-          const y3 = viewport.height - (arg[5] * scale);
-          path2D.bezierCurveTo(x1, y1, x2, y2, x3, y3);
-          currentPath.push({ x: x3, y: y3 });
-        } else if (op === pdfjsLib.OPS.closePath) {
-          path2D.closePath();
-          if (currentPath.length > 0) {
-            currentPath.push(currentPath[0]);
-            result.cutContourPoints.push([...currentPath]);
-            currentPath = [];
-          }
-        }
-      }
-    }
-    
-    if (currentPath.length > 0) {
-      result.cutContourPoints.push([...currentPath]);
-    }
-    
-    if (result.hasCutContour && result.cutContourPoints.length > 0) {
-      result.cutContourPath = path2D;
-    }
-    
-  } catch (error) {
-    console.warn('Could not extract CutContour from PDF:', error);
-  }
-  
-  return result;
-}
-
 export function isPDFFile(file: File): boolean {
   return file.type === 'application/pdf' || file.name.toLowerCase().endsWith('.pdf');
 }
 
-// Generate a PDF with the image and a proper vector CutContour spot color path
+// Generate a PDF with the image, a proper vector CutContour spot color path, and (if provided) White/Gloss spot layers.
 export async function generatePDFWithVectorCutContour(
   image: HTMLImageElement,
   cutContourPoints: { x: number; y: number }[][],
@@ -631,7 +582,9 @@ export async function generatePDFWithVectorCutContour(
   pageHeight: number,
   dpi: number,
   filename: string,
-  cutContourLabel: string = 'CutContour'
+  cutContourLabel: string = 'CutContour',
+  spotColors?: import('./contour-outline').SpotColorInput[],
+  singleArtboard: boolean = false
 ): Promise<void> {
   const { PDFDocument, PDFName, PDFArray, PDFDict } = await import('pdf-lib');
   
@@ -729,10 +682,21 @@ export async function generatePDFWithVectorCutContour(
     }
   }
   
+  // Layer any tagged White/Gloss on top — otherwise a customer's spot-color tagging is silently lost on this path.
+  if (spotColors && spotColors.length > 0) {
+    const { addSpotColorVectorsToPDF } = await import('./spot-color-vectors');
+    await addSpotColorVectorsToPDF(
+      pdfDoc, page, image, spotColors,
+      pageWidth / dpi, pageHeight / dpi,
+      pageHeight / dpi, 0, 0,
+      singleArtboard, widthPts, heightPts
+    );
+  }
+
   pdfDoc.setTitle('PDF with CutContour');
   pdfDoc.setSubject(`Contains ${cutContourLabel} spot color for cutting machines`);
   pdfDoc.setKeywords([cutContourLabel, 'spot color', 'cutting', 'vector']);
-  
+
   const pdfBytes = await pdfDoc.save();
   const pdfBlob = new Blob([pdfBytes], { type: 'application/pdf' });
   const url = URL.createObjectURL(pdfBlob);

@@ -35,6 +35,8 @@ interface ControlsSectionProps {
   resizeSettings: ResizeSettings;
   shapeSettings: ShapeSettings;
   stickerSize: StickerSize;
+  // Current export label (may be a manual override of what was actually detected in the file) — compared against pdfCutContourInfo.detectedLabel to explain any mismatch.
+  cutContourLabel?: 'CutContour' | 'PerfCutContour' | 'KissCut';
   onStrokeChange: (settings: Partial<StrokeSettings>) => void;
   onResizeChange: (settings: Partial<ResizeSettings>) => void;
   onShapeChange: (settings: Partial<ShapeSettings>) => void;
@@ -112,6 +114,7 @@ export default function ControlsSection({
   resizeSettings,
   shapeSettings,
   stickerSize,
+  cutContourLabel,
   onStrokeChange,
   onResizeChange,
   onShapeChange,
@@ -419,7 +422,7 @@ export default function ControlsSection({
         if (strokeSettings.enabled) {
           const workerManager = getContourWorkerManager();
           const cachedData = workerManager.getCachedContourData();
-          const result = await generateContourPDFBase64(imageInfo.image, strokeSettings, resizeSettings, cachedData || undefined);
+          const result = await generateContourPDFBase64(imageInfo.image, strokeSettings, resizeSettings, cachedData || undefined, undefined, imageInfo);
           pdfBase64 = result || "";
         } else if (shapeSettings.enabled) {
           const result = await generateShapePDFBase64(imageInfo.image, shapeSettings, resizeSettings);
@@ -624,7 +627,12 @@ export default function ControlsSection({
               {imageInfo?.isPDF && imageInfo?.pdfCutContourInfo?.hasCutContour ? (
                 <div className="p-2.5 bg-emerald-50 border border-emerald-100 rounded-lg">
                   <p className="text-sm font-medium text-emerald-700">Cutline already in file</p>
-                  <p className="text-xs text-emerald-600 mt-0.5">CutContour detected</p>
+                  {cutContourLabel && cutContourLabel !== (imageInfo.pdfCutContourInfo?.detectedLabel ?? 'CutContour') ? (
+                    // Export label was manually overridden away from what the file actually has — say both, so the two badges never silently disagree.
+                    <p className="text-xs text-emerald-600 mt-0.5">File has {imageInfo.pdfCutContourInfo?.detectedLabel ?? 'CutContour'} — exporting as {cutContourLabel}</p>
+                  ) : (
+                    <p className="text-xs text-emerald-600 mt-0.5">{imageInfo.pdfCutContourInfo?.detectedLabel ?? 'CutContour'} detected</p>
+                  )}
                 </div>
               ) : (
                 <div className="grid grid-cols-2 gap-2">
