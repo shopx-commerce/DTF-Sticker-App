@@ -1,6 +1,8 @@
 import { PDFDocument, PDFName, PDFArray, PDFDict, PDFPage } from 'pdf-lib';
 import { type SpotColorInput } from './contour-outline';
 import SpotColorWorker from './spot-color-worker?worker';
+import { offloadHealthy } from './offload-health';
+import { traceSpotColorsViaOffload } from './offload-client';
 
 export interface SpotPixelMapData {
   pixelMap: Int16Array;
@@ -81,7 +83,7 @@ function traceColorRegionsAsync(
   heightInches: number,
   spotPixelMap?: SpotPixelMapData
 ): Promise<SpotColorRegion[]> {
-  return new Promise((resolve) => {
+  return new Promise(async (resolve) => {
     let cW = Math.round(widthInches * SPOT_COLOR_DPI);
     let cH = Math.round(heightInches * SPOT_COLOR_DPI);
     let scale = 1;
@@ -256,6 +258,25 @@ function traceColorRegionsAsync(
       spotFluorGName: c.spotFluorGName,
       spotFluorOrangeName: c.spotFluorOrangeName,
     }));
+
+    // VPS tier, above the worker — falls straight through to the worker on any offload failure.
+    if (await offloadHealthy()) {
+      try {
+        const regions = await traceSpotColorsViaOffload({
+          imageData,
+          spotColors: workerColors,
+          dpi: SPOT_COLOR_DPI,
+          fullAlphaMask: fullAlphaMask ?? undefined,
+          allTaggedWhite,
+          allTaggedGloss,
+          exactSelection,
+        });
+        resolve(regions);
+        return;
+      } catch (err) {
+        console.warn('[SpotColor] offload failed, falling back to worker:', err);
+      }
+    }
 
     let worker: Worker;
     try {
