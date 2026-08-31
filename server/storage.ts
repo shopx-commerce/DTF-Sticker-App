@@ -19,6 +19,7 @@ import {
   type GangSheet,
   type UserWithStats,
   type DesignWithOwner,
+  type GangSheetWithOwner,
   type AdminStats,
 } from "@shared/schema";
 import type { SerializedDesign } from "@shared/design-document";
@@ -282,6 +283,27 @@ export class DbStorage implements IStorage {
       .orderBy(desc(designs.updatedAt));
   }
 
+  async listAllGangSheetsForAdmin(): Promise<GangSheetWithOwner[]> {
+    return db
+      .select({
+        id: gangSheets.id,
+        name: gangSheets.name,
+        userId: gangSheets.userId,
+        ownerEmail: users.email,
+        pdfAssetId: gangSheets.pdfAssetId,
+        thumbnailAssetId: gangSheets.thumbnailAssetId,
+        sheetWidth: gangSheets.sheetWidth,
+        sheetHeight: gangSheets.sheetHeight,
+        itemCount: gangSheets.itemCount,
+        totalQuantity: gangSheets.totalQuantity,
+        createdAt: gangSheets.createdAt,
+      })
+      .from(gangSheets)
+      .innerJoin(users, eq(gangSheets.userId, users.id))
+      .where(isNull(gangSheets.deletedAt))
+      .orderBy(desc(gangSheets.createdAt));
+  }
+
   // No ownership filter — admin routes may inspect/fork any design; every call site is behind requireAdmin.
   async getDesignAny(id: number): Promise<Design | undefined> {
     const [design] = await db
@@ -313,14 +335,16 @@ export class DbStorage implements IStorage {
   }
 
   async getAdminStats(): Promise<AdminStats> {
-    const [[userRow], [designRow], [downloadRow]] = await Promise.all([
+    const [[userRow], [designRow], [gangSheetRow], [downloadRow]] = await Promise.all([
       db.select({ count: sql<number>`count(*)`.mapWith(Number) }).from(users),
       db.select({ count: sql<number>`count(*)`.mapWith(Number) }).from(designs).where(isNull(designs.deletedAt)),
+      db.select({ count: sql<number>`count(*)`.mapWith(Number) }).from(gangSheets).where(isNull(gangSheets.deletedAt)),
       db.select({ count: sql<number>`count(*)`.mapWith(Number) }).from(downloads),
     ]);
     return {
       totalUsers: userRow.count,
       totalDesigns: designRow.count,
+      totalGangSheets: gangSheetRow.count,
       totalDownloads: downloadRow.count,
     };
   }

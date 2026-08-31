@@ -1,11 +1,12 @@
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { apiRequest, getQueryFn } from "@/lib/queryClient";
 import type { SerializedDesign } from "@shared/design-document";
-import type { UserWithStats, DesignWithOwner, AdminStats, Design } from "@shared/schema";
+import type { UserWithStats, DesignWithOwner, GangSheetWithOwner, AdminStats, Design } from "@shared/schema";
 
 // Derived from the shared aggregate types; date columns cross the wire as JSON strings.
 export type AdminUserRow = Omit<UserWithStats, "createdAt"> & { createdAt: string };
 export type AdminDesignRow = Omit<DesignWithOwner, "createdAt" | "updatedAt"> & { createdAt: string; updatedAt: string };
+export type AdminGangSheetRow = Omit<GangSheetWithOwner, "createdAt"> & { createdAt: string };
 export type { AdminStats };
 
 export function useAdminStats() {
@@ -26,6 +27,13 @@ export function useAdminDesigns() {
   return useQuery<{ designs: AdminDesignRow[] } | null>({
     queryKey: ["/api/admin/designs"],
     queryFn: getQueryFn<{ designs: AdminDesignRow[] } | null>({ on401: "returnNull" }),
+  });
+}
+
+export function useAdminGangSheets() {
+  return useQuery<{ gangSheets: AdminGangSheetRow[] } | null>({
+    queryKey: ["/api/admin/gang-sheets"],
+    queryFn: getQueryFn<{ gangSheets: AdminGangSheetRow[] } | null>({ on401: "returnNull" }),
   });
 }
 

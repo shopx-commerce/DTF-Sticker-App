@@ -159,9 +159,14 @@ export type DesignWithOwner = Pick<Design, "id" | "name" | "userId" | "thumbnail
   ownerEmail: string;
 };
 
+export type GangSheetWithOwner = Pick<GangSheet, "id" | "name" | "userId" | "pdfAssetId" | "thumbnailAssetId" | "sheetWidth" | "sheetHeight" | "itemCount" | "totalQuantity" | "createdAt"> & {
+  ownerEmail: string;
+};
+
 export interface AdminStats {
   totalUsers: number;
   totalDesigns: number;
+  totalGangSheets: number;
   totalDownloads: number;
 }
 
