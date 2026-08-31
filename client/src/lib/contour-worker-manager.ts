@@ -394,7 +394,15 @@ class ContourWorkerManager {
   private async processWithOffloadFallback(request: ProcessRequest, onProgress?: ProgressCallback): Promise<WorkerResult> {
     if (await offloadHealthy()) {
       try {
-        return await traceContourViaOffload(request);
+        const result = await traceContourViaOffload(request);
+        // Mirror handleWorkerMessage's cache write (line ~267) — getCachedContourData() is read
+        // later by the download/gang-sheet paths, independently of this call's own return value.
+        // Without this, a trace that ran via offload leaves that cache stale or null, and a
+        // download can silently embed the wrong (or no) cut path.
+        if (result.contourData) {
+          this.cachedContourData = result.contourData;
+        }
+        return result;
       } catch (err) {
         console.warn('[ContourWorkerManager] offload failed, falling back to worker:', err);
       }

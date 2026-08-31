@@ -84,6 +84,12 @@ function traceColorRegionsAsync(
   spotPixelMap?: SpotPixelMapData
 ): Promise<SpotColorRegion[]> {
   return new Promise(async (resolve) => {
+    // Whole body wrapped in try/catch: an async executor does NOT auto-reject the outer
+    // Promise on a synchronous-looking throw (tainted-canvas getImageData, a non-cloneable
+    // postMessage payload) — the thrown error just becomes an orphaned, unawaited rejection
+    // and this Promise would otherwise hang forever. Resolve to [] on any failure here,
+    // matching every other error path below (worker creation, timeout, worker error).
+    try {
     let cW = Math.round(widthInches * SPOT_COLOR_DPI);
     let cH = Math.round(heightInches * SPOT_COLOR_DPI);
     let scale = 1;
@@ -347,6 +353,10 @@ function traceColorRegionsAsync(
     }
 
     worker.postMessage(msg, transferables);
+    } catch (err) {
+      console.warn('[SpotColor] traceColorRegionsAsync threw, resolving with no regions:', err);
+      resolve([]);
+    }
   });
 }
 
