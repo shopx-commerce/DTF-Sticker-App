@@ -160,6 +160,13 @@ export async function getAssetUrl(assetId: number): Promise<string> {
   return data.url as string;
 }
 
+// Admin-only equivalent of getAssetUrl — fetches ANY user's asset URL, for admin's read-only views.
+export async function getAssetUrlForAdmin(assetId: number): Promise<string> {
+  const res = await apiRequest("GET", `/api/admin/assets/${assetId}/url`);
+  const data = await res.json();
+  return data.url as string;
+}
+
 export async function fetchAssetAsFile(assetId: number, filename: string, mime: string): Promise<File> {
   // Same-origin proxy, not R2's URL directly — R2 doesn't send CORS headers, so fetch() to it fails.
   const res = await apiRequest("GET", `/api/assets/${assetId}/file`);
