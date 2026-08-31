@@ -1,5 +1,7 @@
 import ContourWorker from './contour-worker?worker';
 import { workersHealthy } from './worker-health';
+import { offloadHealthy } from './offload-health';
+import { traceContourViaOffload } from './offload-client';
 
 const MAX_PROCESSING_DIMENSION = 4000;
 
@@ -365,7 +367,7 @@ class ContourWorkerManager {
       detectedShapeInfo: scaledShapeInfo
     };
 
-    const result = await this.processInWorker(request, onProgress);
+    const result = await this.processWithOffloadFallback(request, onProgress);
 
     const resultCanvas = document.createElement('canvas');
     resultCanvas.width = result.imageData.width;
@@ -386,6 +388,26 @@ class ContourWorkerManager {
     this.lastProcessKey = processKey;
     this.lastProcessResult = processResult;
     return processResult;
+  }
+
+  // VPS tier, above the existing worker/main-thread ladder — falls straight through to the worker on any offload failure, so a flaky/unconfigured VPS never blocks tracing.
+  private async processWithOffloadFallback(request: ProcessRequest, onProgress?: ProgressCallback): Promise<WorkerResult> {
+    if (await offloadHealthy()) {
+      try {
+        const result = await traceContourViaOffload(request);
+        // Mirror handleWorkerMessage's cache write (line ~267) — getCachedContourData() is read
+        // later by the download/gang-sheet paths, independently of this call's own return value.
+        // Without this, a trace that ran via offload leaves that cache stale or null, and a
+        // download can silently embed the wrong (or no) cut path.
+        if (result.contourData) {
+          this.cachedContourData = result.contourData;
+        }
+        return result;
+      } catch (err) {
+        console.warn('[ContourWorkerManager] offload failed, falling back to worker:', err);
+      }
+    }
+    return this.processInWorker(request, onProgress);
   }
 
   private processInWorker(request: ProcessRequest, onProgress?: ProgressCallback): Promise<WorkerResult> {

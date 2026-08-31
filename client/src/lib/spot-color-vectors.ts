@@ -1,6 +1,8 @@
 import { PDFDocument, PDFName, PDFArray, PDFDict, PDFPage } from 'pdf-lib';
 import { type SpotColorInput } from './contour-outline';
 import SpotColorWorker from './spot-color-worker?worker';
+import { offloadHealthy } from './offload-health';
+import { traceSpotColorsViaOffload } from './offload-client';
 
 export interface SpotPixelMapData {
   pixelMap: Int16Array;
@@ -81,7 +83,13 @@ function traceColorRegionsAsync(
   heightInches: number,
   spotPixelMap?: SpotPixelMapData
 ): Promise<SpotColorRegion[]> {
-  return new Promise((resolve) => {
+  return new Promise(async (resolve) => {
+    // Whole body wrapped in try/catch: an async executor does NOT auto-reject the outer
+    // Promise on a synchronous-looking throw (tainted-canvas getImageData, a non-cloneable
+    // postMessage payload) — the thrown error just becomes an orphaned, unawaited rejection
+    // and this Promise would otherwise hang forever. Resolve to [] on any failure here,
+    // matching every other error path below (worker creation, timeout, worker error).
+    try {
     let cW = Math.round(widthInches * SPOT_COLOR_DPI);
     let cH = Math.round(heightInches * SPOT_COLOR_DPI);
     let scale = 1;
@@ -257,6 +265,25 @@ function traceColorRegionsAsync(
       spotFluorOrangeName: c.spotFluorOrangeName,
     }));
 
+    // VPS tier, above the worker — falls straight through to the worker on any offload failure.
+    if (await offloadHealthy()) {
+      try {
+        const regions = await traceSpotColorsViaOffload({
+          imageData,
+          spotColors: workerColors,
+          dpi: SPOT_COLOR_DPI,
+          fullAlphaMask: fullAlphaMask ?? undefined,
+          allTaggedWhite,
+          allTaggedGloss,
+          exactSelection,
+        });
+        resolve(regions);
+        return;
+      } catch (err) {
+        console.warn('[SpotColor] offload failed, falling back to worker:', err);
+      }
+    }
+
     let worker: Worker;
     try {
       worker = new SpotColorWorker();
@@ -326,6 +353,10 @@ function traceColorRegionsAsync(
     }
 
     worker.postMessage(msg, transferables);
+    } catch (err) {
+      console.warn('[SpotColor] traceColorRegionsAsync threw, resolving with no regions:', err);
+      resolve([]);
+    }
   });
 }
 

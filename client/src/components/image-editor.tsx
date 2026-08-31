@@ -1898,11 +1898,30 @@ export default function ImageEditor({ onDesignUploaded }: { onDesignUploaded?: (
         if (strokeSettings.enabled) {
           // Contour mode: Download PDF with raster image + vector contour
           const filename = `${nameWithoutExt}_with_contour.pdf`;
-          
-          // Get cached contour data from worker manager for fast PDF export
+
+          // Cache can lag behind the debounced preview — regenerate for the current settings before reading it, same fix as handleAddToGangSheet.
+          try {
+            await processContourInWorker(
+              imageInfo.image,
+              strokeSettings,
+              resizeSettings,
+              undefined,
+              detectedShapeType ?? undefined,
+              detectedShapeInfo
+            );
+          } catch (err) {
+            console.error("[Download] contour refresh failed:", err);
+            toast({
+              title: "Contour not ready",
+              description: "Could not refresh the outline for the current size. Wait for the preview to finish, then try again.",
+              variant: "destructive",
+            });
+            return;
+          }
+
           const workerManager = getContourWorkerManager();
           const cachedData = workerManager.getCachedContourData() as CachedContourData | undefined;
-          
+
           await downloadContourPDF(
             imageInfo.image,
             strokeSettings,

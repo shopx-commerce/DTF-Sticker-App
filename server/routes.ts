@@ -14,6 +14,7 @@ import { registerDesignRoutes } from "./routes/designs";
 import { registerDownloadRoutes } from "./routes/downloads";
 import { registerAdminRoutes } from "./routes/admin";
 import { registerGangSheetRoutes } from "./routes/gang-sheets";
+import { registerOffloadRoutes } from "./routes/offload";
 
 // Configure multer for file uploads
 const upload = multer({
@@ -42,6 +43,7 @@ export async function registerRoutes(app: Express): Promise<Server> {
   registerDownloadRoutes(app);
   registerAdminRoutes(app);
   registerGangSheetRoutes(app);
+  registerOffloadRoutes(app);
 
   // Process image with high-quality stroke and resize
   app.post("/api/process-image", upload.single('image'), async (req, res) => {
