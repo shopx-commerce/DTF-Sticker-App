@@ -2,8 +2,8 @@ import { useEffect, useState } from "react";
 import { Link, useLocation } from "wouter";
 import AccountMenu from "@/components/account-menu";
 import { useAuth, getErrorMessage } from "@/hooks/use-auth";
-import { useAdminStats, useAdminUsers, useAdminDesigns, useForkDesign } from "@/hooks/use-admin";
-import { getAssetUrl } from "@/lib/design-document";
+import { useAdminStats, useAdminUsers, useAdminDesigns, useAdminGangSheets, useForkDesign } from "@/hooks/use-admin";
+import { getAssetUrlForAdmin } from "@/lib/design-document";
 import { useToast } from "@/hooks/use-toast";
 import { Button } from "@/components/ui/button";
 import { Badge } from "@/components/ui/badge";
@@ -16,13 +16,15 @@ import {
   TableCell,
 } from "@/components/ui/table";
 
-function DesignThumb({ assetId, name }: { assetId: number | null; name: string }) {
+// Uses the unscoped admin asset-url route — these thumbnails belong to whichever customer owns
+// the row, not the logged-in admin, so the ownership-scoped getAssetUrl would 404 here.
+function AssetThumb({ assetId, name }: { assetId: number | null; name: string }) {
   const [url, setUrl] = useState<string | null>(null);
 
   useEffect(() => {
     let cancelled = false;
     if (!assetId) return;
-    getAssetUrl(assetId).then((u) => { if (!cancelled) setUrl(u); }).catch(() => {});
+    getAssetUrlForAdmin(assetId).then((u) => { if (!cancelled) setUrl(u); }).catch(() => {});
     return () => { cancelled = true; };
   }, [assetId]);
 
@@ -51,8 +53,10 @@ export default function AdminPage() {
   const { data: statsData, isLoading: statsLoading } = useAdminStats();
   const { data: usersData, isLoading: usersLoading } = useAdminUsers();
   const { data: designsData, isLoading: designsLoading } = useAdminDesigns();
+  const { data: gangSheetsData, isLoading: gangSheetsLoading } = useAdminGangSheets();
   const forkDesign = useForkDesign();
   const [ownerFilter, setOwnerFilter] = useState("");
+  const [viewingGangSheetId, setViewingGangSheetId] = useState<number | null>(null);
 
   // UX guard only — every /api/admin/* route is independently gated by requireAdmin server-side.
   useEffect(() => {
@@ -61,6 +65,19 @@ export default function AdminPage() {
 
   // Opens the real editor in read-only mode against the owner's actual files — not a fork.
   const handleView = (designId: number) => setLocation(`/?adminView=${designId}`);
+
+  // Gang sheets have no re-editable state — just the finished PDF, so "view" opens it directly.
+  const handleViewGangSheet = async (pdfAssetId: number) => {
+    setViewingGangSheetId(pdfAssetId);
+    try {
+      const url = await getAssetUrlForAdmin(pdfAssetId);
+      window.open(url, "_blank", "noopener,noreferrer");
+    } catch (error) {
+      toast({ title: "Couldn't open PDF", description: getErrorMessage(error), variant: "destructive" });
+    } finally {
+      setViewingGangSheetId(null);
+    }
+  };
 
   const handleEditAsOwn = async (designId: number) => {
     try {
@@ -81,6 +98,9 @@ export default function AdminPage() {
   const designs = (designsData?.designs ?? []).filter((d) =>
     ownerFilter.trim() ? d.ownerEmail.toLowerCase().includes(ownerFilter.trim().toLowerCase()) : true
   );
+  const gangSheets = (gangSheetsData?.gangSheets ?? []).filter((g) =>
+    ownerFilter.trim() ? g.ownerEmail.toLowerCase().includes(ownerFilter.trim().toLowerCase()) : true
+  );
 
   return (
     <div className="min-h-screen bg-gradient-to-br from-slate-950 via-slate-900 to-slate-950">
@@ -93,9 +113,10 @@ export default function AdminPage() {
       </header>
 
       <main className="max-w-7xl mx-auto px-4 sm:px-6 py-8 space-y-8">
-        <div className="grid grid-cols-1 sm:grid-cols-3 gap-4">
+        <div className="grid grid-cols-1 sm:grid-cols-4 gap-4">
           <StatCard label="Total Users" value={statsLoading ? "…" : statsData?.stats.totalUsers ?? 0} />
           <StatCard label="Total Designs" value={statsLoading ? "…" : statsData?.stats.totalDesigns ?? 0} />
+          <StatCard label="Total Gang Sheets" value={statsLoading ? "…" : statsData?.stats.totalGangSheets ?? 0} />
           <StatCard label="Total Downloads" value={statsLoading ? "…" : statsData?.stats.totalDownloads ?? 0} />
         </div>
 
@@ -174,7 +195,7 @@ export default function AdminPage() {
                 ) : (
                   designs.map((d) => (
                     <TableRow key={d.id}>
-                      <TableCell><DesignThumb assetId={d.thumbnailAssetId} name={d.name} /></TableCell>
+                      <TableCell><AssetThumb assetId={d.thumbnailAssetId} name={d.name} /></TableCell>
                       <TableCell className="font-medium">{d.name}</TableCell>
                       <TableCell className="text-slate-500">{d.ownerEmail}</TableCell>
                       <TableCell className="text-slate-500 text-sm">{new Date(d.updatedAt).toLocaleDateString()}</TableCell>
@@ -187,6 +208,55 @@ export default function AdminPage() {
                           onClick={() => handleEditAsOwn(d.id)}
                         >
                           Edit as my own
+                        </Button>
+                      </TableCell>
+                    </TableRow>
+                  ))
+                )}
+              </TableBody>
+            </Table>
+          </div>
+        </section>
+
+        <section className="bg-white rounded-xl shadow-sm border border-slate-200/60 overflow-hidden">
+          <div className="px-5 py-4 border-b border-slate-100">
+            <h2 className="font-semibold text-slate-900">Gang Sheets</h2>
+          </div>
+          <div className="overflow-x-auto">
+            <Table>
+              <TableHeader>
+                <TableRow>
+                  <TableHead></TableHead>
+                  <TableHead>Name</TableHead>
+                  <TableHead>Owner</TableHead>
+                  <TableHead>Size</TableHead>
+                  <TableHead className="text-right">Items / Qty</TableHead>
+                  <TableHead>Created</TableHead>
+                  <TableHead className="text-right">Actions</TableHead>
+                </TableRow>
+              </TableHeader>
+              <TableBody>
+                {gangSheetsLoading ? (
+                  <TableRow><TableCell colSpan={7} className="text-center text-slate-400">Loading…</TableCell></TableRow>
+                ) : gangSheets.length === 0 ? (
+                  <TableRow><TableCell colSpan={7} className="text-center text-slate-400">No gang sheets found.</TableCell></TableRow>
+                ) : (
+                  gangSheets.map((g) => (
+                    <TableRow key={g.id}>
+                      <TableCell><AssetThumb assetId={g.thumbnailAssetId} name={g.name} /></TableCell>
+                      <TableCell className="font-medium">{g.name}</TableCell>
+                      <TableCell className="text-slate-500">{g.ownerEmail}</TableCell>
+                      <TableCell className="text-slate-500 text-sm">{g.sheetWidth}" × {g.sheetHeight}"</TableCell>
+                      <TableCell className="text-right text-slate-500 text-sm">{g.itemCount} / {g.totalQuantity}</TableCell>
+                      <TableCell className="text-slate-500 text-sm">{new Date(g.createdAt).toLocaleDateString()}</TableCell>
+                      <TableCell className="text-right">
+                        <Button
+                          size="sm"
+                          variant="ghost"
+                          disabled={viewingGangSheetId === g.pdfAssetId}
+                          onClick={() => handleViewGangSheet(g.pdfAssetId)}
+                        >
+                          View
                         </Button>
                       </TableCell>
                     </TableRow>
