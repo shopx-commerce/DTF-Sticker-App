@@ -38,6 +38,10 @@ function baseUrl(req: Request): string {
   return process.env.APP_URL || `${req.protocol}://${req.get("host")}`;
 }
 
+// Account emails (verify/reset) are branded as AnyNestApp, distinct from mailer.ts's
+// DEFAULT_FROM (sales@dtfmasters.com) used elsewhere — both senders are verified in SendGrid.
+const AUTH_EMAIL_FROM = "AnyNestApp <support@anynestapp.com>";
+
 interface AuthTokenEmailConfig {
   kind: AuthTokenKind;
   ttlMs: number;
@@ -69,6 +73,7 @@ async function sendAuthTokenEmail(req: Request, user: User, config: AuthTokenEma
 
   await sendMail({
     to: user.email,
+    from: AUTH_EMAIL_FROM,
     subject: config.subject,
     text: config.buildText(link),
     html: config.buildHtml(link),
